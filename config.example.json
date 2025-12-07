@@ -1,0 +1,25 @@
+{
+  "id": "node-a",
+  "ws_listen": ":18080",
+  "peers": {
+    "node-b": "ws://127.0.0.1:18081/mesh",
+    "node-c": "ws://127.0.0.1:18082/mesh"
+  },
+  "poll_period": "5s",
+  "auth_key": "changeme-shared-hmac-key",
+  "metrics_listen": ":19090",
+  "reroute_attempts": 2,
+  "udp_session_ttl": "60s",
+  "mtls_cert": "",
+  "mtls_key": "",
+  "mtls_ca": "",
+  "insecure_skip_tls": true,
+  "entries": [
+    {
+      "listen": ":10080",
+      "proto": "tcp",
+      "exit": "node-c",
+      "remote": "203.0.113.10:3389"
+    }
+  ]
+}
