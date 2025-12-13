@@ -36,7 +36,7 @@ func NewMuxManager(m *MuxConn) *MuxManager {
 		nextID:    2, // start from 2, even numbers for initiator
 		streams:   make(map[uint32]*MuxStream),
 		recv:      make(map[uint32]chan muxFrame),
-		defaultCh: make(chan muxFrame, 64),
+		defaultCh: make(chan muxFrame, 256),
 		shutdown:  make(chan struct{}),
 		ctx:       ctx,
 		cancel:    cancel,
@@ -108,10 +108,12 @@ func (mm *MuxManager) readLoop() {
 				delete(mm.recv, f.streamID)
 			}
 		} else {
-			// 如果无人订阅默认通道则丢弃，避免阻塞 readLoop
+			// 控制帧等会先落到 defaultCh，这里阻塞发送，除非整体关闭
 			select {
 			case mm.defaultCh <- f:
-			default:
+			case <-mm.ctx.Done():
+				mm.mu.Unlock()
+				return
 			}
 		}
 		mm.mu.Unlock()

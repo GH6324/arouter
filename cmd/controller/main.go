@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"database/sql/driver"
 	_ "embed"
@@ -125,6 +126,135 @@ func (s *StringList) Scan(value interface{}) error {
 	}
 }
 
+type EncPolicy struct {
+	ID     int    `json:"id"`
+	Name   string `json:"name,omitempty"`
+	Method string `json:"method"`
+	Key    string `json:"key"`
+}
+
+func (p *EncPolicy) normalize(idx int) {
+	if p.ID == 0 {
+		p.ID = idx + 1
+	}
+	p.Method = strings.ToLower(p.Method)
+	reqLen := 0
+	switch p.Method {
+	case "aes-128-gcm":
+		reqLen = 16
+	case "aes-256-gcm":
+		reqLen = 32
+	case "aes-gcm":
+		if len(p.Key) > 0 {
+			break
+		}
+		reqLen = 16
+	case "chacha20-poly1305", "chacha20":
+		reqLen = 32
+	default:
+		p.Method = "aes-128-gcm"
+		reqLen = 16
+	}
+	keyBytes := decodeKeyFlexible(p.Key)
+	if reqLen > 0 && len(keyBytes) != reqLen {
+		keyBytes = randomKeyBytes(reqLen)
+	}
+	p.Key = base64.StdEncoding.EncodeToString(keyBytes)
+}
+
+// UnmarshalJSON 允许 id 既可为数字也可为字符串。
+func (p *EncPolicy) UnmarshalJSON(data []byte) error {
+	type alias EncPolicy
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	var a alias
+	if err := json.Unmarshal(data, &a); err != nil {
+		// try permissive id parsing
+		var idVal int
+		if b, ok := raw["id"]; ok {
+			var num json.Number
+			if err := json.Unmarshal(b, &num); err == nil {
+				if v, err := num.Int64(); err == nil {
+					idVal = int(v)
+				}
+			} else {
+				var s string
+				if err := json.Unmarshal(b, &s); err == nil {
+					if v, err := strconv.Atoi(s); err == nil {
+						idVal = v
+					}
+				}
+			}
+		}
+		a.ID = idVal
+		_ = json.Unmarshal(raw["name"], &a.Name)
+		_ = json.Unmarshal(raw["method"], &a.Method)
+		_ = json.Unmarshal(raw["key"], &a.Key)
+	}
+	p.ID = a.ID
+	p.Name = a.Name
+	p.Method = a.Method
+	p.Key = a.Key
+	return nil
+}
+
+type EncPolicyList []EncPolicy
+
+func decodeKeyFlexible(s string) []byte {
+	if s == "" {
+		return nil
+	}
+	if b, err := base64.StdEncoding.DecodeString(s); err == nil {
+		return b
+	}
+	if b, err := base64.URLEncoding.DecodeString(s); err == nil {
+		return b
+	}
+	if b, err := hex.DecodeString(s); err == nil {
+		return b
+	}
+	return []byte(s)
+}
+
+func randomKeyBytes(n int) []byte {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return []byte("fallback-random-key-32bytes-----")[:n]
+	}
+	return b
+}
+
+func (s EncPolicyList) Value() (driver.Value, error) {
+	b, err := json.Marshal(s)
+	if err != nil {
+		return nil, err
+	}
+	return string(b), nil
+}
+
+func (s *EncPolicyList) Scan(value interface{}) error {
+	switch v := value.(type) {
+	case []byte:
+		return json.Unmarshal(v, s)
+	case string:
+		return json.Unmarshal([]byte(v), s)
+	default:
+		return fmt.Errorf("unsupported type %T", value)
+	}
+}
+
+func (s EncPolicyList) normalize() EncPolicyList {
+	out := make(EncPolicyList, 0, len(s))
+	for i := range s {
+		p := s[i]
+		p.normalize(i)
+		out = append(out, p)
+	}
+	return out
+}
+
 type RoutePlan struct {
 	ID        uint       `gorm:"primaryKey" json:"id"`
 	NodeID    uint       `json:"-"`
@@ -157,12 +287,13 @@ type User struct {
 
 // Setting 为全局系统设置，影响所有节点。
 type Setting struct {
-	ID             uint   `gorm:"primaryKey" json:"id"`
-	Transport      string `json:"transport"`
-	Compression    string `json:"compression"`
-	CompressionMin int    `json:"compression_min_bytes"`
-	DebugLog       bool   `json:"debug_log"`
-	HTTPProbeURL   string `json:"http_probe_url"`
+	ID                 uint          `gorm:"primaryKey" json:"id"`
+	Transport          string        `json:"transport"`
+	Compression        string        `json:"compression"`
+	CompressionMin     int           `json:"compression_min_bytes"`
+	DebugLog           bool          `json:"debug_log"`
+	HTTPProbeURL       string        `json:"http_probe_url"`
+	EncryptionPolicies EncPolicyList `json:"encryption_policies"`
 }
 
 type RouteProbe struct {
@@ -209,6 +340,7 @@ type ConfigResponse struct {
 	OS              string            `json:"os,omitempty"`
 	Arch            string            `json:"arch,omitempty"`
 	HTTPProbeURL    string            `json:"http_probe_url,omitempty"`
+	Encryption      []EncPolicy       `json:"encryption_policies,omitempty"`
 }
 
 // applyOSOverrides 根据 os hint（例如 darwin）调整默认路径，便于节点在不同平台使用合适的目录。
@@ -1064,6 +1196,9 @@ func main() {
 			s.CompressionMin = req.CompressionMin
 		}
 		s.DebugLog = req.DebugLog
+		if req.EncryptionPolicies != nil {
+			s.EncryptionPolicies = req.EncryptionPolicies.normalize()
+		}
 		if strings.TrimSpace(req.HTTPProbeURL) != "" {
 			s.HTTPProbeURL = strings.TrimSpace(req.HTTPProbeURL)
 		}
@@ -1174,6 +1309,7 @@ func buildConfig(node Node, allNodes []Node, globalKey string, controllerBase st
 		OS:              node.OSName,
 		Arch:            node.Arch,
 		HTTPProbeURL:    settings.HTTPProbeURL,
+		Encryption:      settings.EncryptionPolicies,
 	}
 }
 
@@ -1650,7 +1786,12 @@ func ensureGlobalSettings(db *gorm.DB) {
 			CompressionMin: 0,
 			DebugLog:       false,
 			HTTPProbeURL:   envOrDefault("GLOBAL_HTTP_PROBE_URL", "https://www.google.com/generate_204"),
+			EncryptionPolicies: EncPolicyList{
+				{ID: 1, Name: "aes128", Method: "aes-128-gcm", Key: "YWFhYWFhYWFhYWFhYWFhYQ=="},
+				{ID: 2, Name: "chacha", Method: "chacha20-poly1305", Key: "YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWE="},
+			},
 		}
+		def.EncryptionPolicies = def.EncryptionPolicies.normalize()
 		if err := db.Create(&def).Error; err != nil {
 			log.Printf("create default settings failed: %v", err)
 		} else {
@@ -1669,11 +1810,20 @@ func loadSettings(db *gorm.DB) Setting {
 			CompressionMin: 0,
 			DebugLog:       false,
 			HTTPProbeURL:   envOrDefault("GLOBAL_HTTP_PROBE_URL", "https://www.google.com/generate_204"),
+			EncryptionPolicies: EncPolicyList{
+				{ID: 1, Name: "aes128", Method: "aes-128-gcm", Key: "YWFhYWFhYWFhYWFhYWFhYQ=="},
+			}.normalize(),
 		}
 	}
 	if strings.TrimSpace(s.HTTPProbeURL) == "" {
 		s.HTTPProbeURL = envOrDefault("GLOBAL_HTTP_PROBE_URL", "https://www.google.com/generate_204")
 	}
+	if len(s.EncryptionPolicies) == 0 {
+		s.EncryptionPolicies = EncPolicyList{
+			{ID: 1, Name: "aes128", Method: "aes-128-gcm", Key: "YWFhYWFhYWFhYWFhYWFhYQ=="},
+		}.normalize()
+	}
+	s.EncryptionPolicies = s.EncryptionPolicies.normalize()
 	return s
 }
 
@@ -1824,6 +1974,7 @@ func ensureColumns(db *gorm.DB) {
 		{&User{}, "is_admin", "users", "BOOLEAN"},
 		{&Setting{}, "debug_log", "settings", "BOOLEAN"},
 		{&Setting{}, "http_probe_url", "settings", "TEXT"},
+		{&Setting{}, "encryption_policies", "settings", "TEXT"},
 		{&Peer{}, "entry_ip", "peers", "TEXT"},
 		{&Peer{}, "exit_ip", "peers", "TEXT"},
 	}

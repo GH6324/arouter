@@ -5,11 +5,15 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
@@ -38,6 +42,7 @@ import (
 
 	http2 "alicode.mukj.cn/yjkj.ink/work/http"
 	"github.com/quic-go/quic-go"
+	"golang.org/x/crypto/chacha20poly1305"
 	"nhooyr.io/websocket"
 )
 
@@ -1054,6 +1059,7 @@ type ControlHeader struct {
 	Proto       Protocol `json:"proto"`
 	Compression string   `json:"compress,omitempty"`
 	CompressMin int      `json:"compress_min,omitempty"`
+	EncID       int      `json:"enc_id,omitempty"`
 }
 
 type ctrlType uint8
@@ -1081,6 +1087,14 @@ func parseCtrl(payload []byte) (ctrlType, []byte, error) {
 type UDPDatagram struct {
 	Src     string `json:"src"`
 	Payload []byte `json:"payload"`
+}
+
+// EncryptionPolicy 描述可配置的加密策略（由控制器下发）。
+type EncryptionPolicy struct {
+	ID     int    `json:"id"`
+	Name   string `json:"name,omitempty"`
+	Method string `json:"method"` // aes-128-gcm | aes-256-gcm | chacha20-poly1305
+	Key    string `json:"key"`    // base64 或 hex
 }
 
 // dummyAddr 用于 muxConnAdapter 本地/远端地址占位。
@@ -1219,6 +1233,7 @@ type WSSTransport struct {
 	Metrics       *Metrics
 	Compression   string
 	CompressMin   int
+	EncPolicies   []EncryptionPolicy
 	poolMu        sync.Mutex
 	pool          map[NodeID]*pooledWS
 }
@@ -1243,12 +1258,16 @@ func (t *WSSTransport) Forward(ctx context.Context, src NodeID, path []NodeID, p
 	stream := mux.OpenStream()
 	defer stream.Close(context.Background())
 	session := fmt.Sprintf("mux-%d", stream.ID())
+	pol := selectPolicy(t.EncPolicies)
 	header := ControlHeader{
 		Path:        path[1:],
 		RemoteAddr:  remoteAddr,
 		Proto:       proto,
 		Compression: t.Compression,
 		CompressMin: t.CompressMin,
+	}
+	if pol != nil {
+		header.EncID = pol.ID
 	}
 	hdrPayload, _ := json.Marshal(header)
 	if err := stream.WriteFlags(ctxDial, flagCTRL, marshalCtrl(ctrlHeader, hdrPayload)); err != nil {
@@ -1258,7 +1277,26 @@ func (t *WSSTransport) Forward(ctx context.Context, src NodeID, path []NodeID, p
 	}
 	log.Printf("[mux stream=%d] sent header to %s proto=%s remote=%s path=%v", stream.ID(), next, proto, remoteAddr, header.Path)
 	wsConn := muxStreamConn(ctx, stream, func() { t.release(next, conn) })
-	return bridgeMaybeCompressed(session, downstream, wsConn, header.Compression, header.CompressMin, t.Metrics, path, remoteAddr)
+	if pol != nil {
+		log.Printf("[mux stream=%d] enable encryption enc_id=%d method=%s", stream.ID(), pol.ID, pol.Method)
+		secured, err := wrapSecureConn(wsConn, pol)
+		if err != nil {
+			downstream.Close()
+			t.release(next, conn)
+			return fmt.Errorf("enable encryption failed: %w", err)
+		}
+		wsConn = secured
+	}
+	err = bridgeMaybeCompressed(session, downstream, wsConn, header.Compression, header.CompressMin, t.Metrics, path, remoteAddr)
+	if err != nil {
+		// 出错后关闭流并驱逐连接，避免复用可能异常的 mux
+		_ = stream.Reset(context.Background())
+		t.evict(next, conn)
+		if isCipherErr(err) {
+			log.Printf("[mux stream=%d] encryption error, evicting mux: %v", stream.ID(), err)
+		}
+	}
+	return err
 }
 
 // ProbeHTTP 在给定路径上发起 HTTP 探测（入口->多跳->出口->目标 URL），返回端到端耗时。
@@ -1662,7 +1700,13 @@ func (t *WSSTransport) handleMuxHeader(ctx context.Context, mm *MuxManager, stre
 	remaining := hdr.Path[1:]
 	if len(remaining) == 0 {
 		// exit
-		log.Printf("[mux stream=%d] exit handle proto=%s remote=%s compress=%s", streamID, hdr.Proto, hdr.RemoteAddr, hdr.Compression)
+		log.Printf("[mux stream=%d] exit handle proto=%s remote=%s compress=%s enc_id=%d", streamID, hdr.Proto, hdr.RemoteAddr, hdr.Compression, hdr.EncID)
+		pol := findPolicy(t.EncPolicies, hdr.EncID)
+		if hdr.EncID != 0 && pol == nil {
+			log.Printf("[mux stream=%d] unknown enc policy id=%d", streamID, hdr.EncID)
+			_ = upStream.WriteFlags(context.Background(), flagRST, []byte("unknown enc policy"))
+			return
+		}
 		switch hdr.Proto {
 		case ProtocolTCP:
 			conn, err := net.DialTimeout("tcp", hdr.RemoteAddr, 5*time.Second)
@@ -1671,9 +1715,24 @@ func (t *WSSTransport) handleMuxHeader(ctx context.Context, mm *MuxManager, stre
 				return
 			}
 			wsConn := muxStreamConn(ctx, upStream, func() { conn.Close() })
+			if pol != nil {
+				log.Printf("[mux stream=%d] decrypt with enc_id=%d method=%s", streamID, pol.ID, pol.Method)
+				secured, err := wrapSecureConn(wsConn, pol)
+				if err != nil {
+					_ = upStream.WriteFlags(context.Background(), flagRST, []byte(err.Error()))
+					conn.Close()
+					return
+				}
+				wsConn = secured
+			}
 			go func() {
 				if err := bridgeMaybeCompressed(sessionID, conn, wsConn, hdr.Compression, hdr.CompressMin, t.Metrics, nil, hdr.RemoteAddr); err != nil {
 					log.Printf("[session=%s] exit bridge failed: %v", sessionID, err)
+					_ = upStream.Reset(context.Background())
+					if isCipherErr(err) {
+						log.Printf("[session=%s] cipher error, closing mux conn", sessionID)
+						mm.Conn().Close()
+					}
 				}
 			}()
 		case ProtocolUDP:
@@ -1683,6 +1742,16 @@ func (t *WSSTransport) handleMuxHeader(ctx context.Context, mm *MuxManager, stre
 				return
 			}
 			wsConn := muxStreamConn(ctx, upStream, func() { udpConn.Close() })
+			if pol != nil {
+				log.Printf("[mux stream=%d] decrypt with enc_id=%d method=%s (udp)", streamID, pol.ID, pol.Method)
+				secured, err := wrapSecureConn(wsConn, pol)
+				if err != nil {
+					_ = upStream.WriteFlags(context.Background(), flagRST, []byte(err.Error()))
+					udpConn.Close()
+					return
+				}
+				wsConn = secured
+			}
 			go forwardUDPToStream(wsConn, udpConn, t.Metrics)
 			go forwardStreamToUDP(wsConn, udpConn, t.Metrics)
 		case Protocol("probe"):
@@ -2244,6 +2313,155 @@ func isConnBroken(err error) bool {
 	return errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed)
 }
 
+func isCipherErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "cipher") || strings.Contains(msg, "invalid frame len") || strings.Contains(msg, "nonce") || strings.Contains(msg, "message authentication failed")
+}
+
+// === Encryption helpers ===
+
+// selectPolicy 根据当前时间选择一条加密策略。
+func selectPolicy(pols []EncryptionPolicy) *EncryptionPolicy {
+	if len(pols) == 0 {
+		return nil
+	}
+	idx := int(time.Now().Unix()) % len(pols)
+	return &pols[idx]
+}
+
+func findPolicy(pols []EncryptionPolicy, id int) *EncryptionPolicy {
+	for i := range pols {
+		if pols[i].ID == id {
+			return &pols[i]
+		}
+	}
+	return nil
+}
+
+func decodeKey(s string) ([]byte, error) {
+	if s == "" {
+		return nil, fmt.Errorf("empty key")
+	}
+	if b, err := hex.DecodeString(s); err == nil {
+		return b, nil
+	}
+	if b, err := base64.StdEncoding.DecodeString(s); err == nil {
+		return b, nil
+	}
+	if b, err := base64.URLEncoding.DecodeString(s); err == nil {
+		return b, nil
+	}
+	return []byte(s), nil
+}
+
+func newAEAD(method string, key []byte) (cipher.AEAD, error) {
+	switch strings.ToLower(method) {
+	case "aes-128-gcm", "aes-256-gcm", "aes-gcm":
+		if len(key) != 16 && len(key) != 24 && len(key) != 32 {
+			return nil, fmt.Errorf("aes-gcm key length must be 16/24/32, got %d", len(key))
+		}
+		block, err := aes.NewCipher(key)
+		if err != nil {
+			return nil, err
+		}
+		return cipher.NewGCM(block)
+	case "chacha20-poly1305", "chacha20":
+		if len(key) != chacha20poly1305.KeySize {
+			return nil, fmt.Errorf("chacha20-poly1305 key must be %d bytes", chacha20poly1305.KeySize)
+		}
+		return chacha20poly1305.New(key)
+	default:
+		return nil, fmt.Errorf("unknown method %s", method)
+	}
+}
+
+// secureConn 在 net.Conn 上做 AEAD 分帧加解密。
+type secureConn struct {
+	conn      net.Conn
+	aead      cipher.AEAD
+	readBuf   []byte
+	nonceSize int
+}
+
+func wrapSecureConn(c net.Conn, pol *EncryptionPolicy) (net.Conn, error) {
+	if pol == nil {
+		return c, nil
+	}
+	key, err := decodeKey(pol.Key)
+	if err != nil {
+		return nil, err
+	}
+	a, err := newAEAD(pol.Method, key)
+	if err != nil {
+		return nil, err
+	}
+	return &secureConn{conn: c, aead: a, nonceSize: a.NonceSize()}, nil
+}
+
+func (s *secureConn) Read(p []byte) (int, error) {
+	if len(s.readBuf) == 0 {
+		var lenBuf [4]byte
+		if _, err := io.ReadFull(s.conn, lenBuf[:]); err != nil {
+			return 0, err
+		}
+		frameLen := binary.BigEndian.Uint32(lenBuf[:])
+		if frameLen == 0 || frameLen > 4<<20 {
+			err := fmt.Errorf("invalid frame len %d", frameLen)
+			_ = s.conn.Close()
+			return 0, err
+		}
+		frame := make([]byte, frameLen)
+		if _, err := io.ReadFull(s.conn, frame); err != nil {
+			return 0, err
+		}
+		if len(frame) < s.nonceSize {
+			return 0, fmt.Errorf("frame too short")
+		}
+		nonce := frame[:s.nonceSize]
+		ct := frame[s.nonceSize:]
+		pt, err := s.aead.Open(nil, nonce, ct, nil)
+		if err != nil {
+			_ = s.conn.Close()
+			return 0, err
+		}
+		s.readBuf = pt
+	}
+	n := copy(p, s.readBuf)
+	s.readBuf = s.readBuf[n:]
+	return n, nil
+}
+
+func (s *secureConn) Write(p []byte) (int, error) {
+	nonce := make([]byte, s.nonceSize)
+	if _, err := rand.Read(nonce); err != nil {
+		return 0, err
+	}
+	ct := s.aead.Seal(nil, nonce, p, nil)
+	var lenBuf [4]byte
+	total := len(nonce) + len(ct)
+	binary.BigEndian.PutUint32(lenBuf[:], uint32(total))
+	if _, err := s.conn.Write(lenBuf[:]); err != nil {
+		return 0, err
+	}
+	if _, err := s.conn.Write(nonce); err != nil {
+		return 0, err
+	}
+	if _, err := s.conn.Write(ct); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+func (s *secureConn) Close() error                       { return s.conn.Close() }
+func (s *secureConn) LocalAddr() net.Addr                { return s.conn.LocalAddr() }
+func (s *secureConn) RemoteAddr() net.Addr               { return s.conn.RemoteAddr() }
+func (s *secureConn) SetDeadline(t time.Time) error      { return s.conn.SetDeadline(t) }
+func (s *secureConn) SetReadDeadline(t time.Time) error  { return s.conn.SetReadDeadline(t) }
+func (s *secureConn) SetWriteDeadline(t time.Time) error { return s.conn.SetWriteDeadline(t) }
+
 type countingWriter struct {
 	Writer  io.Writer
 	counter *int64
@@ -2287,6 +2505,7 @@ type Node struct {
 	KeyPath        string
 	AuthKey        []byte
 	DebugLog       bool
+	EncPolicies    []EncryptionPolicy
 	lastMetrics    map[NodeID]LinkMetrics
 	metricsMu      sync.Mutex
 	routePlans     map[NodeID][]ManualRoute
@@ -2514,11 +2733,13 @@ func (n *Node) serveTCP(ctx context.Context, ep EntryPort) {
 			if n.Metrics != nil {
 				n.Metrics.IncTCP()
 			}
-			attempts := n.routeAttempts(ep.ExitNode, ep.RemoteAddr)
-			if err := n.Transport.ReconnectTCP(ctx, n.ID, ep.Proto, c, ep.RemoteAddr, func(try int) ([]NodeID, error) {
-				return n.pathForAttempt(ep.ExitNode, ep.RemoteAddr, try)
-			}, attempts); err != nil {
-				log.Printf("tcp forwarding failed after %d attempts: %v", attempts, err)
+			path, err := n.pathForAttempt(ep.ExitNode, ep.RemoteAddr, 0)
+			if err != nil {
+				log.Printf("tcp forwarding failed: %v", err)
+				return
+			}
+			if err := n.Transport.Forward(ctx, n.ID, path, ep.Proto, c, ep.RemoteAddr); err != nil {
+				log.Printf("tcp forwarding failed: %v", err)
 			}
 		}(conn)
 	}
@@ -2684,34 +2905,35 @@ type routePlanConfig struct {
 }
 
 type nodeConfig struct {
-	ID              string            `json:"id"`
-	WSListen        string            `json:"ws_listen"`
-	QUICListen      string            `json:"quic_listen"`
-	WSSListen       string            `json:"wss_listen"`
-	Peers           map[string]string `json:"peers"` // node -> ws(s)://host:port/mesh
-	Entries         []entryConfig     `json:"entries"`
-	Routes          []routePlanConfig `json:"routes"`
-	PollPeriod      string            `json:"poll_period"`
-	InsecureSkipTLS bool              `json:"insecure_skip_tls"`
-	QUICServerName  string            `json:"quic_server_name"`
-	MaxIdle         string            `json:"quic_max_idle"`
-	MaxDatagramSize int               `json:"quic_max_datagram_size"`
-	AuthKey         string            `json:"auth_key"`
-	MetricsListen   string            `json:"metrics_listen"`
-	RerouteAttempts int               `json:"reroute_attempts"`
-	UDPSessionTTL   string            `json:"udp_session_ttl"`
-	MTLSCert        string            `json:"mtls_cert"`
-	MTLSKey         string            `json:"mtls_key"`
-	MTLSCA          string            `json:"mtls_ca"`
-	ControllerURL   string            `json:"controller_url"`
-	TopologyPull    string            `json:"topology_pull"`
-	RoutePull       string            `json:"route_pull"`
-	Compression     string            `json:"compression"`
-	CompressionMin  int               `json:"compression_min_bytes"`
-	Transport       string            `json:"transport"`
-	TokenPath       string            `json:"token_path"`
-	DebugLog        bool              `json:"debug_log"`
-	HTTPProbeURL    string            `json:"http_probe_url"`
+	ID              string             `json:"id"`
+	WSListen        string             `json:"ws_listen"`
+	QUICListen      string             `json:"quic_listen"`
+	WSSListen       string             `json:"wss_listen"`
+	Peers           map[string]string  `json:"peers"` // node -> ws(s)://host:port/mesh
+	Entries         []entryConfig      `json:"entries"`
+	Routes          []routePlanConfig  `json:"routes"`
+	PollPeriod      string             `json:"poll_period"`
+	InsecureSkipTLS bool               `json:"insecure_skip_tls"`
+	QUICServerName  string             `json:"quic_server_name"`
+	MaxIdle         string             `json:"quic_max_idle"`
+	MaxDatagramSize int                `json:"quic_max_datagram_size"`
+	AuthKey         string             `json:"auth_key"`
+	MetricsListen   string             `json:"metrics_listen"`
+	RerouteAttempts int                `json:"reroute_attempts"`
+	UDPSessionTTL   string             `json:"udp_session_ttl"`
+	MTLSCert        string             `json:"mtls_cert"`
+	MTLSKey         string             `json:"mtls_key"`
+	MTLSCA          string             `json:"mtls_ca"`
+	ControllerURL   string             `json:"controller_url"`
+	TopologyPull    string             `json:"topology_pull"`
+	RoutePull       string             `json:"route_pull"`
+	Compression     string             `json:"compression"`
+	CompressionMin  int                `json:"compression_min_bytes"`
+	Transport       string             `json:"transport"`
+	TokenPath       string             `json:"token_path"`
+	DebugLog        bool               `json:"debug_log"`
+	HTTPProbeURL    string             `json:"http_probe_url"`
+	EncPolicies     []EncryptionPolicy `json:"encryption_policies"`
 }
 
 func loadConfig(path string) (nodeConfig, error) {
@@ -3118,6 +3340,7 @@ func main() {
 				Metrics:       metrics,
 				Compression:   compression,
 				CompressMin:   cfg.CompressionMin,
+				EncPolicies:   cfg.EncPolicies,
 			}
 		default:
 			log.Printf("unknown transport %s, fallback to ws", mode)
@@ -3133,6 +3356,7 @@ func main() {
 				Metrics:       metrics,
 				Compression:   compression,
 				CompressMin:   cfg.CompressionMin,
+				EncPolicies:   cfg.EncPolicies,
 			}
 		}
 		prober := &WSProber{
@@ -3168,6 +3392,7 @@ func main() {
 			routePlans:     routePlans,
 			TokenPath:      platformPath(defaultIfEmpty(*tokenPath, "/opt/arouter/.token")),
 			DebugLog:       cfg.DebugLog,
+			EncPolicies:    cfg.EncPolicies,
 		}
 
 		ctx, cancel := context.WithCancel(context.Background())
