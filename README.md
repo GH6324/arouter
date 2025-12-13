@@ -23,7 +23,7 @@ ARouter 为搭建一个安全可靠的数据传输网络，防止中间人拦截
 version: '3.8'
 services:
   controller:
-    image: your-registry/arouter-controller:latest
+    image: 24802117/arouter:latest
     container_name: arouter-controller
     environment:
       - CONTROLLER_ADDR=:8080
@@ -37,23 +37,42 @@ services:
 ```
 启动：`docker-compose up -d`，访问 `http://<host>:8080`。
 
-### MySQL 版本
+### MySQL 版本（含 MySQL 容器，一键复制）
 ```yaml
 version: '3.8'
 services:
+  mysql:
+    image: mysql:8.0
+    container_name: arouter-mysql
+    environment:
+      - MYSQL_DATABASE=arouter
+      - MYSQL_USER=arouter
+      - MYSQL_PASSWORD=arouter123
+      - MYSQL_ROOT_PASSWORD=change_me_root
+    command: --default-authentication-plugin=mysql_native_password
+    volumes:
+      - ./mysql-data:/var/lib/mysql
+    ports:
+      - "3306:3306"
+    restart: unless-stopped
+
   controller:
-    image: your-registry/arouter-controller:latest
+    image: 24802117/arouter:latest
     container_name: arouter-controller
     environment:
       - CONTROLLER_ADDR=:8080
-      - DB_DSN=user:pass@tcp(mysql:3306)/arouter?parseTime=true
+      - DB_DSN=arouter:arouter123@tcp(mysql:3306)/arouter?parseTime=true&charset=utf8mb4&loc=Local
+    depends_on:
+      - mysql
     volumes:
-      - ./certs:/app/certs
+      - ./certs:/app/certs   # 如需自定义证书
     ports:
       - "8080:8080"
     restart: unless-stopped
 ```
-确保 MySQL 已建库 `arouter` 且账号具备建表权限（控制器会 AutoMigrate）。
+复制上述文件为 `docker-compose.yml`，`docker-compose up -d` 即可：会同时拉起 MySQL 与控制器。第一次启动会自动建表（AutoMigrate）。
+
+如已有 MySQL，可仅保留 `controller` 服务，确保 `DB_DSN` 中的账号拥有建库/建表权限，并在 DSN 中加上 `?parseTime=true&charset=utf8mb4&loc=Local`。
 
 ## 节点部署
 1. 在控制台创建节点（“节点列表”→“新建节点”），记录节点 Token。
@@ -78,4 +97,3 @@ services:
 - 服务未监听：检查 systemd/launchctl 状态，查看安装目录下 `arouter.log`、`arouter.err`。
 - TLS/WSS 探测失败：确认目标端口是否启用 TLS，必要时切回 `ws`，或开启 `insecure_skip_tls`/留空 SNI。
 - 重启：macOS `sudo launchctl kickstart -k system/com.arouter.node`；Linux `sudo systemctl restart arouter`。
-
