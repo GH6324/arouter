@@ -1056,11 +1056,38 @@ type ControlHeader struct {
 	CompressMin int      `json:"compress_min,omitempty"`
 }
 
+type ctrlType uint8
+
+const (
+	ctrlHeader ctrlType = 1
+	ctrlAck    ctrlType = 2
+	ctrlError  ctrlType = 3
+	ctrlUDP    ctrlType = 4
+	ctrlProbe  ctrlType = 5
+)
+
+func marshalCtrl(t ctrlType, payload []byte) []byte {
+	return append([]byte{byte(t)}, payload...)
+}
+
+func parseCtrl(payload []byte) (ctrlType, []byte, error) {
+	if len(payload) == 0 {
+		return 0, nil, fmt.Errorf("empty ctrl payload")
+	}
+	return ctrlType(payload[0]), payload[1:], nil
+}
+
 // UDPDatagram 用于跨 WS 传输单个 UDP 包。
 type UDPDatagram struct {
 	Src     string `json:"src"`
 	Payload []byte `json:"payload"`
 }
+
+// dummyAddr 用于 muxConnAdapter 本地/远端地址占位。
+type dummyAddr string
+
+func (d dummyAddr) Network() string { return "mux" }
+func (d dummyAddr) String() string  { return string(d) }
 
 func probeURL(endpoint string) string {
 	if endpoint == "" {
@@ -1174,6 +1201,7 @@ type pooledWS struct {
 	conn      *websocket.Conn
 	createdAt time.Time
 	inUse     int32
+	mux       *MuxManager
 }
 
 // WSSTransport 通过 WebSocket 级联转发，可同时监听 WS 与 WSS。
@@ -1205,7 +1233,16 @@ func (t *WSSTransport) Forward(ctx context.Context, src NodeID, path []NodeID, p
 		return fmt.Errorf("no endpoint for %s", next)
 	}
 	targetURL = normalizeWSEndpoint(targetURL)
-	session := newSessionID()
+	ctxDial, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	conn, mux, err := t.getOrDialMux(ctxDial, next, targetURL)
+	if err != nil {
+		downstream.Close()
+		return fmt.Errorf("dial next %s failed: %w", next, err)
+	}
+	stream := mux.OpenStream()
+	defer stream.Close(context.Background())
+	session := fmt.Sprintf("mux-%d", stream.ID())
 	header := ControlHeader{
 		Path:        path[1:],
 		RemoteAddr:  remoteAddr,
@@ -1213,40 +1250,14 @@ func (t *WSSTransport) Forward(ctx context.Context, src NodeID, path []NodeID, p
 		Compression: t.Compression,
 		CompressMin: t.CompressMin,
 	}
-	ctxDial, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
-	c, err := t.getOrDial(ctxDial, next, targetURL)
-	if err != nil {
+	hdrPayload, _ := json.Marshal(header)
+	if err := stream.WriteFlags(ctxDial, flagCTRL, marshalCtrl(ctrlHeader, hdrPayload)); err != nil {
 		downstream.Close()
-		return fmt.Errorf("dial next %s failed: %w", next, err)
-	}
-
-	if err := writeSignedEnvelope(ctxDial, c, ControlEnvelope{
-		Type:    "header",
-		Session: session,
-		Header:  &header,
-	}, t.AuthKey); err != nil {
-		downstream.Close()
+		t.release(next, conn)
 		return fmt.Errorf("send header failed: %w", err)
 	}
-	ack, err := readVerifiedEnvelope(ctxDial, c, t.AuthKey)
-	if err != nil {
-		downstream.Close()
-		return fmt.Errorf("await ack failed: %w", err)
-	}
-	if ack.Type != "ack" {
-		downstream.Close()
-		return fmt.Errorf("expected ack, got %s: %s", ack.Type, ack.Error)
-	}
-	log.Printf("[session=%s] 下游 %s 确认链路，已确认: %v", session, next, ack.Ack.Confirmed)
-	wsConn := websocket.NetConn(ctx, c, websocket.MessageBinary)
-	go func() {
-		<-ctx.Done()
-		t.release(next, c)
-		c.Close(websocket.StatusNormalClosure, "ctx canceled")
-		wsConn.Close()
-	}()
-	// 首跳按照请求压缩，后续中间节点在转发时透传
+	log.Printf("[mux stream=%d] sent header to %s proto=%s remote=%s path=%v", stream.ID(), next, proto, remoteAddr, header.Path)
+	wsConn := muxStreamConn(ctx, stream, func() { t.release(next, conn) })
 	return bridgeMaybeCompressed(session, downstream, wsConn, header.Compression, header.CompressMin, t.Metrics, path, remoteAddr)
 }
 
@@ -1264,54 +1275,43 @@ func (t *WSSTransport) ProbeHTTP(ctx context.Context, path []NodeID, target stri
 		return 0, fmt.Errorf("no endpoint for %s", next)
 	}
 	targetURL = normalizeWSEndpoint(targetURL)
-	session := newSessionID()
 	start := time.Now()
 	ctxDial, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	conn, err := t.getOrDial(ctxDial, next, targetURL)
+	conn, mux, err := t.getOrDialMux(ctxDial, next, targetURL)
 	if err != nil {
 		return 0, fmt.Errorf("dial next %s failed: %w", next, err)
 	}
-	defer conn.Close(websocket.StatusNormalClosure, "probe done")
-	if err := writeSignedEnvelope(ctxDial, conn, ControlEnvelope{
-		Type:    "probe_http",
-		Session: session,
-		Probe: &HTTPProbe{
-			Path:   path[1:],
-			Target: target,
-		},
-	}, t.AuthKey); err != nil {
+	defer t.release(next, conn)
+	stream := mux.OpenStream()
+	defer stream.Close(context.Background())
+	header := ControlHeader{
+		Path:       path[1:],
+		RemoteAddr: target, // 复用 RemoteAddr 字段传目标 URL
+		Proto:      Protocol("probe"),
+	}
+	hdrPayload, _ := json.Marshal(header)
+	if err := stream.WriteFlags(ctxDial, flagCTRL, marshalCtrl(ctrlProbe, hdrPayload)); err != nil {
 		return 0, fmt.Errorf("send probe failed: %w", err)
 	}
-	res, err := readVerifiedEnvelope(ctxDial, conn, t.AuthKey)
-	if err != nil {
-		return 0, fmt.Errorf("wait probe result failed: %w", err)
-	}
-	if res.Type != "probe_result" || res.ProbeResult == nil {
-		return 0, fmt.Errorf("unexpected response %s", res.Type)
+	// 等待 FIN 表示完成
+	ch := mux.subscribe(stream.ID())
+	for f := range ch {
+		if f.flags&(flagFIN|flagRST) != 0 {
+			break
+		}
 	}
 	return time.Since(start), nil
 }
 
 // ReconnectTCP 在桥接出错时尝试重新选路重建连接。
 func (t *WSSTransport) ReconnectTCP(ctx context.Context, src NodeID, proto Protocol, downstream net.Conn, remoteAddr string, computePath func(try int) ([]NodeID, error), attempts int) error {
-	if attempts < 1 {
-		attempts = 1
+	// 仅对入口->隧道、隧道->隧道做一次尝试，出口/远端断开不再重试。
+	path, err := computePath(0)
+	if err != nil {
+		return err
 	}
-	for i := 0; i < attempts; i++ {
-		path, err := computePath(i)
-		if err != nil {
-			time.Sleep(200 * time.Millisecond)
-			continue
-		}
-		err = t.Forward(ctx, src, path, proto, downstream, remoteAddr)
-		if err == nil {
-			return nil
-		}
-		log.Printf("[reconnect attempt %d/%d] failed: %v", i+1, attempts, err)
-		time.Sleep(300 * time.Millisecond)
-	}
-	return fmt.Errorf("reconnect attempts exhausted")
+	return t.Forward(ctx, src, path, proto, downstream, remoteAddr)
 }
 
 // OpenUDPSession 建立 UDP 隧道的控制面，返回已握手的 WS 连接与会话 ID。
@@ -1444,187 +1444,12 @@ func (t *WSSTransport) handleConn(ctx context.Context, c *websocket.Conn) {
 	if t.IdleTimeout > 0 {
 		c.SetReadLimit(64 << 20)
 	}
-	env, err := readVerifiedEnvelope(ctx, c, t.AuthKey)
-	if err != nil {
-		log.Printf("read header failed: %v", err)
-		return
-	}
-	if env.Type == "probe_http" && env.Probe != nil {
-		t.handleHTTPProbe(ctx, c, env)
-		return
-	}
-	if env.Type != "header" || env.Header == nil {
-		log.Printf("unexpected envelope type %s", env.Type)
-		return
-	}
-	header := *env.Header
-	session := env.Session
-	if len(header.Path) == 0 {
-		log.Printf("empty path in header")
-		return
-	}
-	if header.Path[0] != t.Self {
-		log.Printf("path not for me: %v", header.Path)
-		return
-	}
-	remaining := header.Path[1:]
-
-	if len(remaining) == 0 {
-		// 当前节点是出口
-		switch header.Proto {
-		case ProtocolTCP:
-			if err := t.handleTCPExit(ctx, session, c, header.RemoteAddr, header.Compression, header.CompressMin); err != nil {
-				writeSignedEnvelope(ctx, c, ControlEnvelope{Type: "error", Session: session, Error: err.Error()}, t.AuthKey)
-				return
-			}
-		case ProtocolUDP:
-			if err := t.handleUDPExit(ctx, session, c, header.RemoteAddr); err != nil {
-				writeSignedEnvelope(ctx, c, ControlEnvelope{Type: "error", Session: session, Error: err.Error()}, t.AuthKey)
-				return
-			}
-		default:
-			log.Printf("unknown proto %q", header.Proto)
-		}
-		return
-	}
-
-	// 中间节点：转发到下一跳
-	next := remaining[0]
-	targetURL, ok := t.Endpoints[next]
-	if !ok {
-		log.Printf("no endpoint for next hop %s", next)
-		return
-	}
-	ctxDial, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
-	nextConn, err := t.getOrDial(ctxDial, next, targetURL)
-	if err != nil {
-		log.Printf("dial next hop %s failed: %v", next, err)
-		return
-	}
-	if err := writeSignedEnvelope(ctxDial, nextConn, ControlEnvelope{
-		Type:    "header",
-		Session: session,
-		Header: &ControlHeader{
-			Path:        remaining,
-			RemoteAddr:  header.RemoteAddr,
-			Proto:       header.Proto,
-			Compression: header.Compression,
-			CompressMin: header.CompressMin,
-		},
-	}, t.AuthKey); err != nil {
-		log.Printf("forward header failed: %v", err)
-		nextConn.Close(websocket.StatusInternalError, "header write failed")
-		return
-	}
-	nextAck, err := readVerifiedEnvelope(ctxDial, nextConn, t.AuthKey)
-	if err != nil {
-		log.Printf("wait downstream ack failed: %v", err)
-		return
-	}
-	if nextAck.Type != "ack" || nextAck.Ack == nil {
-		log.Printf("downstream returned non-ack: %s %s", nextAck.Type, nextAck.Error)
-		return
-	}
-	confirmed := append([]NodeID{t.Self}, nextAck.Ack.Confirmed...)
-	if err := writeSignedEnvelope(ctx, c, ControlEnvelope{
-		Type:    "ack",
-		Session: session,
-		Ack:     &AckStatus{Confirmed: confirmed, Note: "forwarded to " + string(next)},
-	}, t.AuthKey); err != nil {
-		log.Printf("send upstream ack failed: %v", err)
-		return
-	}
-
-	if header.Proto == ProtocolUDP {
-		t.relayUDP(ctx, session, c, nextConn)
-		return
-	}
-
-	upstream := websocket.NetConn(ctx, c, websocket.MessageBinary)
-	downstream := websocket.NetConn(ctx, nextConn, websocket.MessageBinary)
-	if err := bridgeWithLogging(session, upstream, downstream, t.Metrics); err != nil {
-		log.Printf("[session=%s] bridge failed: %v", session, err)
-	}
+	mux := NewMuxManager(NewMuxConn(c))
+	t.muxServe(ctx, mux)
 }
 
 func (t *WSSTransport) handleHTTPProbe(ctx context.Context, c *websocket.Conn, env ControlEnvelope) {
-	probe := env.Probe
-	session := env.Session
-	if probe == nil || len(probe.Path) == 0 {
-		log.Printf("[session=%s] empty probe path", session)
-		return
-	}
-	if probe.Path[0] != t.Self {
-		log.Printf("[session=%s] probe path not for me: %v", session, probe.Path)
-		return
-	}
-	remaining := probe.Path[1:]
-	if len(remaining) == 0 {
-		// 我是出口，直接访问目标
-		ctxReq, cancel := context.WithTimeout(ctx, 20*time.Second)
-		defer cancel()
-		req, _ := http.NewRequestWithContext(ctxReq, "GET", probe.Target, nil)
-		resp, err := http.DefaultClient.Do(req)
-		result := &HTTPProbeResult{}
-		if err != nil {
-			result.Error = err.Error()
-		} else {
-			result.Status = resp.StatusCode
-			resp.Body.Close()
-			if resp.StatusCode >= 200 && resp.StatusCode < 400 {
-				result.Success = true
-			} else {
-				result.Error = resp.Status
-			}
-		}
-		_ = writeSignedEnvelope(ctx, c, ControlEnvelope{
-			Type:        "probe_result",
-			Session:     session,
-			ProbeResult: result,
-		}, t.AuthKey)
-		return
-	}
-
-	// 中间节点转发
-	next := remaining[0]
-	targetURL, ok := t.Endpoints[next]
-	if !ok {
-		log.Printf("[session=%s] probe no endpoint for %s", session, next)
-		return
-	}
-	ctxDial, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
-	nextConn, _, err := websocket.Dial(ctxDial, targetURL, &websocket.DialOptions{
-		HTTPClient:      fastWSClient(t.TLSConfig),
-		CompressionMode: websocket.CompressionDisabled,
-	})
-	if err != nil {
-		log.Printf("[session=%s] probe dial next %s failed: %v", session, next, err)
-		return
-	}
-	defer nextConn.Close(websocket.StatusNormalClosure, "probe relay done")
-	if err := writeSignedEnvelope(ctxDial, nextConn, ControlEnvelope{
-		Type:    "probe_http",
-		Session: session,
-		Probe: &HTTPProbe{
-			Path:   remaining,
-			Target: probe.Target,
-		},
-	}, t.AuthKey); err != nil {
-		log.Printf("[session=%s] probe forward failed: %v", session, err)
-		return
-	}
-	resEnv, err := readVerifiedEnvelope(ctxDial, nextConn, t.AuthKey)
-	if err != nil {
-		log.Printf("[session=%s] probe await result failed: %v", session, err)
-		return
-	}
-	if resEnv.Type != "probe_result" || resEnv.ProbeResult == nil {
-		log.Printf("[session=%s] probe got unexpected %s", session, resEnv.Type)
-		return
-	}
-	_ = writeSignedEnvelope(ctx, c, resEnv, t.AuthKey)
+	_ = c.Close(websocket.StatusUnsupportedData, "legacy probe unsupported in mux mode")
 }
 
 func (t *WSSTransport) getOrDial(ctx context.Context, next NodeID, url string) (*websocket.Conn, error) {
@@ -1652,6 +1477,36 @@ func (t *WSSTransport) getOrDial(ctx context.Context, next NodeID, url string) (
 	return conn, nil
 }
 
+func (t *WSSTransport) getOrDialMux(ctx context.Context, next NodeID, url string) (*websocket.Conn, *MuxManager, error) {
+	t.poolMu.Lock()
+	if t.pool == nil {
+		t.pool = make(map[NodeID]*pooledWS)
+	}
+	if p := t.pool[next]; p != nil && p.conn != nil && p.mux != nil {
+		atomic.AddInt32(&p.inUse, 1)
+		t.poolMu.Unlock()
+		return p.conn, p.mux, nil
+	}
+	t.poolMu.Unlock()
+	conn, _, err := websocket.Dial(ctx, url, &websocket.DialOptions{
+		HTTPClient:      fastWSClient(t.TLSConfig),
+		CompressionMode: websocket.CompressionDisabled,
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	mux := NewMuxManager(NewMuxConn(conn))
+	t.poolMu.Lock()
+	t.pool[next] = &pooledWS{conn: conn, createdAt: time.Now(), inUse: 1, mux: mux}
+	t.poolMu.Unlock()
+	go t.keepalive(next, conn)
+	go func() {
+		<-mux.Done()
+		t.evict(next, conn)
+	}()
+	return conn, mux, nil
+}
+
 func (t *WSSTransport) release(next NodeID, conn *websocket.Conn) {
 	t.poolMu.Lock()
 	if p := t.pool[next]; p != nil && p.conn == conn {
@@ -1675,6 +1530,249 @@ func (t *WSSTransport) keepalive(next NodeID, conn *websocket.Conn) {
 		if err := conn.Ping(context.Background()); err != nil {
 			t.evict(next, conn)
 			conn.Close(websocket.StatusInternalError, "ping failed")
+			return
+		}
+	}
+}
+
+// muxStreamConn adapts a mux stream to net.Conn-like interface for bridge without extra pipes.
+func muxStreamConn(ctx context.Context, stream *MuxStream, onClose func()) net.Conn {
+	ch := stream.mgr.subscribe(stream.ID())
+	return &muxConnAdapter{
+		ctx:     ctx,
+		stream:  stream,
+		ch:      ch,
+		onClose: onClose,
+	}
+}
+
+type muxConnAdapter struct {
+	ctx     context.Context
+	stream  *MuxStream
+	ch      <-chan muxFrame
+	buf     []byte
+	closed  bool
+	onClose func()
+}
+
+func (m *muxConnAdapter) Read(p []byte) (int, error) {
+	if m.closed {
+		return 0, io.EOF
+	}
+	for {
+		if len(m.buf) > 0 {
+			n := copy(p, m.buf)
+			m.buf = m.buf[n:]
+			return n, nil
+		}
+		f, ok := <-m.ch
+		if !ok {
+			m.closed = true
+			return 0, io.EOF
+		}
+		if len(f.payload) > 0 {
+			m.buf = f.payload
+		}
+		if f.flags&(flagFIN|flagRST) != 0 {
+			log.Printf("[mux stream=%d] upstream fin/rst flags=%d", m.stream.ID(), f.flags)
+			if len(m.buf) == 0 {
+				m.closed = true
+				if m.onClose != nil {
+					m.onClose()
+				}
+				return 0, io.EOF
+			}
+		}
+	}
+}
+
+func (m *muxConnAdapter) Write(p []byte) (int, error) {
+	if m.closed {
+		return 0, io.ErrClosedPipe
+	}
+	if err := m.stream.Write(context.Background(), p); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+func (m *muxConnAdapter) Close() error {
+	if m.closed {
+		return nil
+	}
+	m.closed = true
+	if m.onClose != nil {
+		m.onClose()
+	}
+	return m.stream.Close(context.Background())
+}
+
+func (m *muxConnAdapter) LocalAddr() net.Addr  { return dummyAddr("mux") }
+func (m *muxConnAdapter) RemoteAddr() net.Addr { return dummyAddr("mux") }
+func (m *muxConnAdapter) SetDeadline(t time.Time) error {
+	return nil
+}
+func (m *muxConnAdapter) SetReadDeadline(t time.Time) error  { return nil }
+func (m *muxConnAdapter) SetWriteDeadline(t time.Time) error { return nil }
+
+// muxServe handles incoming mux frames on an accepted WS connection.
+func (t *WSSTransport) muxServe(ctx context.Context, mm *MuxManager) {
+	defaultCh := mm.subscribeDefault()
+	go mm.Conn().KeepAlive(ctx, 15*time.Second)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case f, ok := <-defaultCh:
+			if !ok {
+				return
+			}
+			if f.flags&flagCTRL != 0 {
+				ct, payload, err := parseCtrl(f.payload)
+				if err != nil {
+					continue
+				}
+				if ct == ctrlHeader {
+					var hdr ControlHeader
+					if err := json.Unmarshal(payload, &hdr); err != nil {
+						continue
+					}
+					t.handleMuxHeader(ctx, mm, f.streamID, hdr)
+				} else {
+					log.Printf("[mux stream=%d] ignore ctrl type=%d", f.streamID, ct)
+				}
+			} else {
+				// 数据帧可能在订阅前先到 defaultCh，推送到对应 stream channel，避免阻塞
+				ch := mm.subscribe(f.streamID)
+				ch <- f
+			}
+		}
+	}
+}
+
+// handleMuxHeader processes control header; bridges exit or forwards.
+func (t *WSSTransport) handleMuxHeader(ctx context.Context, mm *MuxManager, streamID uint32, hdr ControlHeader) {
+	if len(hdr.Path) == 0 || hdr.Path[0] != t.Self {
+		log.Printf("[mux stream=%d] header path mismatch, expected start %s got %v", streamID, t.Self, hdr.Path)
+		return
+	}
+	upStream := &MuxStream{id: streamID, m: mm.Conn(), mgr: mm}
+	streamCh := mm.subscribe(streamID)
+	sessionID := fmt.Sprintf("mux-%d", streamID)
+	remaining := hdr.Path[1:]
+	if len(remaining) == 0 {
+		// exit
+		log.Printf("[mux stream=%d] exit handle proto=%s remote=%s compress=%s", streamID, hdr.Proto, hdr.RemoteAddr, hdr.Compression)
+		switch hdr.Proto {
+		case ProtocolTCP:
+			conn, err := net.DialTimeout("tcp", hdr.RemoteAddr, 5*time.Second)
+			if err != nil {
+				_ = upStream.WriteFlags(context.Background(), flagRST, []byte(err.Error()))
+				return
+			}
+			wsConn := muxStreamConn(ctx, upStream, func() { conn.Close() })
+			go func() {
+				if err := bridgeMaybeCompressed(sessionID, conn, wsConn, hdr.Compression, hdr.CompressMin, t.Metrics, nil, hdr.RemoteAddr); err != nil {
+					log.Printf("[session=%s] exit bridge failed: %v", sessionID, err)
+				}
+			}()
+		case ProtocolUDP:
+			udpConn, err := net.Dial("udp", hdr.RemoteAddr)
+			if err != nil {
+				_ = upStream.WriteFlags(context.Background(), flagRST, []byte(err.Error()))
+				return
+			}
+			wsConn := muxStreamConn(ctx, upStream, func() { udpConn.Close() })
+			go forwardUDPToStream(wsConn, udpConn, t.Metrics)
+			go forwardStreamToUDP(wsConn, udpConn, t.Metrics)
+		case Protocol("probe"):
+			// 出口执行 HTTP 探测
+			ctxReq, cancel := context.WithTimeout(ctx, 20*time.Second)
+			defer cancel()
+			req, _ := http.NewRequestWithContext(ctxReq, "GET", hdr.RemoteAddr, nil)
+			resp, err := http.DefaultClient.Do(req)
+			if err == nil {
+				resp.Body.Close()
+			}
+			_ = upStream.WriteFlags(context.Background(), flagFIN, nil)
+		}
+		return
+	}
+	// forward to next hop
+	next := remaining[0]
+	targetURL, ok := t.Endpoints[next]
+	if !ok {
+		_ = upStream.WriteFlags(context.Background(), flagRST, []byte("no endpoint"))
+		return
+	}
+	log.Printf("[mux stream=%d] forward to %s path=%v", streamID, next, remaining)
+	ctxDial, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	_, nextMux, err := t.getOrDialMux(ctxDial, next, targetURL)
+	if err != nil || nextMux == nil {
+		_ = upStream.WriteFlags(context.Background(), flagRST, []byte("dial next failed"))
+		return
+	}
+	downStream := nextMux.OpenStream()
+	hdr.Path = remaining
+	payload, _ := json.Marshal(hdr)
+	if err := downStream.WriteFlags(ctxDial, flagCTRL, marshalCtrl(ctrlHeader, payload)); err != nil {
+		return
+	}
+	downCh := nextMux.subscribe(downStream.ID())
+	// downstream -> upstream
+	go func() {
+		for f := range downCh {
+			if len(f.payload) > 0 {
+				_ = upStream.Write(context.Background(), f.payload)
+			}
+			if f.flags&(flagFIN|flagRST) != 0 {
+				_ = upStream.WriteFlags(context.Background(), flagFIN, nil)
+				return
+			}
+		}
+	}()
+	// upstream -> downstream
+	go func() {
+		for f := range streamCh {
+			if len(f.payload) > 0 {
+				_ = downStream.Write(context.Background(), f.payload)
+			}
+			if f.flags&(flagFIN|flagRST) != 0 {
+				_ = downStream.WriteFlags(context.Background(), flagFIN, nil)
+				return
+			}
+		}
+	}()
+}
+
+func forwardUDPToStream(wsConn net.Conn, udpConn net.Conn, metrics *Metrics) {
+	buf := make([]byte, 65535)
+	for {
+		n, err := udpConn.Read(buf)
+		if n > 0 {
+			wsConn.Write(buf[:n])
+			if metrics != nil {
+				metrics.AddDown(int64(n))
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+func forwardStreamToUDP(wsConn net.Conn, udpConn net.Conn, metrics *Metrics) {
+	buf := make([]byte, 65535)
+	for {
+		n, err := wsConn.Read(buf)
+		if n > 0 {
+			udpConn.Write(buf[:n])
+			if metrics != nil {
+				metrics.AddUp(int64(n))
+			}
+		}
+		if err != nil {
 			return
 		}
 	}
@@ -2139,6 +2237,13 @@ func isCanceledErr(err error) bool {
 	return false
 }
 
+func isConnBroken(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed)
+}
+
 type countingWriter struct {
 	Writer  io.Writer
 	counter *int64
@@ -2405,6 +2510,7 @@ func (n *Node) serveTCP(ctx context.Context, ep EntryPort) {
 			continue
 		}
 		go func(c net.Conn) {
+			defer c.Close()
 			if n.Metrics != nil {
 				n.Metrics.IncTCP()
 			}
@@ -2413,7 +2519,6 @@ func (n *Node) serveTCP(ctx context.Context, ep EntryPort) {
 				return n.pathForAttempt(ep.ExitNode, ep.RemoteAddr, try)
 			}, attempts); err != nil {
 				log.Printf("tcp forwarding failed after %d attempts: %v", attempts, err)
-				c.Close()
 			}
 		}(conn)
 	}

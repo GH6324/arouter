@@ -5,7 +5,6 @@ OS=$(uname -s | tr '[:upper:]' '[:lower:]')
 INSTALL_DIR="__INSTALL_DIR__"
 CONFIG_URL="__CONFIG_URL__"
 TOKEN_OVERRIDE="__TOKEN__"
-PROXY_PREFIX_OVERRIDE="__PROXY_PREFIX__"
 mkdir -p "${INSTALL_DIR}"
 
 # ensure os/dir hint exists
@@ -21,14 +20,12 @@ fi
 
 TOKEN="$(cat ${INSTALL_DIR}/.token 2>/dev/null || true)"
 if [ -n "${TOKEN_OVERRIDE}" ]; then TOKEN="${TOKEN_OVERRIDE}"; fi
-PROXY_PREFIX="${PROXY_PREFIX_OVERRIDE:-${PROXY_PREFIX:-}}"
-if [ -n "${PROXY_PREFIX}" ]; then PROXY_PREFIX="${PROXY_PREFIX%/}/"; fi
 
 TMP=$(mktemp)
 if [ -n "${TOKEN}" ]; then
-  CURL_CMD=(curl -v -fsSL --connect-timeout 10 --max-time 30 -H "Authorization: Bearer ${TOKEN}" "${PROXY_PREFIX}${CONFIG_URL}")
+  CURL_CMD=(curl -v -fsSL --connect-timeout 10 --max-time 30 -H "Authorization: Bearer ${TOKEN}" "${CONFIG_URL}")
 else
-  CURL_CMD=(curl -v -fsSL --connect-timeout 10 --max-time 30 "${PROXY_PREFIX}${CONFIG_URL}")
+  CURL_CMD=(curl -v -fsSL --connect-timeout 10 --max-time 30 "${CONFIG_URL}")
 fi
 
 if "${CURL_CMD[@]}" -o "$TMP"; then
@@ -47,6 +44,6 @@ if "${CURL_CMD[@]}" -o "$TMP"; then
     rm -f "$TMP"
   fi
 else
-  echo "[config-sync] fetch failed: CONFIG_URL=${CONFIG_URL} PROXY_PREFIX=${PROXY_PREFIX}"
+  echo "[config-sync] fetch failed: CONFIG_URL=${CONFIG_URL}"
   rm -f "$TMP"
 fi
