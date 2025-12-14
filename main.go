@@ -1095,6 +1095,7 @@ type EncryptionPolicy struct {
 	Name   string `json:"name,omitempty"`
 	Method string `json:"method"` // aes-128-gcm | aes-256-gcm | chacha20-poly1305
 	Key    string `json:"key"`    // base64 或 hex
+	Enable bool   `json:"enable"`
 }
 
 // dummyAddr 用于 muxConnAdapter 本地/远端地址占位。
@@ -1236,6 +1237,7 @@ type WSSTransport struct {
 	EncPolicies   []EncryptionPolicy
 	poolMu        sync.Mutex
 	pool          map[NodeID]*pooledWS
+	poolOnce      sync.Once
 }
 
 func (t *WSSTransport) Forward(ctx context.Context, src NodeID, path []NodeID, proto Protocol, downstream net.Conn, remoteAddr string) error {
@@ -1292,8 +1294,8 @@ func (t *WSSTransport) Forward(ctx context.Context, src NodeID, path []NodeID, p
 		// 出错后关闭流并驱逐连接，避免复用可能异常的 mux
 		_ = stream.Reset(context.Background())
 		t.evict(next, conn)
-		if isCipherErr(err) {
-			log.Printf("[mux stream=%d] encryption error, evicting mux: %v", stream.ID(), err)
+		if isCipherErr(err) || isConnBroken(err) {
+			log.Printf("[mux stream=%d] bridge error, evicting mux: %v", stream.ID(), err)
 		}
 	}
 	return err
@@ -1494,6 +1496,7 @@ func (t *WSSTransport) getOrDial(ctx context.Context, next NodeID, url string) (
 	t.poolMu.Lock()
 	if t.pool == nil {
 		t.pool = make(map[NodeID]*pooledWS)
+		t.startPoolCleaner()
 	}
 	if p := t.pool[next]; p != nil && p.conn != nil {
 		atomic.AddInt32(&p.inUse, 1)
@@ -1519,6 +1522,7 @@ func (t *WSSTransport) getOrDialMux(ctx context.Context, next NodeID, url string
 	t.poolMu.Lock()
 	if t.pool == nil {
 		t.pool = make(map[NodeID]*pooledWS)
+		t.startPoolCleaner()
 	}
 	if p := t.pool[next]; p != nil && p.conn != nil && p.mux != nil {
 		atomic.AddInt32(&p.inUse, 1)
@@ -1571,6 +1575,34 @@ func (t *WSSTransport) keepalive(next NodeID, conn *websocket.Conn) {
 			return
 		}
 	}
+}
+
+// startPoolCleaner 周期性清理空闲的 mux/conn，防止异常连接长时间占用。
+func (t *WSSTransport) startPoolCleaner() {
+	t.poolOnce.Do(func() {
+		go func() {
+			ticker := time.NewTicker(1 * time.Minute)
+			defer ticker.Stop()
+			for range ticker.C {
+				now := time.Now()
+				t.poolMu.Lock()
+				for id, p := range t.pool {
+					if p == nil || p.conn == nil {
+						delete(t.pool, id)
+						continue
+					}
+					if atomic.LoadInt32(&p.inUse) > 0 {
+						continue
+					}
+					if now.Sub(p.createdAt) > 2*time.Minute {
+						p.conn.Close(websocket.StatusNormalClosure, "idle cleanup")
+						delete(t.pool, id)
+					}
+				}
+				t.poolMu.Unlock()
+			}
+		}()
+	})
 }
 
 // muxStreamConn adapts a mux stream to net.Conn-like interface for bridge without extra pipes.
@@ -1729,8 +1761,8 @@ func (t *WSSTransport) handleMuxHeader(ctx context.Context, mm *MuxManager, stre
 				if err := bridgeMaybeCompressed(sessionID, conn, wsConn, hdr.Compression, hdr.CompressMin, t.Metrics, nil, hdr.RemoteAddr); err != nil {
 					log.Printf("[session=%s] exit bridge failed: %v", sessionID, err)
 					_ = upStream.Reset(context.Background())
-					if isCipherErr(err) {
-						log.Printf("[session=%s] cipher error, closing mux conn", sessionID)
+					if isCipherErr(err) || isConnBroken(err) {
+						log.Printf("[session=%s] bridge fatal error, closing mux conn", sessionID)
 						mm.Conn().Close()
 					}
 				}
@@ -2237,6 +2269,11 @@ func decompressStream(dst net.Conn, src net.Conn, compression string, minBytes i
 	if cerr := closer.Close(); errCopy == nil {
 		errCopy = cerr
 	}
+	if errCopy == io.ErrUnexpectedEOF {
+		// 上游提前关闭视为正常结束，避免噪声
+		log.Printf("[decompress done] bytes=%d err=unexpected EOF (treated as close)", n)
+		return nil
+	}
 	log.Printf("[decompress done] bytes=%d err=%v", n, errCopy)
 	return errCopy
 }
@@ -2310,7 +2347,14 @@ func isConnBroken(err error) bool {
 	if err == nil {
 		return false
 	}
-	return errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed)
+	if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "reset by peer") || strings.Contains(msg, "broken pipe") || strings.Contains(msg, "use of closed network connection") {
+		return true
+	}
+	return false
 }
 
 func isCipherErr(err error) bool {
@@ -2387,7 +2431,7 @@ type secureConn struct {
 }
 
 func wrapSecureConn(c net.Conn, pol *EncryptionPolicy) (net.Conn, error) {
-	if pol == nil {
+	if pol == nil || !pol.Enable {
 		return c, nil
 	}
 	key, err := decodeKey(pol.Key)

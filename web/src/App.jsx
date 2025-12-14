@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { Layout, Table, Button, Modal, Form, Input, Space, message, Tabs, Card, Descriptions, Select, Tag, Divider, Tooltip, Row, Col, Statistic, Drawer, Menu } from 'antd';
+import { Layout, Table, Button, Modal, Form, Input, Space, message, Tabs, Card, Descriptions, Select, Tag, Divider, Tooltip, Row, Col, Statistic, Drawer, Menu, Switch } from 'antd';
 import { api } from './api';
 
 const { Header, Content } = Layout;
@@ -646,40 +646,68 @@ export default function App() {
           <Form.Item name="debug_log" label="调试日志" style={{marginLeft:16}}>
             <Select style={{width:140}} options={[{value:true,label:'开启'},{value:false,label:'关闭'}]}/>
           </Form.Item>
-          <Form.Item style={{width:'100%', marginTop:16}}>
-            <Divider orientation="left">加密策略（按当前时间取模轮换）</Divider>
-            <Form.List name="encryption_policies">
-              {(fields, { add, remove }) => (
-                <>
-                  {fields.map(({ key, name, ...rest }) => (
-                    <Space key={key} style={{ display: 'flex', marginBottom: 8 }} align="baseline">
-                      <Form.Item {...rest} name={[name, 'id']} label="ID" rules={[{ required: true, message: 'ID必填' }]}>
-                        <Input style={{ width: 80 }} />
-                      </Form.Item>
-                      <Form.Item {...rest} name={[name, 'name']} label="名称">
-                        <Input style={{ width: 120 }} />
-                      </Form.Item>
-                      <Form.Item {...rest} name={[name, 'method']} label="算法" rules={[{ required: true }]}>
-                        <Select style={{ width: 180 }} options={[
-                          { value: 'aes-128-gcm', label: 'AES-128-GCM' },
-                          { value: 'aes-256-gcm', label: 'AES-256-GCM' },
-                          { value: 'chacha20-poly1305', label: 'ChaCha20-Poly1305' },
-                        ]}/>
-                      </Form.Item>
-                      <Form.Item {...rest} name={[name, 'key']} label="密钥(Base64/HEX)" rules={[{ required: true }]}>
-                        <Input style={{ width: 260 }} placeholder="Base64或HEX" />
-                      </Form.Item>
-                      <Button danger onClick={() => remove(name)} type="link">删除</Button>
-                    </Space>
-                  ))}
-                  <Button type="dashed" onClick={() => add()} block>
-                    + 增加策略
-                  </Button>
-                </>
-              )}
-            </Form.List>
-          </Form.Item>
+          
           <Form.Item>
+            <Button type="primary" onClick={onSave} loading={saving}>保存</Button>
+          </Form.Item>
+        </Form>
+      </Card>
+    );
+  };
+
+  const EncryptionCard = () => {
+    const [form] = Form.useForm();
+    const [saving, setSaving] = useState(false);
+    useEffect(()=>{ if(settings) form.setFieldsValue({
+      encryption_policies: settings.encryption_policies || []
+    }); }, [settings]);
+    const onSave = async () => {
+      try {
+        const v = await form.validateFields();
+        setSaving(true);
+        await api('POST', '/api/settings', { encryption_policies: v.encryption_policies || [] });
+        message.success('加密策略已更新，节点下次拉取配置后生效');
+        await loadSettings();
+      } catch (e) { message.error(e.message); }
+      setSaving(false);
+    };
+    return (
+      <Card title="加密策略配置" style={{marginBottom:16}}>
+        <Form layout="vertical" form={form}>
+          <Form.List name="encryption_policies">
+            {(fields, { add, remove }) => (
+              <>
+                {fields.map(({ key, name, ...rest }) => (
+                  <Space key={key} style={{ display: 'flex', marginBottom: 8, flexWrap:'wrap' }} align="baseline">
+                    <Form.Item {...rest} name={[name, 'enable']} label="启用" valuePropName="checked" initialValue={true}>
+                      <Switch />
+                    </Form.Item>
+                    <Form.Item {...rest} name={[name, 'id']} label="ID" rules={[{ required: true, message: 'ID必填' }]}>
+                      <Input style={{ width: 80 }} />
+                    </Form.Item>
+                    <Form.Item {...rest} name={[name, 'name']} label="名称">
+                      <Input style={{ width: 120 }} />
+                    </Form.Item>
+                    <Form.Item {...rest} name={[name, 'method']} label="算法" rules={[{ required: true }]}>
+                      <Select style={{ width: 180 }} options={[
+                        { value: 'aes-128-gcm', label: 'AES-128-GCM' },
+                        { value: 'aes-256-gcm', label: 'AES-256-GCM' },
+                        { value: 'chacha20-poly1305', label: 'ChaCha20-Poly1305' },
+                      ]}/>
+                    </Form.Item>
+                    <Form.Item {...rest} name={[name, 'key']} label="密钥(Base64/HEX)">
+                      <Input style={{ width: 280 }} placeholder="可留空，保存时自动生成合规长度" />
+                    </Form.Item>
+                    <Button danger onClick={() => remove(name)} type="link">删除</Button>
+                  </Space>
+                ))}
+                <Button type="dashed" onClick={() => add()} block>
+                  + 增加策略
+                </Button>
+              </>
+            )}
+          </Form.List>
+          <Form.Item style={{marginTop:12}}>
             <Button type="primary" onClick={onSave} loading={saving}>保存</Button>
           </Form.Item>
         </Form>
@@ -730,7 +758,9 @@ export default function App() {
         <SettingsCard/>
         {view === 'routes'
           ? <RouteList/>
-          : (selected
+          : view === 'encryption'
+            ? <EncryptionCard/>
+            : (selected
             ? <NodeDetail key={selected.id} node={selected} onBack={()=>setSelected(null)} refreshList={refreshList} onShowInstall={showInstall}/>
             : <NodeList key={tick} onSelect={setSelected} onShowInstall={showInstall}/>
           )
@@ -787,6 +817,7 @@ export default function App() {
           items={[
             {key:'dashboard', label:'节点概览'},
             {key:'routes', label:'线路列表'},
+            {key:'encryption', label:'加密策略'},
           ]}
         />
       </Drawer>

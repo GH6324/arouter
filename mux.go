@@ -71,6 +71,7 @@ func (m *MuxConn) ReadFrame(ctx context.Context) (muxFrame, error) {
 		return muxFrame{}, err
 	}
 	if typ != websocket.MessageBinary {
+		_ = m.ws.Close(websocket.StatusUnsupportedData, "binary only")
 		return muxFrame{}, fmt.Errorf("unexpected ws message type %v", typ)
 	}
 	if len(data) < 10 {

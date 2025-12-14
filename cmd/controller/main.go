@@ -131,6 +131,7 @@ type EncPolicy struct {
 	Name   string `json:"name,omitempty"`
 	Method string `json:"method"`
 	Key    string `json:"key"`
+	Enable bool   `json:"enable"` // 允许临时关闭某策略，前端控制
 }
 
 func (p *EncPolicy) normalize(idx int) {
@@ -138,6 +139,10 @@ func (p *EncPolicy) normalize(idx int) {
 		p.ID = idx + 1
 	}
 	p.Method = strings.ToLower(p.Method)
+	if !p.Enable {
+		p.Key = ""
+		return
+	}
 	reqLen := 0
 	switch p.Method {
 	case "aes-128-gcm":
@@ -197,6 +202,7 @@ func (p *EncPolicy) UnmarshalJSON(data []byte) error {
 	p.Name = a.Name
 	p.Method = a.Method
 	p.Key = a.Key
+	p.Enable = a.Enable
 	return nil
 }
 
@@ -250,7 +256,9 @@ func (s EncPolicyList) normalize() EncPolicyList {
 	for i := range s {
 		p := s[i]
 		p.normalize(i)
-		out = append(out, p)
+		if p.Enable {
+			out = append(out, p)
+		}
 	}
 	return out
 }
