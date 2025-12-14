@@ -106,3 +106,10 @@ func (m *MuxConn) KeepAlive(ctx context.Context, interval time.Duration) {
 		}
 	}
 }
+
+// Ping wraps websocket Ping with write mutex to avoid concurrent write conflicts.
+func (m *MuxConn) Ping(ctx context.Context) error {
+	m.wmu.Lock()
+	defer m.wmu.Unlock()
+	return m.ws.Ping(ctx)
+}

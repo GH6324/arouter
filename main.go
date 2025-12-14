@@ -1214,9 +1214,10 @@ type HTTPProbeResult struct {
 
 type pooledWS struct {
 	conn      *websocket.Conn
-	createdAt time.Time
-	inUse     int32
 	mux       *MuxManager
+	createdAt time.Time
+	lastUsed  time.Time
+	active    int
 }
 
 // WSSTransport 通过 WebSocket 级联转发，可同时监听 WS 与 WSS。
@@ -1236,8 +1237,10 @@ type WSSTransport struct {
 	CompressMin   int
 	EncPolicies   []EncryptionPolicy
 	poolMu        sync.Mutex
-	pool          map[NodeID]*pooledWS
-	poolOnce      sync.Once
+	pool          map[NodeID][]*pooledWS
+	maxConnAge    time.Duration
+	maxIdle       time.Duration
+	maxStreams    int
 }
 
 func (t *WSSTransport) Forward(ctx context.Context, src NodeID, path []NodeID, proto Protocol, downstream net.Conn, remoteAddr string) error {
@@ -1252,7 +1255,7 @@ func (t *WSSTransport) Forward(ctx context.Context, src NodeID, path []NodeID, p
 	targetURL = normalizeWSEndpoint(targetURL)
 	ctxDial, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	conn, mux, err := t.getOrDialMux(ctxDial, next, targetURL)
+	_, mux, pw, err := t.getOrDialMux(ctxDial, next, targetURL)
 	if err != nil {
 		downstream.Close()
 		return fmt.Errorf("dial next %s failed: %w", next, err)
@@ -1274,29 +1277,38 @@ func (t *WSSTransport) Forward(ctx context.Context, src NodeID, path []NodeID, p
 	hdrPayload, _ := json.Marshal(header)
 	if err := stream.WriteFlags(ctxDial, flagCTRL, marshalCtrl(ctrlHeader, hdrPayload)); err != nil {
 		downstream.Close()
-		t.release(next, conn)
+		t.releasePooled(next, pw)
+		t.evictPooled(next, pw)
 		return fmt.Errorf("send header failed: %w", err)
 	}
 	log.Printf("[mux stream=%d] sent header to %s proto=%s remote=%s path=%v", stream.ID(), next, proto, remoteAddr, header.Path)
-	wsConn := muxStreamConn(ctx, stream, func() { t.release(next, conn) })
+	wsConn := muxStreamConn(ctx, stream, func() {
+		log.Printf("[mux stream=%d] release pooled mux %s (addr=%p)", stream.ID(), next, pw)
+		t.releasePooled(next, pw)
+	})
+	defer t.releasePooled(next, pw)
 	if pol != nil {
 		log.Printf("[mux stream=%d] enable encryption enc_id=%d method=%s", stream.ID(), pol.ID, pol.Method)
 		secured, err := wrapSecureConn(wsConn, pol)
 		if err != nil {
 			downstream.Close()
-			t.release(next, conn)
+			t.evictPooled(next, pw)
 			return fmt.Errorf("enable encryption failed: %w", err)
 		}
 		wsConn = secured
 	}
+	log.Printf("[session=%s] tunnel start proto=%s remote=%s path=%v compression=%s enc=%v", session, proto, remoteAddr, header.Path, header.Compression, header.EncID)
 	err = bridgeMaybeCompressed(session, downstream, wsConn, header.Compression, header.CompressMin, t.Metrics, path, remoteAddr)
 	if err != nil {
 		// 出错后关闭流并驱逐连接，避免复用可能异常的 mux
 		_ = stream.Reset(context.Background())
-		t.evict(next, conn)
-		if isCipherErr(err) || isConnBroken(err) {
-			log.Printf("[mux stream=%d] bridge error, evicting mux: %v", stream.ID(), err)
+		if isCipherErr(err) || isConnBroken(err) || isFrameErr(err) {
+			log.Printf("[mux stream=%d] bridge fatal (cipher/broken/frame), closing mux: %v", stream.ID(), err)
+			t.evictPooled(next, pw)
 		}
+	}
+	if err == nil {
+		log.Printf("[session=%s] tunnel finish proto=%s remote=%s path=%v", session, proto, remoteAddr, header.Path)
 	}
 	return err
 }
@@ -1318,11 +1330,11 @@ func (t *WSSTransport) ProbeHTTP(ctx context.Context, path []NodeID, target stri
 	start := time.Now()
 	ctxDial, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	conn, mux, err := t.getOrDialMux(ctxDial, next, targetURL)
+	_, mux, pw, err := t.getOrDialMux(ctxDial, next, targetURL)
 	if err != nil {
 		return 0, fmt.Errorf("dial next %s failed: %w", next, err)
 	}
-	defer t.release(next, conn)
+	defer t.releasePooled(next, pw)
 	stream := mux.OpenStream()
 	defer stream.Close(context.Background())
 	header := ControlHeader{
@@ -1493,17 +1505,6 @@ func (t *WSSTransport) handleHTTPProbe(ctx context.Context, c *websocket.Conn, e
 }
 
 func (t *WSSTransport) getOrDial(ctx context.Context, next NodeID, url string) (*websocket.Conn, error) {
-	t.poolMu.Lock()
-	if t.pool == nil {
-		t.pool = make(map[NodeID]*pooledWS)
-		t.startPoolCleaner()
-	}
-	if p := t.pool[next]; p != nil && p.conn != nil {
-		atomic.AddInt32(&p.inUse, 1)
-		t.poolMu.Unlock()
-		return p.conn, nil
-	}
-	t.poolMu.Unlock()
 	conn, _, err := websocket.Dial(ctx, url, &websocket.DialOptions{
 		HTTPClient:      fastWSClient(t.TLSConfig),
 		CompressionMode: websocket.CompressionDisabled,
@@ -1511,98 +1512,170 @@ func (t *WSSTransport) getOrDial(ctx context.Context, next NodeID, url string) (
 	if err != nil {
 		return nil, err
 	}
-	t.poolMu.Lock()
-	t.pool[next] = &pooledWS{conn: conn, createdAt: time.Now(), inUse: 1}
-	t.poolMu.Unlock()
-	go t.keepalive(next, conn)
 	return conn, nil
 }
 
-func (t *WSSTransport) getOrDialMux(ctx context.Context, next NodeID, url string) (*websocket.Conn, *MuxManager, error) {
+func (t *WSSTransport) getOrDialMux(ctx context.Context, next NodeID, url string) (*websocket.Conn, *MuxManager, *pooledWS, error) {
 	t.poolMu.Lock()
 	if t.pool == nil {
-		t.pool = make(map[NodeID]*pooledWS)
-		t.startPoolCleaner()
+		t.pool = make(map[NodeID][]*pooledWS)
 	}
-	if p := t.pool[next]; p != nil && p.conn != nil && p.mux != nil {
-		atomic.AddInt32(&p.inUse, 1)
-		t.poolMu.Unlock()
-		return p.conn, p.mux, nil
+	// pick an active mux with available stream capacity
+	maxStreams := t.maxStreams
+	if maxStreams <= 0 {
+		maxStreams = 2
+	}
+	candidates := t.pool[next]
+	now := time.Now()
+	// filter out expired or closed
+	valid := make([]*pooledWS, 0, len(candidates))
+	var chosen *pooledWS
+	for _, p := range candidates {
+		select {
+		case <-p.mux.Done():
+			p.conn.Close(websocket.StatusNormalClosure, "mux done")
+			log.Printf("[mux pool %s] drop closed mux (addr=%p)", next, p)
+			continue
+		default:
+		}
+		if !t.isActive(p, now) {
+			p.conn.Close(websocket.StatusNormalClosure, "expired")
+			log.Printf("[mux pool %s] drop expired mux (addr=%p)", next, p)
+			continue
+		}
+		if chosen == nil && p.active < maxStreams {
+			chosen = p
+			p.active++
+			p.lastUsed = now
+		}
+		valid = append(valid, p)
+	}
+	if len(valid) == 0 {
+		delete(t.pool, next)
+	} else {
+		t.pool[next] = valid
 	}
 	t.poolMu.Unlock()
+	if chosen != nil {
+		log.Printf("[mux pool %s] reuse mux (addr=%p) active=%d/%d", next, chosen, chosen.active, maxStreams)
+		return chosen.conn, chosen.mux, chosen, nil
+	}
+
 	conn, _, err := websocket.Dial(ctx, url, &websocket.DialOptions{
 		HTTPClient:      fastWSClient(t.TLSConfig),
 		CompressionMode: websocket.CompressionDisabled,
 	})
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	mux := NewMuxManager(NewMuxConn(conn))
+	pw := &pooledWS{conn: conn, mux: mux, createdAt: now, lastUsed: now, active: 1}
 	t.poolMu.Lock()
-	t.pool[next] = &pooledWS{conn: conn, createdAt: time.Now(), inUse: 1, mux: mux}
+	t.pool[next] = append(t.pool[next], pw)
 	t.poolMu.Unlock()
-	go t.keepalive(next, conn)
+	log.Printf("[mux pool %s] new mux dialed (addr=%p) active=1/%d", next, pw, maxStreams)
+	go t.keepaliveMux(next, pw)
 	go func() {
 		<-mux.Done()
-		t.evict(next, conn)
+		t.evictPooled(next, pw)
 	}()
-	return conn, mux, nil
+	return conn, mux, pw, nil
 }
 
-func (t *WSSTransport) release(next NodeID, conn *websocket.Conn) {
-	t.poolMu.Lock()
-	if p := t.pool[next]; p != nil && p.conn == conn {
-		atomic.AddInt32(&p.inUse, -1)
+func (t *WSSTransport) releasePooled(next NodeID, pw *pooledWS) {
+	if pw == nil {
+		return
 	}
-	t.poolMu.Unlock()
-}
-
-func (t *WSSTransport) evict(next NodeID, conn *websocket.Conn) {
 	t.poolMu.Lock()
-	if p := t.pool[next]; p != nil && p.conn == conn {
-		delete(t.pool, next)
-	}
-	t.poolMu.Unlock()
-}
-
-func (t *WSSTransport) keepalive(next NodeID, conn *websocket.Conn) {
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-	for range ticker.C {
-		if err := conn.Ping(context.Background()); err != nil {
-			t.evict(next, conn)
-			conn.Close(websocket.StatusInternalError, "ping failed")
+	defer t.poolMu.Unlock()
+	list := t.pool[next]
+	for _, p := range list {
+		if p == pw {
+			if p.active > 0 {
+				p.active--
+			}
+			p.lastUsed = time.Now()
+			log.Printf("[mux pool %s] release mux (addr=%p) active=%d", next, p, p.active)
 			return
 		}
 	}
 }
 
-// startPoolCleaner 周期性清理空闲的 mux/conn，防止异常连接长时间占用。
-func (t *WSSTransport) startPoolCleaner() {
-	t.poolOnce.Do(func() {
-		go func() {
-			ticker := time.NewTicker(1 * time.Minute)
-			defer ticker.Stop()
-			for range ticker.C {
-				now := time.Now()
+func (t *WSSTransport) evictPooled(next NodeID, pw *pooledWS) {
+	if pw == nil {
+		return
+	}
+	pw.conn.Close(websocket.StatusInternalError, "evict")
+	log.Printf("[mux pool %s] evict mux (addr=%p)", next, pw)
+	t.poolMu.Lock()
+	defer t.poolMu.Unlock()
+	list := t.pool[next]
+	newList := list[:0]
+	for _, p := range list {
+		if p != pw {
+			newList = append(newList, p)
+		}
+	}
+	if len(newList) == 0 {
+		delete(t.pool, next)
+	} else {
+		t.pool[next] = newList
+	}
+}
+
+func (t *WSSTransport) isActive(p *pooledWS, now time.Time) bool {
+	maxAge := t.maxConnAge
+	if maxAge <= 0 {
+		maxAge = 10 * time.Minute
+	}
+	maxIdle := t.maxIdle
+	if maxIdle <= 0 {
+		maxIdle = 2 * time.Minute
+	}
+	if now.Sub(p.createdAt) > maxAge {
+		return false
+	}
+	if now.Sub(p.lastUsed) > maxIdle {
+		return false
+	}
+	return true
+}
+
+func (t *WSSTransport) keepaliveMux(next NodeID, pw *pooledWS) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-pw.mux.Done():
+			log.Printf("[mux pool %s] keepalive stop, mux closed (addr=%p)", next, pw)
+			return
+		case <-ticker.C:
+			if err := pw.mux.Conn().Ping(context.Background()); err != nil {
+				log.Printf("[mux pool %s] keepalive failed (addr=%p): %v", next, pw, err)
+				pw.conn.Close(websocket.StatusInternalError, "ping failed")
 				t.poolMu.Lock()
-				for id, p := range t.pool {
-					if p == nil || p.conn == nil {
-						delete(t.pool, id)
-						continue
-					}
-					if atomic.LoadInt32(&p.inUse) > 0 {
-						continue
-					}
-					if now.Sub(p.createdAt) > 2*time.Minute {
-						p.conn.Close(websocket.StatusNormalClosure, "idle cleanup")
-						delete(t.pool, id)
-					}
-				}
+				delete(t.pool, next)
 				t.poolMu.Unlock()
+				return
 			}
-		}()
-	})
+		}
+	}
+}
+
+func isLockErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "failed to acquire lock") || errors.Is(err, context.DeadlineExceeded)
+}
+
+func isFrameErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "invalid frame") || strings.Contains(msg, "unexpected EOF") || strings.Contains(msg, "corrupt input")
 }
 
 // muxStreamConn adapts a mux stream to net.Conn-like interface for bridge without extra pipes.
@@ -1661,6 +1734,9 @@ func (m *muxConnAdapter) Write(p []byte) (int, error) {
 		return 0, io.ErrClosedPipe
 	}
 	if err := m.stream.Write(context.Background(), p); err != nil {
+		if isLockErr(err) {
+			log.Printf("[mux stream=%d] write blocked/lock err: %v", m.stream.ID(), err)
+		}
 		return 0, err
 	}
 	return len(p), nil
@@ -1809,7 +1885,7 @@ func (t *WSSTransport) handleMuxHeader(ctx context.Context, mm *MuxManager, stre
 	log.Printf("[mux stream=%d] forward to %s path=%v", streamID, next, remaining)
 	ctxDial, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	_, nextMux, err := t.getOrDialMux(ctxDial, next, targetURL)
+	_, nextMux, pw, err := t.getOrDialMux(ctxDial, next, targetURL)
 	if err != nil || nextMux == nil {
 		_ = upStream.WriteFlags(context.Background(), flagRST, []byte("dial next failed"))
 		return
@@ -1818,9 +1894,15 @@ func (t *WSSTransport) handleMuxHeader(ctx context.Context, mm *MuxManager, stre
 	hdr.Path = remaining
 	payload, _ := json.Marshal(hdr)
 	if err := downStream.WriteFlags(ctxDial, flagCTRL, marshalCtrl(ctrlHeader, payload)); err != nil {
+		t.releasePooled(next, pw)
+		t.evictPooled(next, pw)
+		log.Printf("[mux stream=%d] cascade header write to %s failed: %v", streamID, next, err)
 		return
 	}
 	downCh := nextMux.subscribe(downStream.ID())
+	var once sync.Once
+	release := func() { once.Do(func() { t.releasePooled(next, pw) }) }
+	log.Printf("[mux stream=%d] cascade start next=%s path=%v", streamID, next, remaining)
 	// downstream -> upstream
 	go func() {
 		for f := range downCh {
@@ -1829,6 +1911,8 @@ func (t *WSSTransport) handleMuxHeader(ctx context.Context, mm *MuxManager, stre
 			}
 			if f.flags&(flagFIN|flagRST) != 0 {
 				_ = upStream.WriteFlags(context.Background(), flagFIN, nil)
+				log.Printf("[mux stream=%d] cascade downstream fin/rst flags=%d", streamID, f.flags)
+				release()
 				return
 			}
 		}
@@ -1841,6 +1925,8 @@ func (t *WSSTransport) handleMuxHeader(ctx context.Context, mm *MuxManager, stre
 			}
 			if f.flags&(flagFIN|flagRST) != 0 {
 				_ = downStream.WriteFlags(context.Background(), flagFIN, nil)
+				log.Printf("[mux stream=%d] cascade upstream fin/rst flags=%d", streamID, f.flags)
+				release()
 				return
 			}
 		}
@@ -2699,7 +2785,11 @@ func (n *Node) runRouteProbes(ctx context.Context) {
 		if len(r.Path) < 2 || r.Path[0] != n.ID {
 			continue
 		}
-		dur, err := ws.ProbeHTTP(ctx, r.Path, n.HTTPProbeURL, 20*time.Second)
+		const probeTimeout = 20 * time.Second
+		dur, err := ws.ProbeHTTP(ctx, r.Path, n.HTTPProbeURL, probeTimeout)
+		if dur > probeTimeout {
+			dur = probeTimeout
+		}
 		success := err == nil
 		if err != nil {
 			log.Printf("[probe route %s] failed: %v", r.Name, err)
