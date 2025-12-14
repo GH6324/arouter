@@ -48,6 +48,44 @@ import (
 
 var buildVersion = "dev"
 var wsSessionCache = tls.NewLRUClientSessionCache(128)
+var debugLogEnabled atomic.Bool
+var logFilter = &levelWriter{out: os.Stderr, debug: &debugLogEnabled}
+
+func logDebug(format string, args ...interface{}) {
+	if debugLogEnabled.Load() {
+		log.Printf("[DEBUG] "+format, args...)
+	}
+}
+
+func logWarn(format string, args ...interface{}) {
+	log.Printf("[WARN] "+format, args...)
+}
+
+func logError(format string, args ...interface{}) {
+	log.Printf("[ERROR] "+format, args...)
+}
+
+type levelWriter struct {
+	out   io.Writer
+	debug *atomic.Bool
+	mu    sync.Mutex
+}
+
+func (w *levelWriter) Write(p []byte) (n int, err error) {
+	if w.debug != nil && w.debug.Load() {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		return w.out.Write(p)
+	}
+	// 默认仅透传 WARN/ERROR/FATAL 等重要日志
+	if bytes.Contains(p, []byte("[WARN]")) || bytes.Contains(p, []byte("[ERROR]")) || bytes.Contains(p, []byte("FATA")) {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		return w.out.Write(p)
+	}
+	// 非调试模式下静默吞掉信息级日志
+	return len(p), nil
+}
 
 // 该版本实现了基础的 WSS 数据平面、JSON 配置加载、动态选路和简单的 RTT 探测。
 // 多跳通过 WebSocket 级联，出口节点将流量转发到 RemoteAddr。
@@ -1281,14 +1319,14 @@ func (t *WSSTransport) Forward(ctx context.Context, src NodeID, path []NodeID, p
 		t.evictPooled(next, pw)
 		return fmt.Errorf("send header failed: %w", err)
 	}
-	log.Printf("[mux stream=%d] sent header to %s proto=%s remote=%s path=%v", stream.ID(), next, proto, remoteAddr, header.Path)
+	logDebug("[mux stream=%d] sent header to %s proto=%s remote=%s path=%v", stream.ID(), next, proto, remoteAddr, header.Path)
 	wsConn := muxStreamConn(ctx, stream, func() {
-		log.Printf("[mux stream=%d] release pooled mux %s (addr=%p)", stream.ID(), next, pw)
+		logDebug("[mux stream=%d] release pooled mux %s (addr=%p)", stream.ID(), next, pw)
 		t.releasePooled(next, pw)
 	})
 	defer t.releasePooled(next, pw)
 	if pol != nil {
-		log.Printf("[mux stream=%d] enable encryption enc_id=%d method=%s", stream.ID(), pol.ID, pol.Method)
+		logDebug("[mux stream=%d] enable encryption enc_id=%d method=%s", stream.ID(), pol.ID, pol.Method)
 		secured, err := wrapSecureConn(wsConn, pol)
 		if err != nil {
 			downstream.Close()
@@ -1297,18 +1335,18 @@ func (t *WSSTransport) Forward(ctx context.Context, src NodeID, path []NodeID, p
 		}
 		wsConn = secured
 	}
-	log.Printf("[session=%s] tunnel start proto=%s remote=%s path=%v compression=%s enc=%v", session, proto, remoteAddr, header.Path, header.Compression, header.EncID)
+	logDebug("[session=%s] tunnel start proto=%s remote=%s path=%v compression=%s enc=%v", session, proto, remoteAddr, header.Path, header.Compression, header.EncID)
 	err = bridgeMaybeCompressed(session, downstream, wsConn, header.Compression, header.CompressMin, t.Metrics, path, remoteAddr)
 	if err != nil {
 		// 出错后关闭流并驱逐连接，避免复用可能异常的 mux
 		_ = stream.Reset(context.Background())
 		if isCipherErr(err) || isConnBroken(err) || isFrameErr(err) {
-			log.Printf("[mux stream=%d] bridge fatal (cipher/broken/frame), closing mux: %v", stream.ID(), err)
+			logWarn("[mux stream=%d] bridge fatal (cipher/broken/frame), closing mux: %v", stream.ID(), err)
 			t.evictPooled(next, pw)
 		}
 	}
 	if err == nil {
-		log.Printf("[session=%s] tunnel finish proto=%s remote=%s path=%v", session, proto, remoteAddr, header.Path)
+		logDebug("[session=%s] tunnel finish proto=%s remote=%s path=%v", session, proto, remoteAddr, header.Path)
 	}
 	return err
 }
@@ -1534,13 +1572,13 @@ func (t *WSSTransport) getOrDialMux(ctx context.Context, next NodeID, url string
 		select {
 		case <-p.mux.Done():
 			p.conn.Close(websocket.StatusNormalClosure, "mux done")
-			log.Printf("[mux pool %s] drop closed mux (addr=%p)", next, p)
+	logDebug("[mux pool %s] drop closed mux (addr=%p)", next, p)
 			continue
 		default:
 		}
 		if !t.isActive(p, now) {
 			p.conn.Close(websocket.StatusNormalClosure, "expired")
-			log.Printf("[mux pool %s] drop expired mux (addr=%p)", next, p)
+			logDebug("[mux pool %s] drop expired mux (addr=%p)", next, p)
 			continue
 		}
 		if chosen == nil && p.active < maxStreams {
@@ -1557,7 +1595,7 @@ func (t *WSSTransport) getOrDialMux(ctx context.Context, next NodeID, url string
 	}
 	t.poolMu.Unlock()
 	if chosen != nil {
-		log.Printf("[mux pool %s] reuse mux (addr=%p) active=%d/%d", next, chosen, chosen.active, maxStreams)
+		logDebug("[mux pool %s] reuse mux (addr=%p) active=%d/%d", next, chosen, chosen.active, maxStreams)
 		return chosen.conn, chosen.mux, chosen, nil
 	}
 
@@ -1573,7 +1611,7 @@ func (t *WSSTransport) getOrDialMux(ctx context.Context, next NodeID, url string
 	t.poolMu.Lock()
 	t.pool[next] = append(t.pool[next], pw)
 	t.poolMu.Unlock()
-	log.Printf("[mux pool %s] new mux dialed (addr=%p) active=1/%d", next, pw, maxStreams)
+	logDebug("[mux pool %s] new mux dialed (addr=%p) active=1/%d", next, pw, maxStreams)
 	go t.keepaliveMux(next, pw)
 	go func() {
 		<-mux.Done()
@@ -1595,7 +1633,7 @@ func (t *WSSTransport) releasePooled(next NodeID, pw *pooledWS) {
 				p.active--
 			}
 			p.lastUsed = time.Now()
-			log.Printf("[mux pool %s] release mux (addr=%p) active=%d", next, p, p.active)
+			logDebug("[mux pool %s] release mux (addr=%p) active=%d", next, p, p.active)
 			return
 		}
 	}
@@ -1606,7 +1644,7 @@ func (t *WSSTransport) evictPooled(next NodeID, pw *pooledWS) {
 		return
 	}
 	pw.conn.Close(websocket.StatusInternalError, "evict")
-	log.Printf("[mux pool %s] evict mux (addr=%p)", next, pw)
+	logWarn("[mux pool %s] evict mux (addr=%p)", next, pw)
 	t.poolMu.Lock()
 	defer t.poolMu.Unlock()
 	list := t.pool[next]
@@ -1647,11 +1685,11 @@ func (t *WSSTransport) keepaliveMux(next NodeID, pw *pooledWS) {
 	for {
 		select {
 		case <-pw.mux.Done():
-			log.Printf("[mux pool %s] keepalive stop, mux closed (addr=%p)", next, pw)
+			logDebug("[mux pool %s] keepalive stop, mux closed (addr=%p)", next, pw)
 			return
 		case <-ticker.C:
 			if err := pw.mux.Conn().Ping(context.Background()); err != nil {
-				log.Printf("[mux pool %s] keepalive failed (addr=%p): %v", next, pw, err)
+				logWarn("[mux pool %s] keepalive failed (addr=%p): %v", next, pw, err)
 				pw.conn.Close(websocket.StatusInternalError, "ping failed")
 				t.poolMu.Lock()
 				delete(t.pool, next)
@@ -1735,7 +1773,7 @@ func (m *muxConnAdapter) Write(p []byte) (int, error) {
 	}
 	if err := m.stream.Write(context.Background(), p); err != nil {
 		if isLockErr(err) {
-			log.Printf("[mux stream=%d] write blocked/lock err: %v", m.stream.ID(), err)
+			logWarn("[mux stream=%d] write blocked/lock err: %v", m.stream.ID(), err)
 		}
 		return 0, err
 	}
@@ -1882,7 +1920,7 @@ func (t *WSSTransport) handleMuxHeader(ctx context.Context, mm *MuxManager, stre
 		_ = upStream.WriteFlags(context.Background(), flagRST, []byte("no endpoint"))
 		return
 	}
-	log.Printf("[mux stream=%d] forward to %s path=%v", streamID, next, remaining)
+	logDebug("[mux stream=%d] forward to %s path=%v", streamID, next, remaining)
 	ctxDial, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	_, nextMux, pw, err := t.getOrDialMux(ctxDial, next, targetURL)
@@ -1896,13 +1934,13 @@ func (t *WSSTransport) handleMuxHeader(ctx context.Context, mm *MuxManager, stre
 	if err := downStream.WriteFlags(ctxDial, flagCTRL, marshalCtrl(ctrlHeader, payload)); err != nil {
 		t.releasePooled(next, pw)
 		t.evictPooled(next, pw)
-		log.Printf("[mux stream=%d] cascade header write to %s failed: %v", streamID, next, err)
+		logWarn("[mux stream=%d] cascade header write to %s failed: %v", streamID, next, err)
 		return
 	}
 	downCh := nextMux.subscribe(downStream.ID())
 	var once sync.Once
 	release := func() { once.Do(func() { t.releasePooled(next, pw) }) }
-	log.Printf("[mux stream=%d] cascade start next=%s path=%v", streamID, next, remaining)
+	logDebug("[mux stream=%d] cascade start next=%s path=%v", streamID, next, remaining)
 	// downstream -> upstream
 	go func() {
 		for f := range downCh {
@@ -1911,7 +1949,7 @@ func (t *WSSTransport) handleMuxHeader(ctx context.Context, mm *MuxManager, stre
 			}
 			if f.flags&(flagFIN|flagRST) != 0 {
 				_ = upStream.WriteFlags(context.Background(), flagFIN, nil)
-				log.Printf("[mux stream=%d] cascade downstream fin/rst flags=%d", streamID, f.flags)
+				logDebug("[mux stream=%d] cascade downstream fin/rst flags=%d", streamID, f.flags)
 				release()
 				return
 			}
@@ -1925,7 +1963,7 @@ func (t *WSSTransport) handleMuxHeader(ctx context.Context, mm *MuxManager, stre
 			}
 			if f.flags&(flagFIN|flagRST) != 0 {
 				_ = downStream.WriteFlags(context.Background(), flagFIN, nil)
-				log.Printf("[mux stream=%d] cascade upstream fin/rst flags=%d", streamID, f.flags)
+				logDebug("[mux stream=%d] cascade upstream fin/rst flags=%d", streamID, f.flags)
 				release()
 				return
 			}
@@ -3341,6 +3379,7 @@ func main() {
 	flag.Parse()
 
 	log.Printf("arouter agent version %s", buildVersion)
+	log.SetOutput(logFilter)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGHUP, syscall.SIGUSR1)
@@ -3352,6 +3391,9 @@ func main() {
 		if err != nil {
 			log.Fatalf("load config failed: %v", err)
 		}
+		debugLogEnabled.Store(cfg.DebugLog)
+		// 更新过滤器开关
+		logFilter.debug = &debugLogEnabled
 		cfgDigest := configDigest(cfg)
 		if cfgDigest == lastCfgDigest {
 			log.Printf("config unchanged, skip reload")

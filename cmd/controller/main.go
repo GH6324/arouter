@@ -410,6 +410,7 @@ type EntryConfig struct {
 
 func main() {
 	db := mustOpenDB()
+	maybeCheckpoint(db)
 	auth := NewGlobalAuth(envOrDefault("AUTH_KEY_FILE", "/app/data/auth.key"))
 	globalKey := auth.LoadOrCreate()
 	if err := db.AutoMigrate(&Node{}, &Entry{}, &Peer{}, &LinkMetric{}, &RoutePlan{}, &Setting{}, &User{}, &RouteProbe{}); err != nil {
@@ -1189,32 +1190,44 @@ func main() {
 			c.String(http.StatusBadRequest, err.Error())
 			return
 		}
-		var s Setting
-		if err := db.First(&s).Error; err != nil {
+		maybeCheckpoint(db)
+		var saved Setting
+		err := db.Transaction(func(tx *gorm.DB) error {
+			var s Setting
+			if err := tx.First(&s).Error; err != nil {
+				return err
+			}
+			if strings.TrimSpace(req.Transport) != "" {
+				s.Transport = strings.TrimSpace(req.Transport)
+			}
+			if strings.TrimSpace(req.Compression) != "" {
+				s.Compression = strings.TrimSpace(req.Compression)
+			}
+			if req.CompressionMin >= 0 {
+				s.CompressionMin = req.CompressionMin
+			}
+			s.DebugLog = req.DebugLog
+			if req.EncryptionPolicies != nil {
+				s.EncryptionPolicies = req.EncryptionPolicies.normalize()
+			}
+			if strings.TrimSpace(req.HTTPProbeURL) != "" {
+				s.HTTPProbeURL = strings.TrimSpace(req.HTTPProbeURL)
+			}
+			if err := tx.Save(&s).Error; err != nil {
+				return err
+			}
+			saved = s
+			return nil
+		})
+		if err != nil {
+			if isSQLiteFull(err) {
+				c.String(http.StatusInsufficientStorage, "写入失败：磁盘空间不足或 SQLite 无写权限，请清理空间或改用 MySQL。原始错误: %v", err)
+				return
+			}
 			c.String(http.StatusInternalServerError, err.Error())
 			return
 		}
-		if strings.TrimSpace(req.Transport) != "" {
-			s.Transport = strings.TrimSpace(req.Transport)
-		}
-		if strings.TrimSpace(req.Compression) != "" {
-			s.Compression = strings.TrimSpace(req.Compression)
-		}
-		if req.CompressionMin >= 0 {
-			s.CompressionMin = req.CompressionMin
-		}
-		s.DebugLog = req.DebugLog
-		if req.EncryptionPolicies != nil {
-			s.EncryptionPolicies = req.EncryptionPolicies.normalize()
-		}
-		if strings.TrimSpace(req.HTTPProbeURL) != "" {
-			s.HTTPProbeURL = strings.TrimSpace(req.HTTPProbeURL)
-		}
-		if err := db.Save(&s).Error; err != nil {
-			c.String(http.StatusInternalServerError, err.Error())
-			return
-		}
-		c.JSON(http.StatusOK, s)
+		c.JSON(http.StatusOK, saved)
 	})
 
 	addr := envOrDefault("CONTROLLER_ADDR", ":8080")
@@ -1727,25 +1740,51 @@ func mustOpenDB() *gorm.DB {
 		if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
 			log.Fatalf("create db dir failed: %v", err)
 		}
-		db, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{})
-		if err != nil {
-			log.Fatalf("open sqlite failed: %v", err)
-		}
-		return db
+		return openSQLiteWithPragma(dbPath)
 	}
 	if strings.HasPrefix(dsn, "sqlite:") {
 		path := strings.TrimPrefix(dsn, "sqlite:")
-		db, err := gorm.Open(sqlite.Open(path), &gorm.Config{})
-		if err != nil {
-			log.Fatalf("open sqlite failed: %v", err)
-		}
-		return db
+		return openSQLiteWithPragma(path)
 	}
 	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{})
 	if err != nil {
 		log.Fatalf("open mysql failed: %v", err)
 	}
 	return db
+}
+
+// openSQLiteWithPragma 为 sqlite 添加常用的 pragma，减少磁盘压力并提高兼容性。
+func openSQLiteWithPragma(path string) *gorm.DB {
+	// busy_timeout 避免瞬时锁导致失败；WAL 提高并发；同步设为 NORMAL 兼顾性能。
+	dsn := fmt.Sprintf("%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)", path)
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
+	if err != nil {
+		log.Fatalf("open sqlite failed: %v", err)
+	}
+	// 单连接即可，避免 WAL checkpoint 被阻塞
+	if sqlDB, err := db.DB(); err == nil {
+		sqlDB.SetMaxOpenConns(1)
+	}
+	return db
+}
+
+// maybeCheckpoint 在 SQLite 下进行 WAL checkpoint，避免 WAL 长大导致“disk is full”。
+func maybeCheckpoint(db *gorm.DB) {
+	if db == nil || db.Dialector.Name() != "sqlite" {
+		return
+	}
+	db.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+}
+
+// isSQLiteFull 检测 SQLite 的磁盘/权限问题。
+func isSQLiteFull(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "database or disk is full") ||
+		strings.Contains(msg, "no space left on device") ||
+		strings.Contains(msg, "attempt to write a readonly database")
 }
 
 func defaultIfEmpty(v, def string) string {

@@ -643,8 +643,11 @@ export default function App() {
           <Form.Item name="http_probe_url" label="HTTP探测URL" style={{marginLeft:16}}>
             <Input style={{width:320}} placeholder="https://www.google.com/generate_204"/>
           </Form.Item>
-          <Form.Item name="debug_log" label="调试日志" style={{marginLeft:16}}>
-            <Select style={{width:140}} options={[{value:true,label:'开启'},{value:false,label:'关闭'}]}/>
+          <Form.Item name="debug_log" label="日志模式" style={{marginLeft:16}}>
+            <Select style={{width:180}} options={[
+              {value:false,label:'仅告警/错误（默认）'},
+              {value:true,label:'调试模式（输出全部）'},
+            ]}/>
           </Form.Item>
           
           <Form.Item>
