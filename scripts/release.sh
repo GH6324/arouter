@@ -63,5 +63,15 @@ git tag "$VERSION"
 echo "Creating release $VERSION"
 gh release create "$VERSION" "${assets[@]}" --repo "$REPO" --title "$VERSION" --notes "Automated release $VERSION"
 
+# Build & push Docker (controller) if docker is available
+PUBLISH_DOCKER="${PUBLISH_DOCKER:-1}"
+DOCKER_IMAGE="${DOCKER_IMAGE:-24802117/arouter}"
+if [ "$PUBLISH_DOCKER" != "0" ] && command -v docker >/dev/null 2>&1; then
+  echo "Building and pushing Docker image ${DOCKER_IMAGE}:${VERSION} (and :latest)..."
+  docker buildx build --platform linux/amd64,linux/arm64 -t "${DOCKER_IMAGE}:${VERSION}" -t "${DOCKER_IMAGE}:latest" --build-arg BUILD_VERSION="${VERSION}" --push .
+else
+  echo "Skip Docker publish (PUBLISH_DOCKER=${PUBLISH_DOCKER}, docker command not found?)."
+fi
+
 echo "Done. Published files:"
 ls -l "$OUT_DIR"

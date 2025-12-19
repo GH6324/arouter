@@ -97,7 +97,7 @@ services:
 ## 单机二进制安装（控制器）
 无需 Docker，直接从 GitHub Releases 安装最新 controller：
 ```bash
-sudo PORT=8080 bash scripts/install_controller.sh
+curl -fsSL https://raw.githubusercontent.com/NiuStar/arouter/refs/heads/main/scripts/install_controller.sh -o install_controller.sh && bash install_controller.sh
 ```
 - 依赖：`curl`、`uname`、`tar`、`systemd` 环境。
 - 自动检测 OS/架构，下载最新发布的 `arouter-controller-<os>-<arch>`，并尝试下载前端 `web-dist.tar.gz` 解压到 `/opt/arouter/controller/web/dist`（同时设置 `WEB_DIST` 环境变量）。

@@ -594,6 +594,11 @@ func main() {
 		})
 	}
 
+	// 版本信息
+	r.GET("/api/version", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"version": buildVersion})
+	})
+
 	api := r.Group("/api")
 	authGroup := api.Group("")
 	authGroup.Use(authUserMiddleware(db))

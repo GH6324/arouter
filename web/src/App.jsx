@@ -554,6 +554,7 @@ export default function App() {
   const [installCmd, setInstallCmd] = useState('');
   const [installOpen, setInstallOpen] = useState(false);
   const [settings, setSettings] = useState(null);
+  const [controllerVersion, setControllerVersion] = useState('');
   const [token, setToken] = useState(localStorage.getItem('jwt')||'');
   const [loginOpen, setLoginOpen] = useState(!localStorage.getItem('jwt'));
   const [userList, setUserList] = useState([]);
@@ -577,6 +578,8 @@ export default function App() {
       if(!token) return;
       const s = await api('GET', '/api/settings');
       if (s) setSettings(s);
+      const v = await api('GET', '/api/version');
+      if (v?.version) setControllerVersion(v.version);
     } catch (e) {
       if(token) message.error('全局设置加载失败: '+e.message);
     }
@@ -773,6 +776,7 @@ export default function App() {
           <Button onClick={()=>setView('routes')}>线路列表</Button>
           <Button onClick={()=>setLoginOpen(true)}>切换账号</Button>
           <Button onClick={showInstall}>安装节点</Button>
+          {controllerVersion && <Tag color="gold">Controller版本：{controllerVersion}</Tag>}
           {settings && <Tag color="blue">默认传输：{(settings.transport||'quic').toUpperCase()}</Tag>}
           {settings && <Tag color="purple">默认压缩：{settings.compression||'none'}</Tag>}
           {settings && settings.http_probe_url ? <Tag color="geekblue">探测URL：{settings.http_probe_url}</Tag> : null}
