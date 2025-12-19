@@ -1096,6 +1096,30 @@ func main() {
 		c.Status(http.StatusNoContent)
 	})
 
+	// 手工设置节点公网IP
+	authGroup.PUT("/nodes/:id/public-ips", func(c *gin.Context) {
+		id := c.Param("id")
+		var req struct {
+			PublicIPs []string `json:"public_ips"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.String(http.StatusBadRequest, "bad request: %v", err)
+			return
+		}
+		ips := make([]string, 0)
+		for _, ip := range req.PublicIPs {
+			ip = strings.TrimSpace(ip)
+			if ip != "" {
+				ips = append(ips, ip)
+			}
+		}
+		if err := db.Model(&Node{}).Where("id = ?", id).Update("public_ips", StringList(ips)).Error; err != nil {
+			c.String(http.StatusInternalServerError, "update failed: %v", err)
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"public_ips": ips})
+	})
+
 	api.POST("/metrics", func(c *gin.Context) {
 		// 节点 token 校验
 		nodeToken := getBearerToken(c)
@@ -2314,7 +2338,7 @@ func applyMetricsPayload(db *gorm.DB, node *Node, payload struct {
 				From: payload.From, To: to, RTTMs: m.RTTms, Loss: m.Loss, UpdatedAt: time.Now(),
 			})
 	}
-	db.Model(&Node{}).Where("id = ?", node.ID).Updates(map[string]any{
+	updates := map[string]any{
 		"last_cpu":      payload.Status.CPUUsage,
 		"mem_used":      payload.Status.MemUsed,
 		"mem_total":     payload.Status.MemTotal,
@@ -2327,8 +2351,38 @@ func applyMetricsPayload(db *gorm.DB, node *Node, payload struct {
 		"compression":   firstNonEmpty(payload.Status.Compression, node.Compression),
 		"os_name":       payload.Status.OS,
 		"arch":          payload.Status.Arch,
-		"public_ips":    StringList(payload.Status.PublicIPs),
-	})
+	}
+	// 合并已有公网IP + 新上报，不覆盖手动填写
+	var existing Node
+	_ = db.First(&existing, node.ID).Error
+	merged := make([]string, 0)
+	seen := map[string]struct{}{}
+	for _, ip := range existing.PublicIPs {
+		ip = strings.TrimSpace(ip)
+		if ip == "" {
+			continue
+		}
+		if _, ok := seen[ip]; ok {
+			continue
+		}
+		seen[ip] = struct{}{}
+		merged = append(merged, ip)
+	}
+	for _, ip := range payload.Status.PublicIPs {
+		ip = strings.TrimSpace(ip)
+		if ip == "" {
+			continue
+		}
+		if _, ok := seen[ip]; ok {
+			continue
+		}
+		seen[ip] = struct{}{}
+		merged = append(merged, ip)
+	}
+	if len(merged) > 0 {
+		updates["public_ips"] = StringList(merged)
+	}
+	db.Model(&Node{}).Where("id = ?", node.ID).Updates(updates)
 }
 
 func findNodeByToken(db *gorm.DB, token string) (*Node, error) {

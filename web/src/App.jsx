@@ -108,6 +108,8 @@ function NodeDetail({ node, onBack, refreshList, onShowInstall }) {
   const [editForm] = Form.useForm();
   const [peerIPOptions, setPeerIPOptions] = useState([]);
   const [peerEditIPOptions, setPeerEditIPOptions] = useState([]);
+  const [ipModalOpen, setIpModalOpen] = useState(false);
+  const [ipForm] = Form.useForm();
 
   const load = async () => {
     try {
@@ -241,12 +243,24 @@ function NodeDetail({ node, onBack, refreshList, onShowInstall }) {
         <Descriptions.Item label="QUIC监听">{detail.quic_listen || detail.ws_listen}</Descriptions.Item>
         <Descriptions.Item label="WSS监听">{detail.wss_listen || '-'}</Descriptions.Item>
         <Descriptions.Item label="CPU">{(detail.cpu_usage||0).toFixed ? detail.cpu_usage.toFixed(1)+'%' : '-'}</Descriptions.Item>
-        <Descriptions.Item label="内存">{`${formatBytes(detail.mem_used_bytes||0)} / ${formatBytes(detail.mem_total_bytes||0)}`}</Descriptions.Item>
-        <Descriptions.Item label="运行时长">{formatUptime(detail.uptime_sec||0)}</Descriptions.Item>
-        <Descriptions.Item label="网络累计">{`↑${formatBytes(detail.net_out_bytes||0)} ↓${formatBytes(detail.net_in_bytes||0)}`}</Descriptions.Item>
-        <Descriptions.Item label="版本">{detail.node_version || '-'}</Descriptions.Item>
-        <Descriptions.Item label="最后心跳">{detail.last_seen_at ? new Date(detail.last_seen_at).toLocaleString() : '-'}</Descriptions.Item>
+      <Descriptions.Item label="内存">{`${formatBytes(detail.mem_used_bytes||0)} / ${formatBytes(detail.mem_total_bytes||0)}`}</Descriptions.Item>
+      <Descriptions.Item label="运行时长">{formatUptime(detail.uptime_sec||0)}</Descriptions.Item>
+      <Descriptions.Item label="网络累计">{`↑${formatBytes(detail.net_out_bytes||0)} ↓${formatBytes(detail.net_in_bytes||0)}`}</Descriptions.Item>
+      <Descriptions.Item label="版本">{detail.node_version || '-'}</Descriptions.Item>
+      <Descriptions.Item label="最后心跳">{detail.last_seen_at ? new Date(detail.last_seen_at).toLocaleString() : '-'}</Descriptions.Item>
       </Descriptions>
+      <Space style={{marginTop:8, marginBottom:8}}>
+        <span>
+          公网IP：
+          {(detail.public_ips||[]).length
+            ? (detail.public_ips||[]).map(ip=><Tag key={ip}>{ip}</Tag>)
+            : '未上报'}
+        </span>
+        <Button size="small" onClick={()=>{
+          ipForm.setFieldsValue({ips:(detail.public_ips||[]).join('\n')});
+          setIpModalOpen(true);
+        }}>手动设置</Button>
+      </Space>
       <Tabs style={{marginTop:16}} items={[
         { key:'entries', label:'入口', children:<>
           <Button type="primary" onClick={()=>setEntryOpen(true)} style={{marginBottom:8}}>添加入口</Button>
@@ -271,15 +285,7 @@ function NodeDetail({ node, onBack, refreshList, onShowInstall }) {
           <Table rowKey="id" dataSource={detail.peers||[]} columns={peerCols} pagination={false}/>
         </>},
         { key:'routes', label:'线路', children:<>
-          <Space style={{marginBottom:8}}>
-            <Button type="primary" onClick={()=>setRouteOpen(true)}>添加线路</Button>
-            <span>
-              节点公网IP：
-              {(detail.public_ips||[]).length
-                ? (detail.public_ips||[]).map(ip=><Tag key={ip}>{ip}</Tag>)
-                : '未上报'}
-            </span>
-          </Space>
+          <Button type="primary" onClick={()=>setRouteOpen(true)} style={{marginBottom:8}}>添加线路</Button>
           <Table rowKey="id" dataSource={detail.routes||[]} columns={routeCols} pagination={false}/>
         </>}
       ]}/>
@@ -305,6 +311,23 @@ function NodeDetail({ node, onBack, refreshList, onShowInstall }) {
             />
           </Form.Item>
           <Form.Item name="remote" label="远端" rules={[{required:true}]}><Input placeholder="1.1.1.1:3389"/></Form.Item>
+        </Form>
+      </Modal>
+
+      <Modal open={ipModalOpen} onCancel={()=>setIpModalOpen(false)} onOk={async ()=>{
+        try{
+          const v = await ipForm.validateFields();
+          const ips = (v.ips||'').split(/[\n,]+/).map(s=>s.trim()).filter(Boolean);
+          await api('PUT', `/api/nodes/${node.id}/public-ips`, {public_ips: ips});
+          message.success('公网IP已更新');
+          setIpModalOpen(false);
+          load();
+        }catch(e){ message.error(e.message); }
+      }} title="手动设置公网IP">
+        <Form layout="vertical" form={ipForm}>
+          <Form.Item name="ips" label="公网IP（换行/逗号分隔）">
+            <Input.TextArea rows={4} placeholder="例如: 1.2.3.4&#10;240e:xxxx::1"/>
+          </Form.Item>
         </Form>
       </Modal>
 
