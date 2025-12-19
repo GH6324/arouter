@@ -3,17 +3,17 @@ module arouter
 go 1.24.0
 
 require (
+	alicode.mukj.cn/yjkj.ink/work v0.0.0-20250623113133-c3eed49cb967
 	github.com/gin-gonic/gin v1.11.0
 	github.com/glebarez/sqlite v1.11.0
+	github.com/gorilla/websocket v1.5.1
 	github.com/quic-go/quic-go v0.54.0
 	golang.org/x/crypto v0.40.0
 	gorm.io/driver/mysql v1.6.0
 	gorm.io/gorm v1.31.1
-	nhooyr.io/websocket v1.8.17
 )
 
 require (
-	alicode.mukj.cn/yjkj.ink/work v0.0.0-20250623113133-c3eed49cb967 // indirect
 	filippo.io/edwards25519 v1.1.0 // indirect
 	github.com/bytedance/sonic v1.14.0 // indirect
 	github.com/bytedance/sonic/loader v0.3.0 // indirect

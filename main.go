@@ -32,6 +32,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -40,16 +41,24 @@ import (
 	"syscall"
 	"time"
 
+	wscompat "arouter/internal/wscompat"
+
 	http2 "alicode.mukj.cn/yjkj.ink/work/http"
 	"github.com/quic-go/quic-go"
 	"golang.org/x/crypto/chacha20poly1305"
-	"nhooyr.io/websocket"
 )
 
 var buildVersion = "dev"
 var wsSessionCache = tls.NewLRUClientSessionCache(128)
 var debugLogEnabled atomic.Bool
 var logFilter = &levelWriter{out: os.Stderr, debug: &debugLogEnabled}
+var httpTimeoutClient = &http.Client{Timeout: 10 * time.Second}
+var defaultMemLimit = "256MiB"
+
+const (
+	colorRed   = "\033[31m"
+	colorReset = "\033[0m"
+)
 
 func logDebug(format string, args ...interface{}) {
 	if debugLogEnabled.Load() {
@@ -63,6 +72,12 @@ func logWarn(format string, args ...interface{}) {
 
 func logError(format string, args ...interface{}) {
 	log.Printf("[ERROR] "+format, args...)
+}
+
+// logTest 用红色高亮测试链路相关日志，便于快速识别。
+func logTest(format string, args ...interface{}) {
+	msg := fmt.Sprintf("[TEST] "+format, args...)
+	log.Printf("%s%s%s", colorRed, msg, colorReset)
 }
 
 type levelWriter struct {
@@ -726,6 +741,18 @@ func defaultIfEmpty(val, def string) string {
 	return val
 }
 
+// ensureListenAddr ensures port-only values are prefixed with ":" for net.Listen.
+func ensureListenAddr(addr string) string {
+	a := strings.TrimSpace(addr)
+	if a == "" {
+		return ""
+	}
+	if strings.Contains(a, ":") {
+		return a
+	}
+	return ":" + a
+}
+
 func (n *Node) recordMetric(peer NodeID, m LinkMetrics) {
 	if n.ControllerURL == "" {
 		return
@@ -739,28 +766,34 @@ func (n *Node) recordMetric(peer NodeID, m LinkMetrics) {
 }
 
 func (n *Node) pushAndPullLoop(ctx context.Context) {
-	interval := n.PollPeriod
-	if interval <= 0 {
-		interval = time.Minute
+	pushInterval := n.PollPeriod
+	if pushInterval <= 0 {
+		pushInterval = time.Minute
 	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	if n.pushMetrics(ctx) {
-		n.pullTopology(ctx)
+	pullInterval := n.TopologyPull
+	if pullInterval <= 0 {
+		pullInterval = pushInterval
 	}
+	pushTicker := time.NewTicker(pushInterval)
+	pullTicker := time.NewTicker(pullInterval)
+	defer pushTicker.Stop()
+	defer pullTicker.Stop()
+	n.pushMetrics(ctx)
+	n.pullTopology(ctx)
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			if n.pushMetrics(ctx) {
-				n.pullTopology(ctx)
-			}
+		case <-pushTicker.C:
+			n.pushMetrics(ctx)
+		case <-pullTicker.C:
+			n.pullTopology(ctx)
 		}
 	}
 }
 
 func (n *Node) pushMetrics(ctx context.Context) bool {
+	// 优先通过 WS 推送，失败时回退 HTTP
 	n.metricsMu.Lock()
 	snapshot := make(map[NodeID]LinkMetrics, len(n.lastMetrics))
 	for k, v := range n.lastMetrics {
@@ -777,9 +810,14 @@ func (n *Node) pushMetrics(ctx context.Context) bool {
 	for k, v := range snapshot {
 		payload.Metrics[k] = LinkMetricsJSON{RTTms: v.RTT.Milliseconds(), Loss: v.LossRatio, UpdatedAt: v.UpdatedAt}
 	}
+	if n.pushMetricsWS(ctx, payload) {
+		return true
+	}
 	data, _ := json.Marshal(payload)
 	url := strings.TrimRight(n.ControllerURL, "/") + "/api/metrics"
-	req, _ := http.NewRequestWithContext(ctx, "POST", url, strings.NewReader(string(data)))
+	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(reqCtx, "POST", url, strings.NewReader(string(data)))
 	req.Header.Set("Content-Type", "application/json")
 	if len(n.AuthKey) > 0 {
 		req.Header.Set("Authorization", "Bearer "+string(n.AuthKey))
@@ -787,7 +825,7 @@ func (n *Node) pushMetrics(ctx context.Context) bool {
 	if tok := n.loadToken(); tok != "" {
 		req.Header.Set("Authorization", "Bearer "+tok)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpTimeoutClient.Do(req)
 	if err != nil {
 		log.Printf("push metrics failed: %v", err)
 		return false
@@ -801,6 +839,32 @@ func (n *Node) pushMetrics(ctx context.Context) bool {
 		log.Printf("push metrics non-2xx: %s body=%s", resp.Status, string(body))
 	}
 	return resp.StatusCode < 300
+}
+
+// pushMetricsWS 通过 WS 推送，成功返回 true。
+func (n *Node) pushMetricsWS(ctx context.Context, payload interface{}) bool {
+	conn := n.wsConnSafe()
+	if conn == nil {
+		return false
+	}
+	data, err := json.Marshal(struct {
+		Type string      `json:"type"`
+		Data interface{} `json:"data"`
+	}{
+		Type: "metrics",
+		Data: payload,
+	})
+	if err != nil {
+		return false
+	}
+	wsCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	if err := conn.Write(wsCtx, wscompat.MessageText, data); err != nil {
+		logWarn("[controller ws] write metrics failed: %v", err)
+		n.setWSConn(nil)
+		return false
+	}
+	return true
 }
 
 func (n *Node) pullTopologyLoop(ctx context.Context) {
@@ -848,6 +912,255 @@ func (n *Node) pullRoutesLoop(ctx context.Context) {
 	}
 }
 
+// controllerWSLoop 建立到控制器的 WS 连接，用于实时推送指标。
+func (n *Node) controllerWSLoop(ctx context.Context) {
+	if n.ControllerURL == "" {
+		return
+	}
+	wsURL := toWSURL(strings.TrimRight(n.ControllerURL, "/") + "/api/ws")
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		logWarn("[controller ws] dialing %s", wsURL)
+		tok := n.loadToken()
+		header := http.Header{}
+		if tok != "" {
+			header.Set("Authorization", "Bearer "+tok)
+		}
+		serverName := n.ServerName
+		if u, err := url.Parse(wsURL); err == nil {
+			host := u.Hostname()
+			if host != "" && net.ParseIP(host) == nil {
+				serverName = host
+			}
+		}
+		conn, _, err := wscompat.Dial(ctx, wsURL, &wscompat.DialOptions{
+			HTTPHeader:      header,
+			TLSClientConfig: cloneTLSWithServerName(n.TLSConfig, serverName),
+		})
+		if err != nil {
+			logWarn("[controller ws] dial failed: %v", err)
+			time.Sleep(3 * time.Second)
+			continue
+		}
+		n.setWSConn(conn)
+		log.Printf("[controller ws] connected")
+		done := make(chan struct{})
+		pingTicker := time.NewTicker(20 * time.Second)
+		defer pingTicker.Stop()
+		go func() {
+			defer close(done)
+			for {
+				_, data, err := conn.Read(ctx)
+				if err != nil {
+					logWarn("[controller ws] read failed: %v", err)
+					return
+				}
+				n.handleWSMessage(ctx, data)
+			}
+		}()
+		for {
+			select {
+			case <-ctx.Done():
+				conn.Close()
+				return
+			case <-pingTicker.C:
+				pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+				_ = conn.Ping(pingCtx)
+				cancel()
+			case <-done:
+				conn.Close()
+				n.setWSConn(nil)
+				logWarn("[controller ws] disconnected, reconnecting...")
+				time.Sleep(2 * time.Second)
+				goto reconnect
+			}
+		}
+	reconnect:
+	}
+}
+
+func (n *Node) setWSConn(c *wscompat.Conn) {
+	n.wsMu.Lock()
+	defer n.wsMu.Unlock()
+	if n.wsConn != nil && n.wsConn != c {
+		n.wsConn.Close()
+	}
+	n.wsConn = c
+}
+
+func (n *Node) wsConnSafe() *wscompat.Conn {
+	n.wsMu.Lock()
+	defer n.wsMu.Unlock()
+	return n.wsConn
+}
+
+func (n *Node) handleWSMessage(ctx context.Context, data []byte) {
+	var msg struct {
+		Type string          `json:"type"`
+		Data json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(data, &msg); err != nil {
+		return
+	}
+	switch msg.Type {
+	case "probe":
+		var req struct {
+			Target string `json:"target"`
+		}
+		if err := json.Unmarshal(msg.Data, &req); err != nil || strings.TrimSpace(req.Target) == "" {
+			return
+		}
+		go n.runProbeAndReport(ctx, req.Target)
+	case "route_test":
+		var req struct {
+			Route  string   `json:"route"`
+			Path   []string `json:"path"`
+			Target string   `json:"target"`
+		}
+		if err := json.Unmarshal(msg.Data, &req); err != nil {
+			return
+		}
+		if len(req.Path) == 0 {
+			return
+		}
+		ids := make([]NodeID, 0, len(req.Path))
+		for _, p := range req.Path {
+			ids = append(ids, NodeID(p))
+		}
+		// 确保路径以自身开头
+		if len(ids) == 0 {
+			return
+		}
+		if ids[0] != n.ID {
+			ids = append([]NodeID{n.ID}, ids...)
+		}
+		target := strings.TrimSpace(req.Target)
+		if target == "" {
+			target = n.HTTPProbeURL
+		}
+		r := ManualRoute{Name: req.Route, Path: ids, Priority: 1}
+		log.Printf("[controller ws] recv route_test route=%s path=%v target=%s", r.Name, r.Path, target)
+		go n.runRouteTest(ctx, r, target)
+	default:
+	}
+}
+
+func toWSURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" {
+		return raw
+	}
+	host := u.Hostname()
+	isIP := net.ParseIP(strings.Trim(host, "[]")) != nil
+	switch strings.ToLower(u.Scheme) {
+	case "https":
+		if isIP {
+			u.Scheme = "ws"
+		} else {
+			u.Scheme = "wss"
+		}
+	case "http":
+		u.Scheme = "ws"
+	default:
+		return raw
+	}
+	return u.String()
+}
+
+// dialWSWithTLS builds dial options respecting SNI/domain and allowing IP override via NetDialContext.
+func dialWSWithTLS(ctx context.Context, targetURL string, hostForSNI string, tlsConf *tls.Config) (*wscompat.Conn, *http.Response, error) {
+	dialOpts := &wscompat.DialOptions{
+		HTTPClient: fastWSClient(tlsConf),
+	}
+	if hostForSNI != "" && tlsConf != nil {
+		tc := tlsConf.Clone()
+		tc.ServerName = hostForSNI
+		tc.InsecureSkipVerify = tc.InsecureSkipVerify
+		dialOpts.TLSClientConfig = tc
+	}
+	return wscompat.Dial(ctx, targetURL, dialOpts)
+}
+
+func (n *Node) runProbeAndReport(ctx context.Context, target string) {
+	metrics, err := n.Prober.Probe(ctx, n.ID, NodeID(target))
+	payload := struct {
+		From    string                     `json:"from"`
+		Metrics map[string]LinkMetricsJSON `json:"metrics"`
+		Status  struct {
+			CPUUsage    float64  `json:"cpu_usage"`
+			MemUsed     uint64   `json:"mem_used_bytes"`
+			MemTotal    uint64   `json:"mem_total_bytes"`
+			UptimeSec   uint64   `json:"uptime_sec"`
+			NetInBytes  uint64   `json:"net_in_bytes"`
+			NetOutBytes uint64   `json:"net_out_bytes"`
+			Version     string   `json:"version"`
+			Transport   string   `json:"transport"`
+			Compression string   `json:"compression"`
+			OS          string   `json:"os"`
+			Arch        string   `json:"arch"`
+			PublicIPs   []string `json:"public_ips"`
+		} `json:"status"`
+	}{
+		From:    string(n.ID),
+		Metrics: make(map[string]LinkMetricsJSON),
+	}
+	if err == nil {
+		payload.Metrics[target] = LinkMetricsJSON{
+			RTTms:     metrics.RTT.Milliseconds(),
+			Loss:      metrics.LossRatio,
+			UpdatedAt: time.Now(),
+		}
+	} else {
+		payload.Metrics[target] = LinkMetricsJSON{
+			RTTms:     0,
+			Loss:      1,
+			UpdatedAt: time.Now(),
+		}
+	}
+	// 立即通过 WS 推送
+	if n.pushMetricsWS(ctx, payload) {
+		return
+	}
+	// WS 失败则回退 HTTP 推送
+	n.metricsMu.Lock()
+	n.lastMetrics[NodeID(target)] = metrics
+	n.metricsMu.Unlock()
+	n.pushMetrics(ctx)
+}
+
+func (n *Node) runRouteTest(ctx context.Context, r ManualRoute, target string) {
+	ws, ok := n.Transport.(*WSSTransport)
+	if !ok {
+		log.Printf("[route_test %s] transport not ws", r.Name)
+		return
+	}
+	if target == "" {
+		target = n.HTTPProbeURL
+	}
+	timeout := 20 * time.Second
+	logTest("route_test %s start path=%v target=%s timeout=%s", r.Name, r.Path, target, timeout)
+	dur, err := ws.ProbeHTTP(ctx, r.Path, target, timeout)
+	if dur > timeout {
+		dur = timeout
+	}
+	success := err == nil
+	if err != nil {
+		logTest("route_test %s failed: %v", r.Name, err)
+	} else {
+		logTest("route_test %s success rtt=%s", r.Name, dur)
+	}
+	if e := n.sendRouteTestResult(ctx, r, target, dur, success, err); e != nil {
+		logTest("route_test %s send ws result failed: %v", r.Name, e)
+	}
+	if e := n.reportProbe(ctx, r, dur, success, err); e != nil {
+		logTest("route_test %s http report failed: %v", r.Name, e)
+	}
+}
+
 type topologyPayload struct {
 	Edges map[NodeID]map[NodeID]LinkMetricsJSON `json:"edges"`
 }
@@ -856,6 +1169,40 @@ type LinkMetricsJSON struct {
 	RTTms     int64     `json:"rtt_ms"`
 	Loss      float64   `json:"loss"`
 	UpdatedAt time.Time `json:"updated_at"`
+}
+
+func (n *Node) sendRouteTestResult(ctx context.Context, r ManualRoute, target string, dur time.Duration, success bool, err error) error {
+	conn := n.wsConnSafe()
+	if conn == nil {
+		return fmt.Errorf("ws not connected")
+	}
+	payload := struct {
+		Type string `json:"type"`
+		Data struct {
+			Route   string   `json:"route"`
+			Path    []string `json:"path"`
+			Target  string   `json:"target"`
+			RTTMs   int64    `json:"rtt_ms"`
+			Success bool     `json:"success"`
+			Error   string   `json:"error"`
+		} `json:"data"`
+	}{
+		Type: "route_test_result",
+	}
+	payload.Data.Route = r.Name
+	payload.Data.Path = nodeIDsToStrings(r.Path)
+	payload.Data.Target = target
+	payload.Data.RTTMs = dur.Milliseconds()
+	payload.Data.Success = success
+	if err != nil {
+		payload.Data.Error = err.Error()
+	}
+	data, _ := json.Marshal(payload)
+	if werr := conn.Write(ctx, wscompat.MessageText, data); werr != nil {
+		return werr
+	}
+	logTest("route_test %s ws result sent target=%s rtt=%dms success=%v", r.Name, target, payload.Data.RTTMs, success)
+	return nil
 }
 
 type certPayload struct {
@@ -868,11 +1215,13 @@ func (n *Node) pullTopology(ctx context.Context) {
 		return
 	}
 	url := strings.TrimRight(n.ControllerURL, "/") + "/api/topology"
-	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
+	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(reqCtx, "GET", url, nil)
 	if tok := n.loadToken(); tok != "" {
 		req.Header.Set("Authorization", "Bearer "+tok)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpTimeoutClient.Do(req)
 	if err != nil {
 		log.Printf("pull topology failed: %v", err)
 		return
@@ -923,11 +1272,13 @@ func (n *Node) fetchCertLoop(ctx context.Context) {
 func (n *Node) fetchCert(ctx context.Context) {
 	url := strings.TrimRight(n.ControllerURL, "/") + "/api/certs"
 	log.Printf("[config] fetching cert from %s", url)
-	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
+	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(reqCtx, "GET", url, nil)
 	if tok := n.loadToken(); tok != "" {
 		req.Header.Set("Authorization", "Bearer "+tok)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpTimeoutClient.Do(req)
 	if err != nil {
 		log.Printf("[config] fetch cert failed: %v", err)
 		return
@@ -983,11 +1334,13 @@ func (n *Node) pullRoutes(ctx context.Context) {
 	}
 	url := strings.TrimRight(n.ControllerURL, "/") + "/api/node-routes/" + url.PathEscape(string(n.ID))
 	log.Printf("[config] fetching routes from %s", url)
-	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
+	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(reqCtx, "GET", url, nil)
 	if tok := n.loadToken(); tok != "" {
 		req.Header.Set("Authorization", "Bearer "+tok)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpTimeoutClient.Do(req)
 	if err != nil {
 		log.Printf("[config] pull routes failed: %v", err)
 		return
@@ -1049,35 +1402,54 @@ func (p *WSProber) Probe(ctx context.Context, _, remote NodeID) (LinkMetrics, er
 	url = normalizeWSEndpoint(probeURL(url))
 	to := p.Timeout
 	if to == 0 {
-		to = 8 * time.Second
+		to = 3 * time.Second
 	}
 	ctxPing, cancel := context.WithTimeout(ctx, to)
 	defer cancel()
 
-	start := time.Now()
-	var c *websocket.Conn
+	startDial := time.Now()
+	var c *wscompat.Conn
 	var err error
-	dialOpts := &websocket.DialOptions{
+	dialOpts := &wscompat.DialOptions{
 		HTTPClient:      fastWSClient(p.TLSConfig),
-		CompressionMode: websocket.CompressionDisabled,
+		TLSClientConfig: cloneTLSWithServerName(p.TLSConfig, p.ServerName),
 	}
-	c, _, err = websocket.Dial(ctxPing, url, dialOpts)
-	if err != nil && strings.HasPrefix(url, "wss://") {
+	c, resp, err := wscompat.Dial(ctxPing, url, dialOpts)
+	if err != nil && resp == nil && shouldFallbackToWS(err) && strings.HasPrefix(url, "wss://") {
 		wsURL := "ws://" + strings.TrimPrefix(url, "wss://")
-		c, _, err = websocket.Dial(ctxPing, wsURL, &websocket.DialOptions{
-			HTTPClient:      fastWSClient(nil),
-			CompressionMode: websocket.CompressionDisabled,
+		logDebug("[probe] fallback to ws for %s due to tls error: %v", url, err)
+		c, resp, err = wscompat.Dial(ctxPing, wsURL, &wscompat.DialOptions{
+			HTTPClient: fastWSClient(nil),
 		})
 		if err == nil {
 			url = wsURL
 		}
 	}
 	if err != nil {
+		if resp != nil {
+			return LinkMetrics{}, fmt.Errorf("dial probe %s failed: status=%s err=%w", url, resp.Status, err)
+		}
 		return LinkMetrics{}, fmt.Errorf("dial probe %s failed: %w", url, err)
 	}
-	defer c.Close(websocket.StatusNormalClosure, "probe done")
+	defer c.Close()
+	dialCost := time.Since(startDial)
+
+	// 连接成功后，通过 Ping/Pong 测算更精确的 RTT，失败则回退到握手耗时。
+	pingCtx, cancelPing := context.WithTimeout(ctx, 2*time.Second)
+	startPing := time.Now()
+	if err := c.Ping(pingCtx); err == nil {
+		cancelPing()
+		return LinkMetrics{
+			RTT:       time.Since(startPing),
+			LossRatio: 0,
+			UpdatedAt: time.Now(),
+		}, nil
+	}
+	cancelPing()
+	logDebug("[probe] ping failed on %s, fallback dial RTT: %v", url, dialCost)
+
 	return LinkMetrics{
-		RTT:       time.Since(start),
+		RTT:       dialCost,
 		LossRatio: 0,
 		UpdatedAt: time.Now(),
 	}, nil
@@ -1164,13 +1536,55 @@ func normalizeWSEndpoint(endpoint string) string {
 	if strings.Contains(host, ":") && !strings.Contains(host, "[") {
 		h, p, err := net.SplitHostPort(host)
 		if err == nil {
-			u.Host = fmt.Sprintf("[%s]:%s", h, p)
+			// 仅 IPv6 需要加 []，IPv4 保持原样
+			if ip := net.ParseIP(h); ip != nil && strings.Contains(h, ":") {
+				u.Host = fmt.Sprintf("[%s]:%s", h, p)
+				return u.String()
+			}
+			u.Host = net.JoinHostPort(h, p)
 			return u.String()
 		}
-		u.Host = fmt.Sprintf("[%s]", host)
-		return u.String()
 	}
-	return endpoint
+	return u.String()
+}
+
+func shouldFallbackToWS(err error) bool {
+	if err == nil {
+		return false
+	}
+	var hdrErr *tls.RecordHeaderError
+	if errors.As(err, &hdrErr) {
+		return true
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "first record does not look like a TLS handshake") {
+		return true
+	}
+	if strings.Contains(msg, "unexpected EOF") {
+		return true
+	}
+	return false
+}
+
+// dialWSWithFallback 优先按 URL 拨号，如果是 wss:// 且握手失败（无 HTTP 状态），则降级为 ws://。
+func dialWSWithFallback(ctx context.Context, url string, tlsConf *tls.Config, serverName string) (*wscompat.Conn, *http.Response, error) {
+	opts := &wscompat.DialOptions{
+		HTTPClient:      fastWSClient(tlsConf),
+		TLSClientConfig: cloneTLSWithServerName(tlsConf, serverName),
+	}
+	conn, resp, err := wscompat.Dial(ctx, url, opts)
+	if err == nil || resp != nil || !strings.HasPrefix(url, "wss://") {
+		return conn, resp, err
+	}
+	if !shouldFallbackToWS(err) {
+		return conn, resp, err
+	}
+	wsURL := "ws://" + strings.TrimPrefix(url, "wss://")
+	logDebug("[ws dial] fallback to ws for %s due to tls error: %v", url, err)
+	conn, resp, err = wscompat.Dial(ctx, wsURL, &wscompat.DialOptions{
+		HTTPClient: fastWSClient(nil),
+	})
+	return conn, resp, err
 }
 
 func normalizePeerEndpoint(raw string, mode string) string {
@@ -1204,6 +1618,7 @@ func fastWSClient(baseTLS *tls.Config) *http.Client {
 		MaxIdleConnsPerHost: 64,
 		IdleConnTimeout:     90 * time.Second,
 		DisableCompression:  true,
+		ForceAttemptHTTP2:   false, // 避免 ALPN 协商 h2 导致 websocket 拒绝
 		DialContext: (&net.Dialer{
 			Timeout:   3 * time.Second,
 			KeepAlive: 30 * time.Second,
@@ -1251,11 +1666,12 @@ type HTTPProbeResult struct {
 }
 
 type pooledWS struct {
-	conn      *websocket.Conn
+	conn      *wscompat.Conn
 	mux       *MuxManager
 	createdAt time.Time
 	lastUsed  time.Time
 	active    int
+	draining  bool
 }
 
 // WSSTransport 通过 WebSocket 级联转发，可同时监听 WS 与 WSS。
@@ -1267,6 +1683,7 @@ type WSSTransport struct {
 	KeyFile       string
 	Endpoints     map[NodeID]string // peer -> ws(s)://host:port/mesh
 	TLSConfig     *tls.Config
+	ServerName    string
 	IdleTimeout   time.Duration
 	AuthKey       []byte
 	NodeToken     string
@@ -1319,6 +1736,7 @@ func (t *WSSTransport) Forward(ctx context.Context, src NodeID, path []NodeID, p
 		t.evictPooled(next, pw)
 		return fmt.Errorf("send header failed: %w", err)
 	}
+	defer stream.Close(context.Background())
 	logDebug("[mux stream=%d] sent header to %s proto=%s remote=%s path=%v", stream.ID(), next, proto, remoteAddr, header.Path)
 	wsConn := muxStreamConn(ctx, stream, func() {
 		logDebug("[mux stream=%d] release pooled mux %s (addr=%p)", stream.ID(), next, pw)
@@ -1337,6 +1755,9 @@ func (t *WSSTransport) Forward(ctx context.Context, src NodeID, path []NodeID, p
 	}
 	logDebug("[session=%s] tunnel start proto=%s remote=%s path=%v compression=%s enc=%v", session, proto, remoteAddr, header.Path, header.Compression, header.EncID)
 	err = bridgeMaybeCompressed(session, downstream, wsConn, header.Compression, header.CompressMin, t.Metrics, path, remoteAddr)
+	if errors.Is(err, io.EOF) {
+		err = nil
+	}
 	if err != nil {
 		// 出错后关闭流并驱逐连接，避免复用可能异常的 mux
 		_ = stream.Reset(context.Background())
@@ -1359,12 +1780,14 @@ func (t *WSSTransport) ProbeHTTP(ctx context.Context, path []NodeID, target stri
 	if timeout <= 0 {
 		timeout = 20 * time.Second
 	}
+	logTest("probe http start path=%v target=%s timeout=%s", path, target, timeout)
 	next := path[1]
 	targetURL, ok := t.Endpoints[next]
 	if !ok {
 		return 0, fmt.Errorf("no endpoint for %s", next)
 	}
 	targetURL = normalizeWSEndpoint(targetURL)
+	logTest("probe http dial next=%s url=%s", next, targetURL)
 	start := time.Now()
 	ctxDial, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -1381,6 +1804,7 @@ func (t *WSSTransport) ProbeHTTP(ctx context.Context, path []NodeID, target stri
 		Proto:      Protocol("probe"),
 	}
 	hdrPayload, _ := json.Marshal(header)
+	logTest("probe http send ctrl path=%v target=%s", header.Path, header.RemoteAddr)
 	if err := stream.WriteFlags(ctxDial, flagCTRL, marshalCtrl(ctrlProbe, hdrPayload)); err != nil {
 		return 0, fmt.Errorf("send probe failed: %w", err)
 	}
@@ -1388,10 +1812,13 @@ func (t *WSSTransport) ProbeHTTP(ctx context.Context, path []NodeID, target stri
 	ch := mux.subscribe(stream.ID())
 	for f := range ch {
 		if f.flags&(flagFIN|flagRST) != 0 {
+			logTest("probe http recv fin flags=%d stream=%d", f.flags, stream.ID())
 			break
 		}
 	}
-	return time.Since(start), nil
+	elapsed := time.Since(start)
+	logTest("probe http finished path=%v target=%s rtt=%s", path, target, elapsed)
+	return elapsed, nil
 }
 
 // ReconnectTCP 在桥接出错时尝试重新选路重建连接。
@@ -1405,7 +1832,7 @@ func (t *WSSTransport) ReconnectTCP(ctx context.Context, src NodeID, proto Proto
 }
 
 // OpenUDPSession 建立 UDP 隧道的控制面，返回已握手的 WS 连接与会话 ID。
-func (t *WSSTransport) OpenUDPSession(ctx context.Context, path []NodeID, remoteAddr string) (*websocket.Conn, string, error) {
+func (t *WSSTransport) OpenUDPSession(ctx context.Context, path []NodeID, remoteAddr string) (*wscompat.Conn, string, error) {
 	if len(path) < 2 {
 		return nil, "", fmt.Errorf("path too short: %v", path)
 	}
@@ -1433,16 +1860,16 @@ func (t *WSSTransport) OpenUDPSession(ctx context.Context, path []NodeID, remote
 		Session: session,
 		Header:  &header,
 	}, t.AuthKey); err != nil {
-		c.Close(websocket.StatusInternalError, "send header failed")
+		c.Close()
 		return nil, "", err
 	}
 	ack, err := readVerifiedEnvelope(ctxDial, c, t.AuthKey)
 	if err != nil {
-		c.Close(websocket.StatusInternalError, "await ack failed")
+		c.Close()
 		return nil, "", err
 	}
 	if ack.Type != "ack" || ack.Ack == nil {
-		c.Close(websocket.StatusInternalError, "bad ack")
+		c.Close()
 		return nil, "", fmt.Errorf("expected ack, got %s: %s", ack.Type, ack.Error)
 	}
 	log.Printf("[session=%s] UDP 下游 %s 确认链路，已确认: %v", session, next, ack.Ack.Confirmed)
@@ -1452,10 +1879,7 @@ func (t *WSSTransport) OpenUDPSession(ctx context.Context, path []NodeID, remote
 func (t *WSSTransport) Serve(ctx context.Context) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/mesh", func(w http.ResponseWriter, r *http.Request) {
-		c, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-			InsecureSkipVerify: t.TLSConfig != nil && t.TLSConfig.InsecureSkipVerify,
-			CompressionMode:    websocket.CompressionDisabled,
-		})
+		c, err := wscompat.Accept(w, r, &wscompat.AcceptOptions{})
 		if err != nil {
 			log.Printf("accept ws failed: %v", err)
 			return
@@ -1464,16 +1888,13 @@ func (t *WSSTransport) Serve(ctx context.Context) error {
 	})
 	// Probe endpoint: accept WS and just respond to pings, then close.
 	mux.HandleFunc("/probe", func(w http.ResponseWriter, r *http.Request) {
-		c, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-			InsecureSkipVerify: t.TLSConfig != nil && t.TLSConfig.InsecureSkipVerify,
-			CompressionMode:    websocket.CompressionDisabled,
-		})
+		c, err := wscompat.Accept(w, r, &wscompat.AcceptOptions{})
 		if err != nil {
 			log.Printf("accept ws probe failed: %v", err)
 			return
 		}
 		go func() {
-			defer c.Close(websocket.StatusNormalClosure, "probe done")
+			defer c.Close()
 			select {
 			case <-ctx.Done():
 			case <-time.After(2 * time.Second):
@@ -1529,8 +1950,8 @@ func (t *WSSTransport) Serve(ctx context.Context) error {
 	return nil
 }
 
-func (t *WSSTransport) handleConn(ctx context.Context, c *websocket.Conn) {
-	defer c.Close(websocket.StatusNormalClosure, "done")
+func (t *WSSTransport) handleConn(ctx context.Context, c *wscompat.Conn) {
+	defer c.Close()
 	if t.IdleTimeout > 0 {
 		c.SetReadLimit(64 << 20)
 	}
@@ -1538,22 +1959,19 @@ func (t *WSSTransport) handleConn(ctx context.Context, c *websocket.Conn) {
 	t.muxServe(ctx, mux)
 }
 
-func (t *WSSTransport) handleHTTPProbe(ctx context.Context, c *websocket.Conn, env ControlEnvelope) {
-	_ = c.Close(websocket.StatusUnsupportedData, "legacy probe unsupported in mux mode")
+func (t *WSSTransport) handleHTTPProbe(ctx context.Context, c *wscompat.Conn, env ControlEnvelope) {
+	_ = c.Close()
 }
 
-func (t *WSSTransport) getOrDial(ctx context.Context, next NodeID, url string) (*websocket.Conn, error) {
-	conn, _, err := websocket.Dial(ctx, url, &websocket.DialOptions{
-		HTTPClient:      fastWSClient(t.TLSConfig),
-		CompressionMode: websocket.CompressionDisabled,
-	})
+func (t *WSSTransport) getOrDial(ctx context.Context, next NodeID, url string) (*wscompat.Conn, error) {
+	conn, _, err := dialWSWithFallback(ctx, url, t.TLSConfig, t.ServerName)
 	if err != nil {
 		return nil, err
 	}
 	return conn, nil
 }
 
-func (t *WSSTransport) getOrDialMux(ctx context.Context, next NodeID, url string) (*websocket.Conn, *MuxManager, *pooledWS, error) {
+func (t *WSSTransport) getOrDialMux(ctx context.Context, next NodeID, url string) (*wscompat.Conn, *MuxManager, *pooledWS, error) {
 	t.poolMu.Lock()
 	if t.pool == nil {
 		t.pool = make(map[NodeID][]*pooledWS)
@@ -1568,23 +1986,32 @@ func (t *WSSTransport) getOrDialMux(ctx context.Context, next NodeID, url string
 	// filter out expired or closed
 	valid := make([]*pooledWS, 0, len(candidates))
 	var chosen *pooledWS
+	var fallback *pooledWS // draining mux as last resort
 	for _, p := range candidates {
 		select {
 		case <-p.mux.Done():
-			p.conn.Close(websocket.StatusNormalClosure, "mux done")
-	logDebug("[mux pool %s] drop closed mux (addr=%p)", next, p)
+			p.conn.Close()
+			logDebug("[mux pool %s] drop closed mux (addr=%p)", next, p)
 			continue
 		default:
 		}
-		if !t.isActive(p, now) {
-			p.conn.Close(websocket.StatusNormalClosure, "expired")
-			logDebug("[mux pool %s] drop expired mux (addr=%p)", next, p)
+		expired := t.isExpired(p, now)
+		if expired && p.active == 0 {
+			p.conn.Close()
+			logDebug("[mux pool %s] drop expired idle mux (addr=%p)", next, p)
 			continue
 		}
-		if chosen == nil && p.active < maxStreams {
+		if expired && !p.draining {
+			p.draining = true
+			logDebug("[mux pool %s] mark mux draining (addr=%p)", next, p)
+		}
+		if chosen == nil && !p.draining && p.active < maxStreams {
 			chosen = p
 			p.active++
 			p.lastUsed = now
+		}
+		if fallback == nil && p.draining && p.active < maxStreams {
+			fallback = p
 		}
 		valid = append(valid, p)
 	}
@@ -1599,11 +2026,17 @@ func (t *WSSTransport) getOrDialMux(ctx context.Context, next NodeID, url string
 		return chosen.conn, chosen.mux, chosen, nil
 	}
 
-	conn, _, err := websocket.Dial(ctx, url, &websocket.DialOptions{
-		HTTPClient:      fastWSClient(t.TLSConfig),
-		CompressionMode: websocket.CompressionDisabled,
-	})
+	conn, _, err := dialWSWithFallback(ctx, url, t.TLSConfig, t.ServerName)
 	if err != nil {
+		// 如果新建失败，降级复用 draining 的连接，尽量保持可用
+		if fallback != nil {
+			t.poolMu.Lock()
+			fallback.active++
+			fallback.lastUsed = time.Now()
+			t.poolMu.Unlock()
+			logWarn("[mux pool %s] dial failed, fallback to draining mux (addr=%p): %v", next, fallback, err)
+			return fallback.conn, fallback.mux, fallback, nil
+		}
 		return nil, nil, nil, err
 	}
 	mux := NewMuxManager(NewMuxConn(conn))
@@ -1627,15 +2060,29 @@ func (t *WSSTransport) releasePooled(next NodeID, pw *pooledWS) {
 	t.poolMu.Lock()
 	defer t.poolMu.Unlock()
 	list := t.pool[next]
+	now := time.Now()
+	newList := list[:0]
 	for _, p := range list {
-		if p == pw {
-			if p.active > 0 {
-				p.active--
-			}
-			p.lastUsed = time.Now()
-			logDebug("[mux pool %s] release mux (addr=%p) active=%d", next, p, p.active)
-			return
+		if p != pw {
+			newList = append(newList, p)
+			continue
 		}
+		if p.active > 0 {
+			p.active--
+		}
+		p.lastUsed = now
+		if (p.draining || t.isExpired(p, now)) && p.active == 0 {
+			p.conn.Close()
+			logDebug("[mux pool %s] retire mux (addr=%p)", next, p)
+			continue
+		}
+		logDebug("[mux pool %s] release mux (addr=%p) active=%d", next, p, p.active)
+		newList = append(newList, p)
+	}
+	if len(newList) == 0 {
+		delete(t.pool, next)
+	} else {
+		t.pool[next] = newList
 	}
 }
 
@@ -1643,7 +2090,7 @@ func (t *WSSTransport) evictPooled(next NodeID, pw *pooledWS) {
 	if pw == nil {
 		return
 	}
-	pw.conn.Close(websocket.StatusInternalError, "evict")
+	pw.conn.Close()
 	logWarn("[mux pool %s] evict mux (addr=%p)", next, pw)
 	t.poolMu.Lock()
 	defer t.poolMu.Unlock()
@@ -1661,7 +2108,7 @@ func (t *WSSTransport) evictPooled(next NodeID, pw *pooledWS) {
 	}
 }
 
-func (t *WSSTransport) isActive(p *pooledWS, now time.Time) bool {
+func (t *WSSTransport) isExpired(p *pooledWS, now time.Time) bool {
 	maxAge := t.maxConnAge
 	if maxAge <= 0 {
 		maxAge = 10 * time.Minute
@@ -1671,12 +2118,12 @@ func (t *WSSTransport) isActive(p *pooledWS, now time.Time) bool {
 		maxIdle = 2 * time.Minute
 	}
 	if now.Sub(p.createdAt) > maxAge {
-		return false
+		return true
 	}
-	if now.Sub(p.lastUsed) > maxIdle {
-		return false
+	if p.active == 0 && now.Sub(p.lastUsed) > maxIdle {
+		return true
 	}
-	return true
+	return false
 }
 
 func (t *WSSTransport) keepaliveMux(next NodeID, pw *pooledWS) {
@@ -1690,7 +2137,7 @@ func (t *WSSTransport) keepaliveMux(next NodeID, pw *pooledWS) {
 		case <-ticker.C:
 			if err := pw.mux.Conn().Ping(context.Background()); err != nil {
 				logWarn("[mux pool %s] keepalive failed (addr=%p): %v", next, pw, err)
-				pw.conn.Close(websocket.StatusInternalError, "ping failed")
+				pw.conn.Close()
 				t.poolMu.Lock()
 				delete(t.pool, next)
 				t.poolMu.Unlock()
@@ -1714,6 +2161,15 @@ func isFrameErr(err error) bool {
 	}
 	msg := err.Error()
 	return strings.Contains(msg, "invalid frame") || strings.Contains(msg, "unexpected EOF") || strings.Contains(msg, "corrupt input")
+}
+
+func isClosedPipeErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, syscall.EPIPE) ||
+		strings.Contains(err.Error(), "closed pipe") ||
+		strings.Contains(err.Error(), "use of closed network connection")
 }
 
 // muxStreamConn adapts a mux stream to net.Conn-like interface for bridge without extra pipes.
@@ -1821,6 +2277,16 @@ func (t *WSSTransport) muxServe(ctx context.Context, mm *MuxManager) {
 					if err := json.Unmarshal(payload, &hdr); err != nil {
 						continue
 					}
+					if hdr.Proto == Protocol("probe") {
+						logTest("mux stream=%d recv probe header path=%v target=%s", f.streamID, hdr.Path, hdr.RemoteAddr)
+					}
+					t.handleMuxHeader(ctx, mm, f.streamID, hdr)
+				} else if ct == ctrlProbe {
+					var hdr ControlHeader
+					if err := json.Unmarshal(payload, &hdr); err != nil {
+						continue
+					}
+					logTest("mux stream=%d recv ctrlProbe path=%v target=%s", f.streamID, hdr.Path, hdr.RemoteAddr)
 					t.handleMuxHeader(ctx, mm, f.streamID, hdr)
 				} else {
 					log.Printf("[mux stream=%d] ignore ctrl type=%d", f.streamID, ct)
@@ -1872,6 +2338,7 @@ func (t *WSSTransport) handleMuxHeader(ctx context.Context, mm *MuxManager, stre
 				wsConn = secured
 			}
 			go func() {
+				defer upStream.Close(context.Background())
 				if err := bridgeMaybeCompressed(sessionID, conn, wsConn, hdr.Compression, hdr.CompressMin, t.Metrics, nil, hdr.RemoteAddr); err != nil {
 					log.Printf("[session=%s] exit bridge failed: %v", sessionID, err)
 					_ = upStream.Reset(context.Background())
@@ -1945,29 +2412,37 @@ func (t *WSSTransport) handleMuxHeader(ctx context.Context, mm *MuxManager, stre
 	go func() {
 		for f := range downCh {
 			if len(f.payload) > 0 {
+				logTest("mux stream=%d cascade downstream payload len=%d", streamID, len(f.payload))
 				_ = upStream.Write(context.Background(), f.payload)
 			}
 			if f.flags&(flagFIN|flagRST) != 0 {
 				_ = upStream.WriteFlags(context.Background(), flagFIN, nil)
-				logDebug("[mux stream=%d] cascade downstream fin/rst flags=%d", streamID, f.flags)
+				logTest("mux stream=%d cascade downstream fin/rst flags=%d", streamID, f.flags)
 				release()
 				return
 			}
 		}
+		// channel closed without fin/rst, still notify upstream
+		_ = upStream.WriteFlags(context.Background(), flagFIN, nil)
+		release()
 	}()
 	// upstream -> downstream
 	go func() {
 		for f := range streamCh {
 			if len(f.payload) > 0 {
+				logTest("mux stream=%d cascade upstream payload len=%d", streamID, len(f.payload))
 				_ = downStream.Write(context.Background(), f.payload)
 			}
 			if f.flags&(flagFIN|flagRST) != 0 {
 				_ = downStream.WriteFlags(context.Background(), flagFIN, nil)
-				logDebug("[mux stream=%d] cascade upstream fin/rst flags=%d", streamID, f.flags)
+				logTest("mux stream=%d cascade upstream fin/rst flags=%d", streamID, f.flags)
 				release()
 				return
 			}
 		}
+		// channel closed without fin/rst, still notify downstream
+		_ = downStream.WriteFlags(context.Background(), flagFIN, nil)
+		release()
 	}()
 }
 
@@ -2003,7 +2478,7 @@ func forwardStreamToUDP(wsConn net.Conn, udpConn net.Conn, metrics *Metrics) {
 	}
 }
 
-func (t *WSSTransport) handleTCPExit(ctx context.Context, session string, c *websocket.Conn, remoteAddr string, compression string, compressMin int) error {
+func (t *WSSTransport) handleTCPExit(ctx context.Context, session string, c *wscompat.Conn, remoteAddr string, compression string, compressMin int) error {
 	out, err := net.DialTimeout("tcp", remoteAddr, 5*time.Second)
 	if err != nil {
 		log.Printf("[session=%s] dial remote %s failed: %v", session, remoteAddr, err)
@@ -2017,7 +2492,7 @@ func (t *WSSTransport) handleTCPExit(ctx context.Context, session string, c *web
 		out.Close()
 		return fmt.Errorf("send exit ack failed: %w", err)
 	}
-	conn := websocket.NetConn(ctx, c, websocket.MessageBinary)
+	conn := wscompat.NetConn(ctx, c, wscompat.MessageBinary)
 	// 出口按照请求的压缩策略处理
 	if err := bridgeMaybeCompressed(session, out, conn, compression, compressMin, t.Metrics, nil, remoteAddr); err != nil {
 		return err
@@ -2025,7 +2500,7 @@ func (t *WSSTransport) handleTCPExit(ctx context.Context, session string, c *web
 	return nil
 }
 
-func (t *WSSTransport) handleUDPExit(ctx context.Context, session string, c *websocket.Conn, remoteAddr string) error {
+func (t *WSSTransport) handleUDPExit(ctx context.Context, session string, c *wscompat.Conn, remoteAddr string) error {
 	conn, err := net.Dial("udp", remoteAddr)
 	if err != nil {
 		log.Printf("[session=%s] dial remote udp %s failed: %v", session, remoteAddr, err)
@@ -2096,9 +2571,9 @@ func (t *WSSTransport) handleUDPExit(ctx context.Context, session string, c *web
 	}
 }
 
-func (t *WSSTransport) relayUDP(ctx context.Context, session string, upstream, downstream *websocket.Conn) {
+func (t *WSSTransport) relayUDP(ctx context.Context, session string, upstream, downstream *wscompat.Conn) {
 	errCh := make(chan error, 2)
-	forward := func(src, dst *websocket.Conn, dir string) {
+	forward := func(src, dst *wscompat.Conn, dir string) {
 		for {
 			env, err := readVerifiedEnvelope(ctx, src, t.AuthKey)
 			if err != nil {
@@ -2138,7 +2613,7 @@ func (t *WSSTransport) relayUDP(ctx context.Context, session string, upstream, d
 	}
 }
 
-func writeSignedEnvelope(ctx context.Context, c *websocket.Conn, env ControlEnvelope, key []byte) error {
+func writeSignedEnvelope(ctx context.Context, c *wscompat.Conn, env ControlEnvelope, key []byte) error {
 	if env.Version == 0 {
 		env.Version = 1
 	}
@@ -2154,10 +2629,10 @@ func writeSignedEnvelope(ctx context.Context, c *websocket.Conn, env ControlEnve
 	if err != nil {
 		return err
 	}
-	return c.Write(ctx, websocket.MessageText, data)
+	return c.Write(ctx, wscompat.MessageText, data)
 }
 
-func readVerifiedEnvelope(ctx context.Context, c *websocket.Conn, key []byte) (ControlEnvelope, error) {
+func readVerifiedEnvelope(ctx context.Context, c *wscompat.Conn, key []byte) (ControlEnvelope, error) {
 	var env ControlEnvelope
 	_, data, err := c.Read(ctx)
 	if err != nil {
@@ -2292,10 +2767,16 @@ func copyWithCompression(dst net.Conn, src net.Conn, compression string, minByte
 
 	if compress {
 		err := compressStream(dst, src, compression, minBytes, counter)
+		if isClosedPipeErr(err) {
+			err = io.EOF
+		}
 		logCopyDone(startMsg, counter, startCount, err)
 		return err
 	}
 	err := decompressStream(dst, src, compression, minBytes, counter)
+	if isClosedPipeErr(err) {
+		err = io.EOF
+	}
 	logCopyDone(startMsg, counter, startCount, err)
 	return err
 }
@@ -2366,6 +2847,9 @@ func compressStream(dst net.Conn, src net.Conn, compression string, minBytes int
 	if cerr := closer.Close(); err == nil {
 		err = cerr
 	}
+	if isClosedPipeErr(err) {
+		return io.EOF
+	}
 	return err
 }
 
@@ -2392,6 +2876,9 @@ func decompressStream(dst net.Conn, src net.Conn, compression string, minBytes i
 	n, errCopy := io.Copy(&countingWriter{Writer: dst, counter: counter}, r)
 	if cerr := closer.Close(); errCopy == nil {
 		errCopy = cerr
+	}
+	if isClosedPipeErr(errCopy) {
+		return io.EOF
 	}
 	if errCopy == io.ErrUnexpectedEOF {
 		// 上游提前关闭视为正常结束，避免噪声
@@ -2471,8 +2958,9 @@ func isConnBroken(err error) bool {
 	if err == nil {
 		return false
 	}
+	// EOF/ErrClosed 多为正常关闭，不视为致命
 	if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
-		return true
+		return false
 	}
 	msg := err.Error()
 	if strings.Contains(msg, "reset by peer") || strings.Contains(msg, "broken pipe") || strings.Contains(msg, "use of closed network connection") {
@@ -2678,8 +3166,16 @@ type Node struct {
 	metricsMu      sync.Mutex
 	routePlans     map[NodeID][]ManualRoute
 	routeMu        sync.RWMutex
+	TLSConfig      *tls.Config
+	ServerName     string
 	tokenOnce      sync.Once
 	tokenValue     string
+	wsMu           sync.Mutex
+	wsConn         *wscompat.Conn
+	maxMuxStreams  int
+	muxMaxAge      time.Duration
+	muxMaxIdle     time.Duration
+	memLimit       string
 }
 
 func (n *Node) Start(ctx context.Context) error {
@@ -2696,6 +3192,7 @@ func (n *Node) Start(ctx context.Context) error {
 	}
 
 	go n.pollMetrics(ctx)
+	go n.controllerWSLoop(ctx)
 	log.Printf("[topology] controller url: %s", n.ControllerURL)
 	if n.ControllerURL != "" {
 		go n.pushAndPullLoop(ctx)
@@ -2951,7 +3448,7 @@ func (n *Node) serveUDP(ctx context.Context, ep EntryPort) {
 				attempts := n.routeAttempts(ep.ExitNode, ep.RemoteAddr)
 				var path []NodeID
 				var sessionID string
-				var wsConn *websocket.Conn
+				var wsConn *wscompat.Conn
 				var err error
 				for try := 0; try < attempts; try++ {
 					path, err = n.pathForAttempt(ep.ExitNode, ep.RemoteAddr, try)
@@ -3020,7 +3517,7 @@ func (n *Node) serveUDP(ctx context.Context, ep EntryPort) {
 }
 
 type udpSession struct {
-	conn       *websocket.Conn
+	conn       *wscompat.Conn
 	cancel     context.CancelFunc
 	clientAddr net.Addr
 	sessionID  string
@@ -3030,7 +3527,7 @@ type udpSession struct {
 func (n *Node) udpDownstreamLoop(ctx context.Context, pc net.PacketConn, sess *udpSession, key []byte, metrics *Metrics, cleanup func()) {
 	defer func() {
 		if sess.conn != nil {
-			sess.conn.Close(websocket.StatusNormalClosure, "udp session closed")
+			sess.conn.Close()
 		}
 		cleanup()
 	}()
@@ -3106,6 +3603,10 @@ type nodeConfig struct {
 	DebugLog        bool               `json:"debug_log"`
 	HTTPProbeURL    string             `json:"http_probe_url"`
 	EncPolicies     []EncryptionPolicy `json:"encryption_policies"`
+	MaxMuxStreams   int                `json:"max_mux_streams"`
+	MuxMaxAge       string             `json:"mux_max_age"`
+	MuxMaxIdle      string             `json:"mux_max_idle"`
+	MemLimit        string             `json:"mem_limit"`
 }
 
 func loadConfig(path string) (nodeConfig, error) {
@@ -3217,6 +3718,60 @@ func parseDurationOrDefault(raw string, def time.Duration) time.Duration {
 		return def
 	}
 	return d
+}
+
+func applyMemLimit(raw string) {
+	// 优先使用配置，其次环境变量，最后默认值
+	limitStr := strings.TrimSpace(raw)
+	if limitStr == "" {
+		if env := os.Getenv("GOMEMLIMIT"); env != "" {
+			limitStr = env
+		} else {
+			limitStr = defaultMemLimit
+		}
+	}
+	if limitStr == "" {
+		return
+	}
+	limitBytes := parseMemSize(limitStr)
+	if limitBytes > 0 {
+		debug.SetMemoryLimit(limitBytes)
+		os.Setenv("GOMEMLIMIT", fmt.Sprintf("%d", limitBytes))
+		log.Printf("[mem] apply mem limit=%s (%d bytes)", limitStr, limitBytes)
+	}
+}
+
+func parseMemSize(s string) int64 {
+	s = strings.TrimSpace(strings.ToLower(s))
+	if s == "" {
+		return 0
+	}
+	mult := int64(1)
+	switch {
+	case strings.HasSuffix(s, "gib"):
+		mult = 1 << 30
+		s = strings.TrimSuffix(s, "gib")
+	case strings.HasSuffix(s, "gb"):
+		mult = 1_000_000_000
+		s = strings.TrimSuffix(s, "gb")
+	case strings.HasSuffix(s, "mib"):
+		mult = 1 << 20
+		s = strings.TrimSuffix(s, "mib")
+	case strings.HasSuffix(s, "mb"):
+		mult = 1_000_000
+		s = strings.TrimSuffix(s, "mb")
+	case strings.HasSuffix(s, "kib"):
+		mult = 1 << 10
+		s = strings.TrimSuffix(s, "kib")
+	case strings.HasSuffix(s, "kb"):
+		mult = 1_000
+		s = strings.TrimSuffix(s, "kb")
+	}
+	val, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
+	if err != nil || val <= 0 {
+		return 0
+	}
+	return val * mult
 }
 
 func buildManualRouteMap(self NodeID, routes []routePlanConfig) map[NodeID][]ManualRoute {
@@ -3365,11 +3920,9 @@ func cloneTLSWithServerName(base *tls.Config, serverName string) *tls.Config {
 		tlsConf = &tls.Config{}
 	}
 	tlsConf.InsecureSkipVerify = true
-	tlsConf.ServerName = ""
-	if strings.TrimSpace(serverName) != "" {
-		tlsConf.ServerName = serverName
-		tlsConf.InsecureSkipVerify = false
-	}
+	tlsConf.ServerName = strings.TrimSpace(serverName)
+	// 强制 HTTP/1.1，避免 ALPN 协商到 h2 导致 WS 握手失败
+	tlsConf.NextProtos = []string{"http/1.1"}
 	return tlsConf
 }
 
@@ -3391,6 +3944,7 @@ func main() {
 		if err != nil {
 			log.Fatalf("load config failed: %v", err)
 		}
+		applyMemLimit(cfg.MemLimit)
 		debugLogEnabled.Store(cfg.DebugLog)
 		// 更新过滤器开关
 		logFilter.debug = &debugLogEnabled
@@ -3450,22 +4004,29 @@ func main() {
 		if mode == "" {
 			mode = "quic"
 		}
-		port := defaultPort(cfg.QUICListen, defaultPort(cfg.WSSListen, defaultPort(cfg.WSListen, "18080")))
+		wsPort := defaultPort(cfg.WSListen, "18080")
+		wssPort := defaultPort(cfg.WSSListen, wsPort)
+		quicPort := defaultPort(cfg.QUICListen, wssPort)
+		port := quicPort
+		if mode == "wss" {
+			port = wssPort
+		} else if mode == "ws" {
+			port = wsPort
+		}
 		for id, addr := range cfg.Peers {
 			raw := strings.TrimSpace(addr)
 			if strings.Contains(raw, "://") {
 				endpoints[NodeID(id)] = normalizePeerEndpoint(raw, mode)
 			} else {
 				host := raw
-				if !strings.Contains(host, ":") {
-					host = net.JoinHostPort(host, port)
-				}
-				if strings.Contains(host, ":") && !strings.Contains(host, "[") {
-					h, p, err := net.SplitHostPort(host)
-					if err == nil {
-						host = net.JoinHostPort(h, p)
+				peerPort := port
+				if strings.Contains(host, ":") {
+					if h, p, err := net.SplitHostPort(host); err == nil {
+						host = h
+						peerPort = p // 显式端口优先
 					}
 				}
+				host = net.JoinHostPort(host, peerPort)
 				endpoints[NodeID(id)] = normalizePeerEndpoint(host, mode)
 			}
 			peerIDs = append(peerIDs, NodeID(id))
@@ -3474,7 +4035,7 @@ func main() {
 		entries := make([]EntryPort, 0, len(cfg.Entries))
 		for _, e := range cfg.Entries {
 			entries = append(entries, EntryPort{
-				ListenAddr: e.Listen,
+				ListenAddr: ensureListenAddr(e.Listen),
 				Proto:      Protocol(e.Proto),
 				ExitNode:   NodeID(e.Exit),
 				RemoteAddr: e.Remote,
@@ -3488,6 +4049,13 @@ func main() {
 			compression = "gzip"
 		}
 		var transport Transport
+		cfg.WSListen = ensureListenAddr(cfg.WSListen)
+		cfg.WSSListen = ensureListenAddr(cfg.WSSListen)
+		cfg.QUICListen = ensureListenAddr(cfg.QUICListen)
+		cfg.MetricsListen = ensureListenAddr(cfg.MetricsListen)
+		muxMaxAge := parseDurationOrDefault(cfg.MuxMaxAge, 0)
+		muxMaxIdle := parseDurationOrDefault(cfg.MuxMaxIdle, 0)
+		maxStreams := cfg.MaxMuxStreams
 		switch mode {
 		case "quic":
 			transport = &QUICTransport{
@@ -3512,11 +4080,15 @@ func main() {
 				KeyFile:       platformPath(defaultIfEmpty(cfg.MTLSKey, "/opt/arouter/certs/arouter.key")),
 				Endpoints:     endpoints,
 				TLSConfig:     tlsConf,
+				ServerName:    cfg.QUICServerName,
 				AuthKey:       authKey,
 				Metrics:       metrics,
 				Compression:   compression,
 				CompressMin:   cfg.CompressionMin,
 				EncPolicies:   cfg.EncPolicies,
+				maxStreams:    maxStreams,
+				maxConnAge:    muxMaxAge,
+				maxIdle:       muxMaxIdle,
 			}
 		default:
 			log.Printf("unknown transport %s, fallback to ws", mode)
@@ -3528,11 +4100,15 @@ func main() {
 				KeyFile:       platformPath(defaultIfEmpty(cfg.MTLSKey, "/opt/arouter/certs/arouter.key")),
 				Endpoints:     endpoints,
 				TLSConfig:     tlsConf,
+				ServerName:    cfg.QUICServerName,
 				AuthKey:       authKey,
 				Metrics:       metrics,
 				Compression:   compression,
 				CompressMin:   cfg.CompressionMin,
 				EncPolicies:   cfg.EncPolicies,
+				maxStreams:    maxStreams,
+				maxConnAge:    muxMaxAge,
+				maxIdle:       muxMaxIdle,
 			}
 		}
 		prober := &WSProber{
@@ -3569,6 +4145,12 @@ func main() {
 			TokenPath:      platformPath(defaultIfEmpty(*tokenPath, "/opt/arouter/.token")),
 			DebugLog:       cfg.DebugLog,
 			EncPolicies:    cfg.EncPolicies,
+			maxMuxStreams:  cfg.MaxMuxStreams,
+			muxMaxAge:      muxMaxAge,
+			muxMaxIdle:     muxMaxIdle,
+			memLimit:       cfg.MemLimit,
+			TLSConfig:      tlsConf,
+			ServerName:     cfg.QUICServerName,
 		}
 
 		ctx, cancel := context.WithCancel(context.Background())

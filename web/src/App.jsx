@@ -465,7 +465,7 @@ function NodeDetail({ node, onBack, refreshList, onShowInstall }) {
   );
 }
 
-function RouteList() {
+function RouteList({ settings }) {
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(false);
   const load = async () => {
@@ -522,8 +522,27 @@ function RouteList() {
       return new Date(pb.updated_at).toLocaleString();
     }},
   ];
+  const triggerAllTests = async () => {
+    const target = settings?.http_probe_url || 'https://www.google.com/generate_204';
+    if (!rows.length) {
+      message.info('暂无线路可测试');
+      return;
+    }
+    try{
+      await Promise.all(rows.map(r=>api('POST', '/api/route-test', {
+        node: r.node,
+        route: r.route,
+        path: r.path,
+        target,
+      })));
+      message.success('已下发全部线路测试指令');
+      setTimeout(load, 1200);
+    }catch(e){
+      message.error(e.message);
+    }
+  };
   return (
-    <Card title="线路列表（含端到端延迟）">
+    <Card title="线路列表（含端到端延迟）" extra={<Button onClick={triggerAllTests}>测试全部</Button>}>
       <Table rowKey="key" dataSource={rows} columns={cols} loading={loading} pagination={false}/>
     </Card>
   );
@@ -760,7 +779,7 @@ export default function App() {
         </Space>
         <SettingsCard/>
         {view === 'routes'
-          ? <RouteList/>
+          ? <RouteList settings={settings}/>
           : view === 'encryption'
             ? <EncryptionCard/>
             : (selected

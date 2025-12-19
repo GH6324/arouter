@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
+bash ./scripts/build_nodes.sh
 VERSION=$(TZ=Asia/Shanghai date +%Y%m%d%H%M)
 IMAGE="24802117/arouter:latest"
 IMAGE2="24802117/arouter:${VERSION}"

@@ -17,5 +17,11 @@ export async function api(method, url, body) {
     throw new Error(text || res.statusText);
   }
   if (res.status === 204) return null;
-  return res.json();
+  const text = await res.text();
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch (_) {
+    return text;
+  }
 }

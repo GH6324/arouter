@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql/driver"
+	"embed"
 	_ "embed"
 	"encoding/base64"
 	"encoding/hex"
@@ -21,6 +22,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -29,6 +31,8 @@ import (
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
+
+	wscompat "arouter/internal/wscompat"
 )
 
 var buildVersion = "dev"
@@ -42,6 +46,9 @@ var defaultKey []byte
 
 //go:embed config_pull.sh.tmpl
 var configPullTemplate string
+
+//go:embed dist/arouter-*
+var embeddedNodeBins embed.FS
 
 type Node struct {
 	ID              uint        `gorm:"primaryKey" json:"id"`
@@ -80,6 +87,10 @@ type Node struct {
 	OSName          string      `json:"os_name"`
 	Arch            string      `json:"arch"`
 	PublicIPs       StringList  `json:"public_ips"`
+	MaxMuxStreams   int         `json:"max_mux_streams"`
+	MuxMaxAge       string      `json:"mux_max_age"`
+	MuxMaxIdle      string      `json:"mux_max_idle"`
+	MemLimit        string      `json:"mem_limit"`
 }
 
 type LinkMetric struct {
@@ -103,6 +114,49 @@ type Entry struct {
 	Proto  string `json:"proto"` // tcp/udp/both
 	Exit   string `json:"exit"`
 	Remote string `json:"remote"`
+}
+
+func stripPortPrefix(s string) string {
+	s = strings.TrimSpace(s)
+	for strings.HasPrefix(s, ":") {
+		s = strings.TrimPrefix(s, ":")
+	}
+	return s
+}
+
+func normalizeNodePorts(n *Node) (changed bool) {
+	norm := func(v string) (string, bool) {
+		nv := stripPortPrefix(v)
+		return nv, nv != v
+	}
+	if nv, diff := norm(n.WSListen); diff {
+		n.WSListen = nv
+		changed = true
+	}
+	if nv, diff := norm(n.WSSListen); diff {
+		n.WSSListen = nv
+		changed = true
+	}
+	if nv, diff := norm(n.MetricsListen); diff {
+		n.MetricsListen = nv
+		changed = true
+	}
+	if nv, diff := norm(n.QUICListen); diff {
+		n.QUICListen = nv
+		changed = true
+	}
+	return
+}
+
+func normalizeEntriesPorts(entries []Entry) (changed bool) {
+	for i := range entries {
+		nv := stripPortPrefix(entries[i].Listen)
+		if nv != entries[i].Listen {
+			entries[i].Listen = nv
+			changed = true
+		}
+	}
+	return
 }
 
 type StringList []string
@@ -349,6 +403,10 @@ type ConfigResponse struct {
 	Arch            string            `json:"arch,omitempty"`
 	HTTPProbeURL    string            `json:"http_probe_url,omitempty"`
 	Encryption      []EncPolicy       `json:"encryption_policies,omitempty"`
+	MaxMuxStreams   int               `json:"max_mux_streams,omitempty"`
+	MuxMaxAge       string            `json:"mux_max_age,omitempty"`
+	MuxMaxIdle      string            `json:"mux_max_idle,omitempty"`
+	MemLimit        string            `json:"mem_limit,omitempty"`
 }
 
 // applyOSOverrides 根据 os hint（例如 darwin）调整默认路径，便于节点在不同平台使用合适的目录。
@@ -408,6 +466,31 @@ type EntryConfig struct {
 	Remote string `json:"remote"`
 }
 
+func normalizeStoredPorts(db *gorm.DB) {
+	var nodes []Node
+	if err := db.Preload("Entries").Find(&nodes).Error; err != nil {
+		log.Printf("normalize ports skipped: %v", err)
+		return
+	}
+	for i := range nodes {
+		nodeChanged := normalizeNodePorts(&nodes[i])
+		entryChanged := normalizeEntriesPorts(nodes[i].Entries)
+		if nodeChanged {
+			db.Model(&nodes[i]).Updates(map[string]interface{}{
+				"ws_listen":      nodes[i].WSListen,
+				"wss_listen":     nodes[i].WSSListen,
+				"metrics_listen": nodes[i].MetricsListen,
+				"quic_listen":    nodes[i].QUICListen,
+			})
+		}
+		if entryChanged {
+			for _, e := range nodes[i].Entries {
+				db.Model(&Entry{}).Where("id = ?", e.ID).Update("listen", e.Listen)
+			}
+		}
+	}
+}
+
 func main() {
 	db := mustOpenDB()
 	maybeCheckpoint(db)
@@ -417,11 +500,13 @@ func main() {
 		log.Fatalf("migrate failed: %v", err)
 	}
 	ensureColumns(db)
+	normalizeStoredPorts(db)
 	ensureGlobalSettings(db)
 	jwtSecret = []byte(envOrDefault("JWT_SECRET", randomKey()))
 	log.Printf("arouter controller version %s", buildVersion)
 
 	r := gin.Default()
+	hub := newWSHub()
 
 	distDir := envOrDefault("WEB_DIST", "web/dist")
 	if info, err := os.Stat(distDir); err == nil && info.IsDir() {
@@ -586,6 +671,21 @@ func main() {
 		var nodes []Node
 		db.Preload("Entries").Preload("Peers").Preload("Routes").Find(&nodes)
 		for i := range nodes {
+			nodeChanged := normalizeNodePorts(&nodes[i])
+			entryChanged := normalizeEntriesPorts(nodes[i].Entries)
+			if nodeChanged {
+				db.Model(&nodes[i]).Updates(map[string]interface{}{
+					"ws_listen":      nodes[i].WSListen,
+					"wss_listen":     nodes[i].WSSListen,
+					"metrics_listen": nodes[i].MetricsListen,
+					"quic_listen":    nodes[i].QUICListen,
+				})
+			}
+			if entryChanged {
+				for _, e := range nodes[i].Entries {
+					db.Model(&Entry{}).Where("id = ?", e.ID).Update("listen", e.Listen)
+				}
+			}
 			ensureNodeToken(db, &nodes[i])
 			if nodes[i].Transport == "" {
 				nodes[i].Transport = settings.Transport
@@ -640,8 +740,13 @@ func main() {
 			c.String(http.StatusBadRequest, "name required")
 			return
 		}
-		req.WSListen = defaultIfEmpty(req.WSListen, ":18080")
-		req.MetricsListen = defaultIfEmpty(req.MetricsListen, ":19090")
+		req.WSListen = stripPortPrefix(defaultIfEmpty(req.WSListen, "18080"))
+		req.WSSListen = stripPortPrefix(req.WSSListen)
+		req.MetricsListen = stripPortPrefix(defaultIfEmpty(req.MetricsListen, "19090"))
+		req.QUICListen = stripPortPrefix(req.QUICListen)
+		if strings.TrimSpace(req.MemLimit) == "" {
+			req.MemLimit = "256MiB"
+		}
 		req.AuthKey = defaultIfEmpty(req.AuthKey, randomKey())
 		req.InsecureSkipTLS = true
 		req.RerouteAttempts = defaultInt(req.RerouteAttempts, 3)
@@ -660,6 +765,19 @@ func main() {
 			c.String(http.StatusNotFound, "not found")
 			return
 		}
+		if normalizeNodePorts(&node) {
+			db.Model(&node).Updates(map[string]interface{}{
+				"ws_listen":      node.WSListen,
+				"wss_listen":     node.WSSListen,
+				"metrics_listen": node.MetricsListen,
+				"quic_listen":    node.QUICListen,
+			})
+		}
+		if normalizeEntriesPorts(node.Entries) {
+			for _, e := range node.Entries {
+				db.Model(&Entry{}).Where("id = ?", e.ID).Update("listen", e.Listen)
+			}
+		}
 		var settings Setting
 		db.First(&settings)
 		if node.Transport == "" {
@@ -670,6 +788,9 @@ func main() {
 		}
 		if node.CompressionMin == 0 && settings.CompressionMin > 0 {
 			node.CompressionMin = settings.CompressionMin
+		}
+		if strings.TrimSpace(node.MemLimit) == "" {
+			node.MemLimit = "256MiB"
 		}
 		c.JSON(http.StatusOK, node)
 	})
@@ -685,16 +806,25 @@ func main() {
 			c.String(http.StatusBadRequest, "bad request: %v", err)
 			return
 		}
+		wsListen := stripPortPrefix(defaultIfEmpty(req.WSListen, node.WSListen))
+		wssListen := stripPortPrefix(defaultIfEmpty(req.WSSListen, node.WSSListen))
+		metricsListen := stripPortPrefix(defaultIfEmpty(req.MetricsListen, node.MetricsListen))
+		quicListen := stripPortPrefix(defaultIfEmpty(req.QUICListen, node.QUICListen))
+		memLimit := defaultIfEmpty(req.MemLimit, node.MemLimit)
 		updates := map[string]interface{}{
-			"ws_listen":        defaultIfEmpty(req.WSListen, node.WSListen),
-			"wss_listen":       defaultIfEmpty(req.WSSListen, node.WSSListen),
-			"metrics_listen":   defaultIfEmpty(req.MetricsListen, node.MetricsListen),
+			"ws_listen":        wsListen,
+			"wss_listen":       wssListen,
+			"metrics_listen":   metricsListen,
 			"poll_period":      defaultIfEmpty(req.PollPeriod, node.PollPeriod),
 			"compression":      defaultIfEmpty(req.Compression, node.Compression),
 			"compression_min":  req.CompressionMin,
 			"transport":        defaultIfEmpty(req.Transport, node.Transport),
-			"quic_listen":      defaultIfEmpty(req.QUICListen, node.QUICListen),
+			"quic_listen":      quicListen,
 			"quic_server_name": defaultIfEmpty(req.QUICServerName, node.QUICServerName),
+			"max_mux_streams":  req.MaxMuxStreams,
+			"mux_max_age":      defaultIfEmpty(req.MuxMaxAge, node.MuxMaxAge),
+			"mux_max_idle":     defaultIfEmpty(req.MuxMaxIdle, node.MuxMaxIdle),
+			"mem_limit":        memLimit,
 		}
 		if err := db.Model(&node).Updates(updates).Error; err != nil {
 			c.String(http.StatusBadRequest, "update failed: %v", err)
@@ -723,6 +853,7 @@ func main() {
 			c.String(http.StatusBadRequest, "bad request: %v", err)
 			return
 		}
+		req.Listen = stripPortPrefix(req.Listen)
 		req.NodeID = node.ID
 		req.Proto = defaultIfEmpty(req.Proto, "tcp")
 		if err := db.Create(&req).Error; err != nil {
@@ -937,29 +1068,7 @@ func main() {
 			c.String(http.StatusBadRequest, "bad request: %v", err)
 			return
 		}
-		for to, m := range payload.Metrics {
-			db.Model(&LinkMetric{}).Where("from_node = ? AND to_node = ?", payload.From, to).
-				Assign(map[string]any{"rtt_ms": m.RTTms, "loss": m.Loss, "updated_at": time.Now()}).
-				FirstOrCreate(&LinkMetric{
-					From: payload.From, To: to, RTTMs: m.RTTms, Loss: m.Loss, UpdatedAt: time.Now(),
-				})
-		}
-		// 更新节点自身状态
-		db.Model(&Node{}).Where("id = ?", node.ID).Updates(map[string]any{
-			"last_cpu":      payload.Status.CPUUsage,
-			"mem_used":      payload.Status.MemUsed,
-			"mem_total":     payload.Status.MemTotal,
-			"uptime_sec":    payload.Status.UptimeSec,
-			"net_in_bytes":  payload.Status.NetInBytes,
-			"net_out_bytes": payload.Status.NetOutBytes,
-			"node_version":  payload.Status.Version,
-			"last_seen_at":  time.Now(),
-			"transport":     firstNonEmpty(payload.Status.Transport, node.Transport),
-			"compression":   firstNonEmpty(payload.Status.Compression, node.Compression),
-			"os_name":       payload.Status.OS,
-			"arch":          payload.Status.Arch,
-			"public_ips":    StringList(payload.Status.PublicIPs),
-		})
+		applyMetricsPayload(db, node, payload)
 		c.Status(http.StatusNoContent)
 	})
 
@@ -1003,6 +1112,156 @@ func main() {
 		c.Status(http.StatusNoContent)
 	})
 
+	// 线路测试触发：指定节点、目标（对端名称或 host），推送到节点 WS。
+	authGroup.POST("/probe/request", func(c *gin.Context) {
+		var req struct {
+			Node   string `json:"node"`   // 节点名称
+			Target string `json:"target"` // 目标节点/host
+		}
+		if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.Node) == "" || strings.TrimSpace(req.Target) == "" {
+			c.String(http.StatusBadRequest, "node and target required")
+			return
+		}
+		if err := hub.sendCommand(req.Node, map[string]any{
+			"type": "probe",
+			"data": map[string]any{"target": req.Target},
+		}); err != nil {
+			c.String(http.StatusServiceUnavailable, "node offline or send failed: %v", err)
+			return
+		}
+		c.Status(http.StatusAccepted)
+	})
+
+	// 线路端到端延迟测试：指定节点 + 路径，控制器经 WS 下发，节点执行 HTTP 探测并回报。
+	authGroup.POST("/route-test", func(c *gin.Context) {
+		var req struct {
+			Node   string   `json:"node"`
+			Route  string   `json:"route"`
+			Path   []string `json:"path"`
+			Target string   `json:"target"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.Node) == "" || len(req.Path) == 0 {
+			c.String(http.StatusBadRequest, "node, path required")
+			return
+		}
+		if err := hub.sendCommand(req.Node, map[string]any{
+			"type": "route_test",
+			"data": map[string]any{
+				"route":  req.Route,
+				"path":   req.Path,
+				"target": req.Target,
+			},
+		}); err != nil {
+			c.String(http.StatusServiceUnavailable, "node offline or send failed: %v", err)
+			return
+		}
+		c.Status(http.StatusAccepted)
+	})
+
+	// WebSocket 通道：节点推送 metrics，后续可扩展控制器下发实时指令。
+	api.GET("/ws", func(c *gin.Context) {
+		nodeToken := getBearerToken(c)
+		node, err := findNodeByToken(db, nodeToken)
+		if err != nil {
+			c.AbortWithStatus(http.StatusUnauthorized)
+			return
+		}
+		ws, err := wscompat.Accept(c.Writer, c.Request, &wscompat.AcceptOptions{})
+		if err != nil {
+			return
+		}
+		hub.register(node.Name, ws)
+		ctx := c.Request.Context()
+		// 控制器也定期发 ping，避免中间设备超时关闭
+		done := make(chan struct{})
+		go func() {
+			t := time.NewTicker(20 * time.Second)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-done:
+					return
+				case <-t.C:
+					_ = ws.Ping(context.Background())
+				}
+			}
+		}()
+		for {
+			_, data, err := ws.Read(ctx)
+			if err != nil {
+				ws.Close()
+				hub.unregister(node.Name, ws)
+				close(done)
+				return
+			}
+			var msg struct {
+				Type string          `json:"type"`
+				Data json.RawMessage `json:"data"`
+			}
+			if err := json.Unmarshal(data, &msg); err != nil {
+				continue
+			}
+			switch msg.Type {
+			case "metrics":
+				var payload struct {
+					From    string                     `json:"from"`
+					Metrics map[string]LinkMetricsJSON `json:"metrics"`
+					Status  struct {
+						CPUUsage    float64  `json:"cpu_usage"`
+						MemUsed     uint64   `json:"mem_used_bytes"`
+						MemTotal    uint64   `json:"mem_total_bytes"`
+						UptimeSec   uint64   `json:"uptime_sec"`
+						NetInBytes  uint64   `json:"net_in_bytes"`
+						NetOutBytes uint64   `json:"net_out_bytes"`
+						Version     string   `json:"version"`
+						Transport   string   `json:"transport"`
+						Compression string   `json:"compression"`
+						OS          string   `json:"os"`
+						Arch        string   `json:"arch"`
+						PublicIPs   []string `json:"public_ips"`
+					} `json:"status"`
+				}
+				if err := json.Unmarshal(msg.Data, &payload); err != nil {
+					continue
+				}
+				if payload.From == "" {
+					payload.From = node.Name
+				}
+				applyMetricsPayload(db, node, payload)
+			case "route_test_result":
+				var res struct {
+					Route   string   `json:"route"`
+					Path    []string `json:"path"`
+					Target  string   `json:"target"`
+					RTTMs   int64    `json:"rtt_ms"`
+					Success bool     `json:"success"`
+					Error   string   `json:"error"`
+				}
+				if err := json.Unmarshal(msg.Data, &res); err != nil {
+					continue
+				}
+				if strings.TrimSpace(res.Route) == "" || len(res.Path) == 0 {
+					continue
+				}
+				probe := RouteProbe{
+					Node:    node.Name,
+					Route:   res.Route,
+					Path:    StringList(res.Path),
+					RTTMs:   res.RTTMs,
+					Success: res.Success,
+					Error:   res.Error,
+				}
+				db.Clauses(clause.OnConflict{
+					Columns:   []clause.Column{{Name: "node"}, {Name: "route"}},
+					DoUpdates: clause.Assignments(map[string]interface{}{"path": probe.Path, "rtt_ms": probe.RTTMs, "success": probe.Success, "error": probe.Error, "updated_at": time.Now()}),
+				}).Create(&probe)
+			default:
+			}
+		}
+	})
+
 	authGroup.GET("/probes", func(c *gin.Context) {
 		var probes []RouteProbe
 		db.Order("updated_at desc").Find(&probes)
@@ -1025,6 +1284,26 @@ func main() {
 			edges[r.From][r.To] = LinkMetricsJSON{RTTms: r.RTTMs, Loss: r.Loss, UpdatedAt: r.UpdatedAt}
 		}
 		c.JSON(http.StatusOK, gin.H{"edges": edges})
+	})
+
+	// 提供嵌入的节点二进制下载，按 os/arch 返回对应文件。
+	r.GET("/downloads/arouter", func(c *gin.Context) {
+		osName := strings.ToLower(c.Query("os"))
+		if osName == "" {
+			osName = "linux"
+		}
+		arch := strings.ToLower(c.Query("arch"))
+		if arch == "" {
+			arch = "amd64"
+		}
+		filename := fmt.Sprintf("dist/arouter-%s-%s", osName, arch)
+		data, err := embeddedNodeBins.ReadFile(filename)
+		if err != nil {
+			c.String(http.StatusNotFound, "binary not found for %s/%s", osName, arch)
+			return
+		}
+		c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename="arouter-%s-%s"`, osName, arch))
+		c.Data(http.StatusOK, "application/octet-stream", data)
 	})
 
 	// 返回填充好的 config_pull.sh
@@ -1173,7 +1452,7 @@ func main() {
 		c.Header("Content-Type", "text/x-shellscript")
 		c.Header("Content-Disposition", "attachment; filename=\"install.sh\"")
 		syncInt := syncIntervalFromConfig(data)
-		c.String(http.StatusOK, installScript(string(data), configURL, configPullBase, syncInt))
+		c.String(http.StatusOK, installScript(string(data), configURL, configPullBase, base, syncInt))
 	})
 
 	// 全局系统设置（传输/压缩）读写接口
@@ -1240,11 +1519,12 @@ func main() {
 func buildConfig(node Node, allNodes []Node, globalKey string, controllerBase string, settings Setting) ConfigResponse {
 	wsMap := make(map[string]string, len(allNodes))
 	for _, n := range allNodes {
+		normalizeNodePorts(&n)
 		// 若全局传输为 wss，则优先使用节点的 wss 监听端口
 		if strings.EqualFold(settings.Transport, "wss") && strings.TrimSpace(n.WSSListen) != "" {
 			wsMap[n.Name] = n.WSSListen
 		} else {
-			wsMap[n.Name] = defaultIfEmpty(n.WSListen, ":18080")
+			wsMap[n.Name] = defaultIfEmpty(n.WSListen, "18080")
 		}
 	}
 	peers := make(map[string]string, len(node.Peers))
@@ -1252,7 +1532,7 @@ func buildConfig(node Node, allNodes []Node, globalKey string, controllerBase st
 		if p.PeerName != "" {
 			ws := wsMap[p.PeerName]
 			if ws == "" {
-				ws = ":18080"
+				ws = "18080"
 			}
 			host := p.EntryIP
 			if host == "" {
@@ -1280,6 +1560,7 @@ func buildConfig(node Node, allNodes []Node, globalKey string, controllerBase st
 	}
 	entries := make([]EntryConfig, 0, len(node.Entries))
 	for _, e := range node.Entries {
+		e.Listen = stripPortPrefix(e.Listen)
 		entries = append(entries, EntryConfig{
 			Listen: e.Listen,
 			Proto:  defaultIfEmpty(e.Proto, "tcp"),
@@ -1303,18 +1584,22 @@ func buildConfig(node Node, allNodes []Node, globalKey string, controllerBase st
 		}
 		return routes[i].Priority < routes[j].Priority
 	})
+	memLimit := node.MemLimit
+	if strings.TrimSpace(memLimit) == "" {
+		memLimit = "256MiB"
+	}
 	return ConfigResponse{
 		ID:              node.Name,
-		WSListen:        defaultIfEmpty(node.WSListen, ":18080"),
-		WSSListen:       node.WSSListen,
-		QUICListen:      defaultIfEmpty(node.QUICListen, node.WSListen),
+		WSListen:        defaultIfEmpty(stripPortPrefix(node.WSListen), "18080"),
+		WSSListen:       stripPortPrefix(node.WSSListen),
+		QUICListen:      defaultIfEmpty(stripPortPrefix(node.QUICListen), stripPortPrefix(node.WSListen)),
 		QUICServerName:  defaultIfEmpty(node.QUICServerName, "arouter.529851.xyz"),
 		Peers:           peers,
 		Entries:         entries,
 		PollPeriod:      defaultIfEmpty(node.PollPeriod, "5s"),
 		InsecureSkipTLS: true,
 		AuthKey:         firstNonEmpty(globalKey, node.AuthKey, randomKey()),
-		MetricsListen:   defaultIfEmpty(node.MetricsListen, ":19090"),
+		MetricsListen:   defaultIfEmpty(stripPortPrefix(node.MetricsListen), "19090"),
 		RerouteAttempts: defaultInt(node.RerouteAttempts, 3),
 		UDPSessionTTL:   defaultIfEmpty(node.UDPSessionTTL, "60s"),
 		MTLSCert:        defaultIfEmpty(node.MTLSCert, "/opt/arouter/certs/arouter.crt"),
@@ -1331,6 +1616,10 @@ func buildConfig(node Node, allNodes []Node, globalKey string, controllerBase st
 		Arch:            node.Arch,
 		HTTPProbeURL:    settings.HTTPProbeURL,
 		Encryption:      settings.EncryptionPolicies,
+		MaxMuxStreams:   node.MaxMuxStreams,
+		MuxMaxAge:       node.MuxMaxAge,
+		MuxMaxIdle:      node.MuxMaxIdle,
+		MemLimit:        memLimit,
 	}
 }
 
@@ -1418,7 +1707,7 @@ func fetchIP(ctx context.Context, client *http.Client, url string) string {
 	return string(b)
 }
 
-func installScript(configJSON string, configURL string, configPullBase string, syncInterval string) string {
+func installScript(configJSON string, configURL string, configPullBase string, binBase string, syncInterval string) string {
 	script := `#!/usr/bin/env bash
 set -euo pipefail
 
@@ -1538,47 +1827,14 @@ sync_interval() {
   echo "$val"
 }
 
-detect_latest() {
-  # Try GitHub API with optional token to avoid rate limit
-  if [ -n "${GITHUB_TOKEN:-}" ]; then
-    echo "DEBUG: querying latest with token via ${PROXY_PREFIX}https://api.github.com/repos/${GITHUB_REPO}/releases/latest" >&2
-    curl -fsSL --connect-timeout 10 --max-time 30 -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-      "${PROXY_PREFIX}https://api.github.com/repos/${GITHUB_REPO}/releases/latest" \
-      | grep -Eo '"tag_name":\s*"[^"]+"' | head -n1 | sed 's/.*"\(.*\)"/\1/' || true
-  else
-    echo "DEBUG: querying latest without token via ${PROXY_PREFIX}https://api.github.com/repos/${GITHUB_REPO}/releases/latest" >&2
-    curl -fsSL --connect-timeout 10 --max-time 30 "${PROXY_PREFIX}https://api.github.com/repos/${GITHUB_REPO}/releases/latest" \
-      | grep -Eo '"tag_name":\s*"[^"]+"' | head -n1 | sed 's/.*"\(.*\)"/\1/' || true
-  fi
-}
-
-if [ -z "${AROUTER_VERSION:-}" ]; then
-	echo "==> Detecting latest release..."
-	AROUTER_VERSION=$(detect_latest)
-  # Fallback: follow redirect from releases/latest
-  if [ -z "${AROUTER_VERSION:-}" ]; then
-    echo "DEBUG: fallback via redirect ${PROXY_PREFIX}https://github.com/${GITHUB_REPO}/releases/latest" >&2
-    AROUTER_VERSION=$(curl -I -L -s "${PROXY_PREFIX}https://github.com/${GITHUB_REPO}/releases/latest" \
-      | tr -d '\r' | awk -F/ '/^location: /{print $NF; exit}')
-  fi
-fi
-
-if [ -z "${AROUTER_VERSION:-}" ]; then
-	echo "Failed to detect latest release. Set AROUTER_VERSION=vX.Y.Z and rerun."
-	echo "PROXY_PREFIX=${PROXY_PREFIX}"
-	exit 1
-else
-	echo "==> Using release ${AROUTER_VERSION}"
-fi
-
-BIN_URL="https://github.com/${GITHUB_REPO}/releases/download/${AROUTER_VERSION}/arouter-${OS}-${ARCH}"
+BIN_URL="__BIN_BASE__/downloads/arouter?os=${OS}&arch=${ARCH}"
 echo "==> Downloading binary ${BIN_URL}"
 TMP_BIN=$(mktemp)
-echo "DEBUG: downloading via ${PROXY_PREFIX}${BIN_URL}" >&2
-if ! curl -fsSL -fL --connect-timeout 10 --max-time 60 "${PROXY_PREFIX}${BIN_URL}" -o "$TMP_BIN"; then
+echo "DEBUG: downloading ${BIN_URL}" >&2
+if ! curl -fsSL -fL --connect-timeout 10 --max-time 60 "${BIN_URL}" -o "$TMP_BIN"; then
   status=$?
-  echo "Download failed. Check version/arch or set AROUTER_VERSION manually."
-  echo "DEBUG: curl exit code ${status} | PROXY_PREFIX=${PROXY_PREFIX}"
+  echo "Download failed. Check controller /downloads endpoint or os/arch params."
+  echo "DEBUG: curl exit code ${status}"
   exit 1
 fi
 chmod +x "$TMP_BIN"
@@ -1727,6 +1983,7 @@ fi
 	script = strings.ReplaceAll(script, "__CONFIG__", configJSON)
 	script = strings.ReplaceAll(script, "__CONFIG_URL__", configURL)
 	script = strings.ReplaceAll(script, "__CONFIG_PULL_BASE__", configPullBase)
+	script = strings.ReplaceAll(script, "__BIN_BASE__", binBase)
 	script = strings.ReplaceAll(script, "__SYNC_INTERVAL__", syncInterval)
 	// choose installDir placeholder; script自身根据 OS 继续覆写为 /opt/arouter 或 $HOME/.arouter
 	script = strings.ReplaceAll(script, "__INSTALL_DIR__", "/opt/arouter")
@@ -1974,6 +2231,48 @@ func getBearerToken(c *gin.Context) string {
 	return ""
 }
 
+func applyMetricsPayload(db *gorm.DB, node *Node, payload struct {
+	From    string                     `json:"from"`
+	Metrics map[string]LinkMetricsJSON `json:"metrics"`
+	Status  struct {
+		CPUUsage    float64  `json:"cpu_usage"`
+		MemUsed     uint64   `json:"mem_used_bytes"`
+		MemTotal    uint64   `json:"mem_total_bytes"`
+		UptimeSec   uint64   `json:"uptime_sec"`
+		NetInBytes  uint64   `json:"net_in_bytes"`
+		NetOutBytes uint64   `json:"net_out_bytes"`
+		Version     string   `json:"version"`
+		Transport   string   `json:"transport"`
+		Compression string   `json:"compression"`
+		OS          string   `json:"os"`
+		Arch        string   `json:"arch"`
+		PublicIPs   []string `json:"public_ips"`
+	} `json:"status"`
+}) {
+	for to, m := range payload.Metrics {
+		db.Model(&LinkMetric{}).Where("from_node = ? AND to_node = ?", payload.From, to).
+			Assign(map[string]any{"rtt_ms": m.RTTms, "loss": m.Loss, "updated_at": time.Now()}).
+			FirstOrCreate(&LinkMetric{
+				From: payload.From, To: to, RTTMs: m.RTTms, Loss: m.Loss, UpdatedAt: time.Now(),
+			})
+	}
+	db.Model(&Node{}).Where("id = ?", node.ID).Updates(map[string]any{
+		"last_cpu":      payload.Status.CPUUsage,
+		"mem_used":      payload.Status.MemUsed,
+		"mem_total":     payload.Status.MemTotal,
+		"uptime_sec":    payload.Status.UptimeSec,
+		"net_in_bytes":  payload.Status.NetInBytes,
+		"net_out_bytes": payload.Status.NetOutBytes,
+		"node_version":  payload.Status.Version,
+		"last_seen_at":  time.Now(),
+		"transport":     firstNonEmpty(payload.Status.Transport, node.Transport),
+		"compression":   firstNonEmpty(payload.Status.Compression, node.Compression),
+		"os_name":       payload.Status.OS,
+		"arch":          payload.Status.Arch,
+		"public_ips":    StringList(payload.Status.PublicIPs),
+	})
+}
+
 func findNodeByToken(db *gorm.DB, token string) (*Node, error) {
 	if token == "" {
 		return nil, fmt.Errorf("empty token")
@@ -1983,6 +2282,52 @@ func findNodeByToken(db *gorm.DB, token string) (*Node, error) {
 		return nil, err
 	}
 	return &n, nil
+}
+
+// wsHub 维护节点 WS 连接，供控制器主动下发指令。
+type wsHub struct {
+	mu    sync.Mutex
+	conns map[string]*wscompat.Conn
+}
+
+func newWSHub() *wsHub {
+	return &wsHub{conns: make(map[string]*wscompat.Conn)}
+}
+
+func (h *wsHub) register(node string, c *wscompat.Conn) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if old, ok := h.conns[node]; ok && old != c {
+		old.Close()
+	}
+	h.conns[node] = c
+}
+
+func (h *wsHub) unregister(node string, c *wscompat.Conn) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if cur, ok := h.conns[node]; ok && cur == c {
+		delete(h.conns, node)
+	}
+}
+
+func (h *wsHub) sendCommand(node string, cmd interface{}) error {
+	h.mu.Lock()
+	c := h.conns[node]
+	h.mu.Unlock()
+	if c == nil {
+		return fmt.Errorf("node %s offline", node)
+	}
+	data, err := json.Marshal(cmd)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := c.Write(ctx, wscompat.MessageText, data); err != nil {
+		return err
+	}
+	return nil
 }
 
 // ensureColumns 兜底补齐旧库缺失的字段，避免“no such column”。
@@ -1998,6 +2343,10 @@ func ensureColumns(db *gorm.DB) {
 		{&Node{}, "transport", "nodes", "TEXT"},
 		{&Node{}, "compression", "nodes", "TEXT"},
 		{&Node{}, "compression_min", "nodes", "INTEGER"},
+		{&Node{}, "max_mux_streams", "nodes", "INTEGER"},
+		{&Node{}, "mux_max_age", "nodes", "TEXT"},
+		{&Node{}, "mux_max_idle", "nodes", "TEXT"},
+		{&Node{}, "mem_limit", "nodes", "TEXT"},
 		{&Node{}, "quic_server_name", "nodes", "TEXT"},
 		{&Node{}, "udp_session_ttl", "nodes", "TEXT"},
 		{&Node{}, "controller_url", "nodes", "TEXT"},

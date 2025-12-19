@@ -8,7 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"nhooyr.io/websocket"
+	"arouter/internal/wscompat"
 )
 
 // 协议多路复用帧格式：
@@ -30,18 +30,18 @@ type muxFrame struct {
 }
 
 type MuxConn struct {
-	ws     *websocket.Conn
+	ws     *wscompat.Conn
 	closed atomic.Bool
 	wmu    sync.Mutex
 }
 
-func NewMuxConn(ws *websocket.Conn) *MuxConn {
+func NewMuxConn(ws *wscompat.Conn) *MuxConn {
 	return &MuxConn{ws: ws}
 }
 
 func (m *MuxConn) Close() {
 	if m.closed.CompareAndSwap(false, true) {
-		m.ws.Close(websocket.StatusNormalClosure, "mux closed")
+		m.ws.Close()
 	}
 }
 
@@ -59,7 +59,7 @@ func (m *MuxConn) WriteFrame(ctx context.Context, f muxFrame) error {
 	binary.BigEndian.PutUint32(header[6:], uint32(len(f.payload)))
 	m.wmu.Lock()
 	defer m.wmu.Unlock()
-	return m.ws.Write(ctx, websocket.MessageBinary, append(header, f.payload...))
+	return m.ws.Write(ctx, wscompat.MessageBinary, append(header, f.payload...))
 }
 
 func (m *MuxConn) ReadFrame(ctx context.Context) (muxFrame, error) {
@@ -70,8 +70,8 @@ func (m *MuxConn) ReadFrame(ctx context.Context) (muxFrame, error) {
 	if err != nil {
 		return muxFrame{}, err
 	}
-	if typ != websocket.MessageBinary {
-		_ = m.ws.Close(websocket.StatusUnsupportedData, "binary only")
+	if typ != wscompat.MessageBinary {
+		_ = m.ws.Close()
 		return muxFrame{}, fmt.Errorf("unexpected ws message type %v", typ)
 	}
 	if len(data) < 10 {

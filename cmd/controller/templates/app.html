@@ -34,6 +34,8 @@ async function api(method, url, body) {
 function NodeList({ onSelect }) {
   const [data, setData] = useState([]);
   const [loading, setLoading] = useState(false);
+  const [probes, setProbes] = useState([]);
+  const [probeLoading, setProbeLoading] = useState(false);
   const [modalOpen, setModalOpen] = useState(false);
   const [form] = Form.useForm();
 
@@ -45,7 +47,16 @@ function NodeList({ onSelect }) {
     } catch (e) { message.error(e.message); }
     setLoading(false);
   };
+  const loadProbes = async () => {
+    setProbeLoading(true);
+    try {
+      const res = await api('GET', '/api/probes');
+      setProbes(res);
+    } catch (e) { message.error(e.message); }
+    setProbeLoading(false);
+  };
   useEffect(() => { load(); }, []);
+  useEffect(() => { loadProbes(); }, []);
 
   const columns = [
     { title: '名称', dataIndex: 'name' },
@@ -71,22 +82,56 @@ function NodeList({ onSelect }) {
       setModalOpen(false);
       form.resetFields();
       load();
+      loadProbes();
     } catch (e) { message.error(e.message); }
   };
 
+  const runProbe = async (row) => {
+    const path = row.path || [];
+    const target = path.length ? path[path.length-1] : row.route;
+    try {
+      await api('POST', '/api/probe/request', { node: row.node, target });
+      message.success('已发送测试指令');
+      setTimeout(loadProbes, 2000);
+    } catch (e) { message.error(e.message); }
+  };
+
+  const probeColumns = [
+    { title: '节点', dataIndex: 'node' },
+    { title: '线路', dataIndex: 'route' },
+    { title: '路径', dataIndex: 'path', render: p => (p||[]).join(' -> ') },
+    { title: '延迟(ms)', dataIndex: 'rtt_ms' },
+    { title: '状态', dataIndex: 'success', render: v => v ? <Tag color="green">成功</Tag> : <Tag color="red">失败</Tag> },
+    { title: '更新时间', dataIndex: 'updated_at' },
+    { title: '操作', render: (_, row) => <Button size="small" onClick={()=>runProbe(row)}>测试</Button> },
+  ];
+
   return (
-    <Card
-      title="节点"
-      extra={<Button type="primary" onClick={() => setModalOpen(true)}>新建节点</Button>}
-    >
-      <Table rowKey="id" dataSource={data} columns={columns} loading={loading} pagination={false}/>
-      <Modal open={modalOpen} onCancel={() => setModalOpen(false)} onOk={onCreate} title="新建节点">
-        <Form layout="vertical" form={form} initialValues={{ ws_listen: ":18080", metrics_listen: ":19090" }}>
+    <Space direction="vertical" style={{width:"100%"}}>
+      <Card
+        title="节点"
+        extra={<Button type="primary" onClick={() => setModalOpen(true)}>新建节点</Button>}
+      >
+        <Table rowKey="id" dataSource={data} columns={columns} loading={loading} pagination={false}/>
+        <Modal open={modalOpen} onCancel={() => setModalOpen(false)} onOk={onCreate} title="新建节点">
+        <Form layout="vertical" form={form} initialValues={{ ws_listen: "18080", metrics_listen: "19090" }}>
           <Form.Item name="name" label="节点名称" rules={[{ required: true }]}><Input/></Form.Item>
           <Form.Item name="ws_listen" label="WS监听"/><Form.Item name="metrics_listen" label="Metrics监听"/>
+          <Form.Item name="mem_limit" label="内存上限" tooltip="如 256MiB，可选"><Input placeholder="256MiB"/></Form.Item>
+          <Form.Item name="max_mux_streams" label="Max mux streams" tooltip="单连接并发流数，建议1-2"><Input placeholder="2"/></Form.Item>
+          <Form.Item name="mux_max_age" label="Mux最⼤存活" tooltip="如 5m，可选"><Input placeholder="5m"/></Form.Item>
+          <Form.Item name="mux_max_idle" label="Mux空闲超时" tooltip="如 1m，可选"><Input placeholder="1m"/></Form.Item>
         </Form>
       </Modal>
-    </Card>
+      </Card>
+
+      <Card title="线路延迟">
+        <Space style={{marginBottom:8}}>
+          <Button onClick={loadProbes} loading={probeLoading}>刷新</Button>
+        </Space>
+        <Table rowKey="id" dataSource={probes} columns={probeColumns} loading={probeLoading} pagination={false}/>
+      </Card>
+    </Space>
   );
 }
 
@@ -175,7 +220,7 @@ function NodeDetail({ node, onBack, refreshList }) {
 
       <Modal open={entryOpen} onCancel={()=>setEntryOpen(false)} onOk={addEntry} title="添加入口">
         <Form layout="vertical" form={entryForm} initialValues={{ proto:"tcp" }}>
-          <Form.Item name="listen" label="监听" rules={[{required:true}]}><Input placeholder=":10080"/></Form.Item>
+          <Form.Item name="listen" label="监听" rules={[{required:true}]}><Input placeholder="10080"/></Form.Item>
           <Form.Item name="proto" label="协议"><Input/></Form.Item>
           <Form.Item name="exit" label="出口节点" rules={[{required:true}]}><Input placeholder="node-b"/></Form.Item>
           <Form.Item name="remote" label="远端" rules={[{required:true}]}><Input placeholder="1.1.1.1:3389"/></Form.Item>
