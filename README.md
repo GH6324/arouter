@@ -94,6 +94,17 @@ services:
   2. 保存后控制器会自动校验/生成合规密钥并下发；节点拉取配置后按“当前时间秒 % 策略数”选用一条，入口加密、出口按 `enc_id` 解密，中间节点仅透传。
   3. 如果留空或长度不符，控制器会自动生成随机密钥，无需手填。
 
+## 单机二进制安装（控制器）
+无需 Docker，直接从 GitHub Releases 安装最新 controller：
+```bash
+sudo PORT=8080 bash scripts/install_controller.sh
+```
+- 依赖：`curl`、`uname`、`tar`、`systemd` 环境。
+- 自动检测 OS/架构，下载最新发布的 `arouter-controller-<os>-<arch>`，并尝试下载前端 `web-dist.tar.gz` 解压到 `/opt/arouter/controller/web/dist`（同时设置 `WEB_DIST` 环境变量）。
+- 安装路径：`/opt/arouter/controller`，DB 默认 `/opt/arouter/controller/data/arouter.db`。
+- 生成并启动 systemd 服务，默认监听 `8080`（可用环境变量 `PORT` 指定）。
+- 终端会打印可访问的 `http://<ip>:PORT` 地址，首次访问需在前端页面完成用户注册/登录。
+
 ## 运行状态与系统信息
 节点周期上报：CPU、内存、网络流量、运行时长、版本、OS/架构、链路 RTT/丢包；控制台卡片显示最新状态。
 

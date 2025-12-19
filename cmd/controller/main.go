@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"net"
 	"net/http"
@@ -49,6 +50,9 @@ var configPullTemplate string
 
 //go:embed dist/arouter-*
 var embeddedNodeBins embed.FS
+
+//go:embed web/dist
+var embeddedWeb embed.FS
 
 type Node struct {
 	ID              uint        `gorm:"primaryKey" json:"id"`
@@ -508,31 +512,80 @@ func main() {
 	r := gin.Default()
 	hub := newWSHub()
 
-	distDir := envOrDefault("WEB_DIST", "web/dist")
+	distDir := envOrDefault("WEB_DIST", "cmd/controller/web/dist")
 	if info, err := os.Stat(distDir); err == nil && info.IsDir() {
-		log.Printf("serving static front-end from %s", distDir)
-		assetsDir := filepath.Join(distDir, "assets")
-		if _, err := os.Stat(assetsDir); err == nil {
-			r.Static("/assets", assetsDir)
+		indexFile := filepath.Join(distDir, "index.html")
+		if _, err := os.Stat(indexFile); err == nil {
+			log.Printf("serving static front-end from %s", distDir)
+			assetsDir := filepath.Join(distDir, "assets")
+			if _, err := os.Stat(assetsDir); err == nil {
+				r.Static("/assets", assetsDir)
+			}
+			r.StaticFile("/favicon.ico", filepath.Join(distDir, "favicon.ico"))
+			r.GET("/", func(c *gin.Context) {
+				c.File(indexFile)
+			})
+			r.NoRoute(func(c *gin.Context) {
+				if strings.HasPrefix(c.Request.URL.Path, "/api/") {
+					c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+					return
+				}
+				// try to serve existing file
+				path := filepath.Clean(c.Request.URL.Path)
+				fpath := filepath.Join(distDir, path)
+				if info, err := os.Stat(fpath); err == nil && !info.IsDir() {
+					c.File(fpath)
+					return
+				}
+				// fallback to SPA entry
+				c.File(indexFile)
+			})
+		} else {
+			log.Printf("WEB_DIST=%s exists but missing index.html, fallback to embedded assets", distDir)
+			if sub, err := fs.Sub(embeddedWeb, "web/dist"); err == nil {
+				efs := http.FS(sub)
+				r.GET("/", func(c *gin.Context) {
+					c.FileFromFS("index.html", efs)
+				})
+				r.NoRoute(func(c *gin.Context) {
+					if strings.HasPrefix(c.Request.URL.Path, "/api/") {
+						c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+						return
+					}
+					path := strings.TrimPrefix(filepath.Clean(c.Request.URL.Path), "/")
+					if path == "" {
+						path = "index.html"
+					}
+					if _, err := sub.Open(path); err == nil {
+						c.FileFromFS(path, efs)
+						return
+					}
+					c.FileFromFS("index.html", efs)
+				})
+			}
 		}
-		r.StaticFile("/favicon.ico", filepath.Join(distDir, "favicon.ico"))
+	} else if sub, err := fs.Sub(embeddedWeb, "web/dist"); err == nil {
+		log.Printf("serving embedded static front-end")
+		efs := http.FS(sub)
 		r.GET("/", func(c *gin.Context) {
-			c.File(filepath.Join(distDir, "index.html"))
+			c.FileFromFS("index.html", efs)
 		})
 		r.NoRoute(func(c *gin.Context) {
 			if strings.HasPrefix(c.Request.URL.Path, "/api/") {
 				c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
 				return
 			}
-			// try to serve existing file
-			path := filepath.Clean(c.Request.URL.Path)
-			fpath := filepath.Join(distDir, path)
-			if info, err := os.Stat(fpath); err == nil && !info.IsDir() {
-				c.File(fpath)
+			path := strings.TrimPrefix(filepath.Clean(c.Request.URL.Path), "/")
+			if path == "" {
+				path = "index.html"
+			}
+			// try direct file (assets/...)
+			if _, err := sub.Open(path); err == nil {
+				c.FileFromFS(path, efs)
 				return
 			}
-			// fallback to SPA entry
-			c.File(filepath.Join(distDir, "index.html"))
+			// fallback SPA
+			c.FileFromFS("index.html", efs)
 		})
 	} else {
 		log.Printf("static front-end not found (%s), please build React front-end into this path", distDir)

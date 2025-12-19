@@ -12,7 +12,8 @@ WORKDIR /app
 COPY --from=build /out/arouter /app/arouter
 
 RUN mkdir -p /app/web
-COPY --from=build /src/web/dist /app/web/dist
+# 前端构建产物放在 cmd/controller/web/dist（已预构建或可通过外部挂载）
+COPY --from=build /src/cmd/controller/web/dist /app/web/dist
 RUN chmod +x /app/arouter
 # Optional: default to SQLite db in /app/data/arouter.db
 RUN mkdir -p /app/data
