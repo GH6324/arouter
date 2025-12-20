@@ -510,6 +510,22 @@ func main() {
 	log.Printf("arouter controller version %s", buildVersion)
 
 	r := gin.Default()
+	enableCors := strings.ToLower(envOrDefault("ENABLE_CORS", "true"))
+	if enableCors == "true" || enableCors == "1" || enableCors == "yes" {
+		r.Use(func(c *gin.Context) {
+			w := c.Writer
+			h := w.Header()
+			h.Set("Access-Control-Allow-Origin", "*")
+			h.Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+			h.Set("Access-Control-Allow-Headers", "Origin, Content-Type, Accept, Authorization")
+			h.Set("Access-Control-Max-Age", "86400")
+			if c.Request.Method == http.MethodOptions {
+				c.AbortWithStatus(http.StatusNoContent)
+				return
+			}
+			c.Next()
+		})
+	}
 	hub := newWSHub()
 
 	distDir := envOrDefault("WEB_DIST", "cmd/controller/web/dist")

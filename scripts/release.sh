@@ -17,10 +17,11 @@ mkdir -p "$OUT_DIR"
 # Build front-end and prepare embed assets
 echo "Building front-end..."
 (cd web && npm install && npm run build)
-rm -rf cmd/controller/web/dist
-mkdir -p cmd/controller/web
-cp -r web/dist cmd/controller/web/dist
-tar -czf "${OUT_DIR}/web-dist.tar.gz" -C web dist
+if [ ! -d "cmd/controller/web/dist" ]; then
+  echo "front-end build output not found at cmd/controller/web/dist"
+  exit 1
+fi
+tar -czf "${OUT_DIR}/web-dist.tar.gz" -C cmd/controller/web dist
 
 build_one() {
   OS=$1; ARCH=$2

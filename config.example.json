@@ -1,4 +1,7 @@
 {
+  "controller_env": {
+    "ENABLE_CORS": true
+  },
   "id": "node-a",
   "ws_listen": ":18080",
   "quic_listen": ":18080",

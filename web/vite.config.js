@@ -6,11 +6,20 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      '/api': 'http://localhost:8080',
-      '/nodes': 'http://localhost:8080'
+      '/api': {
+        target: 'https://arouter.199028.xyz',
+        changeOrigin: true,
+        secure: true,
+      },
+      '/nodes': {
+        target: 'https://arouter.199028.xyz',
+        changeOrigin: true,
+        secure: true,
+      },
     }
   },
   build: {
-    outDir: 'dist'
+    outDir: '../cmd/controller/web/dist',
+    emptyOutDir: true
   }
 });

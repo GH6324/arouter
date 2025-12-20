@@ -28,6 +28,7 @@ services:
     environment:
       - CONTROLLER_ADDR=:8080
       - DB_PATH=/data/arouter.db
+      - ENABLE_CORS=true   # 允许任意域名跨域访问（默认 true）
     volumes:
       - ./data:/data
       - ./certs:/app/certs   # 如需自定义证书
@@ -62,6 +63,7 @@ services:
     environment:
       - CONTROLLER_ADDR=:8080
       - DB_DSN=arouter:arouter123@tcp(mysql:3306)/arouter?parseTime=true&charset=utf8mb4&loc=Local
+      - ENABLE_CORS=true   # 允许任意域名跨域访问（默认 true）
     depends_on:
       - mysql
     volumes:
@@ -73,6 +75,9 @@ services:
 复制上述文件为 `docker-compose.yml`，`docker-compose up -d` 即可：会同时拉起 MySQL 与控制器。第一次启动会自动建表（AutoMigrate）。
 
 如已有 MySQL，可仅保留 `controller` 服务，确保 `DB_DSN` 中的账号拥有建库/建表权限，并在 DSN 中加上 `?parseTime=true&charset=utf8mb4&loc=Local`。
+
+### 控制器环境变量补充
+- `ENABLE_CORS`：是否开启 CORS（跨域）。`true/1/yes` 开启，`false/0/no` 关闭。默认开启。
 
 ## 节点部署
 1. 在控制台创建节点（“节点列表”→“新建节点”），记录节点 Token。

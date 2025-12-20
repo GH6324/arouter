@@ -4,3 +4,4 @@ publish_beta.sh
 dist/
 web/node_modules
 ./scripts/upload_static_to_server.sh
+./web/.env

@@ -267,3 +267,4 @@ scripts/upload_static_to_server.sh
 .release-static
 .release
 _deps/*
+./web/.env

@@ -1,8 +1,16 @@
+export const API_BASE = import.meta.env.VITE_API_BASE || 'https://arouter.199028.xyz';
+
+export const joinUrl = (base, path) => {
+  if (!base) return path;
+  const cleaned = base.replace(/\/+$/, '');
+  return `${cleaned}${path}`;
+};
+
 export async function api(method, url, body) {
   const token = localStorage.getItem('jwt') || '';
   const headers = { 'Content-Type': 'application/json' };
   if (token) headers['Authorization'] = `Bearer ${token}`;
-  const res = await fetch(url, {
+  const res = await fetch(joinUrl(API_BASE, url), {
     method,
     headers,
     body: body ? JSON.stringify(body) : undefined,
