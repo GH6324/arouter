@@ -25,8 +25,10 @@ type QUICTransport struct {
 	MaxDatagramSize int
 	AuthKey         []byte
 	Metrics         *Metrics
+	Topology        *Topology
 	Compression     string
 	CompressMin     int
+	LinkLossAlpha   float64
 }
 
 func (t *QUICTransport) Forward(ctx context.Context, src NodeID, path []NodeID, proto Protocol, downstream net.Conn, remoteAddr string) error {
@@ -53,14 +55,27 @@ func (t *QUICTransport) Forward(ctx context.Context, src NodeID, path []NodeID, 
 	if t.MaxIdleTimeout > 0 {
 		qconf.MaxIdleTimeout = t.MaxIdleTimeout
 	}
+	start := time.Now()
 	qconn, err := quic.DialAddr(ctx, parsed, tlsConf, qconf)
 	if err != nil {
+		if t.Topology != nil {
+			t.Topology.UpdateLink(t.Self, next, 0, false, t.LinkLossAlpha)
+			t.Topology.MarkFail(t.Self, next)
+		}
 		downstream.Close()
 		return fmt.Errorf("dial quic %s failed: %w", parsed, err)
+	}
+	if t.Topology != nil {
+		t.Topology.UpdateLink(t.Self, next, time.Since(start), true, t.LinkLossAlpha)
+		t.Topology.ResetFail(t.Self, next)
 	}
 	stream, err := qconn.OpenStreamSync(ctx)
 	if err != nil {
 		downstream.Close()
+		if t.Topology != nil {
+			t.Topology.UpdateLink(t.Self, next, 0, false, t.LinkLossAlpha)
+			t.Topology.MarkFail(t.Self, next)
+		}
 		return fmt.Errorf("open quic stream failed: %w", err)
 	}
 	header := ControlHeader{

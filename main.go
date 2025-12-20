@@ -130,14 +130,62 @@ type LinkMetrics struct {
 	UpdatedAt time.Time
 }
 
+func clamp01(v float64) float64 {
+	if v < 0 {
+		return 0
+	}
+	if v > 1 {
+		return 1
+	}
+	return v
+}
+
+type failMarker struct {
+	failTime  int64
+	failCount int64
+}
+
+func (m *failMarker) Time() time.Time {
+	if m == nil {
+		return time.Time{}
+	}
+	return time.Unix(atomic.LoadInt64(&m.failTime), 0)
+}
+
+func (m *failMarker) Count() int64 {
+	if m == nil {
+		return 0
+	}
+	return atomic.LoadInt64(&m.failCount)
+}
+
+func (m *failMarker) Mark() {
+	if m == nil {
+		return
+	}
+	atomic.AddInt64(&m.failCount, 1)
+	atomic.StoreInt64(&m.failTime, time.Now().Unix())
+}
+
+func (m *failMarker) Reset() {
+	if m == nil {
+		return
+	}
+	atomic.StoreInt64(&m.failCount, 0)
+}
+
 // Topology keeps weighted edges in-memory.
 type Topology struct {
 	mu    sync.RWMutex
 	edges map[NodeID]map[NodeID]LinkMetrics
+	fails map[NodeID]map[NodeID]*failMarker
 }
 
 func NewTopology() *Topology {
-	return &Topology{edges: make(map[NodeID]map[NodeID]LinkMetrics)}
+	return &Topology{
+		edges: make(map[NodeID]map[NodeID]LinkMetrics),
+		fails: make(map[NodeID]map[NodeID]*failMarker),
+	}
 }
 
 func (t *Topology) Set(from, to NodeID, m LinkMetrics) {
@@ -147,6 +195,39 @@ func (t *Topology) Set(from, to NodeID, m LinkMetrics) {
 		t.edges[from] = make(map[NodeID]LinkMetrics)
 	}
 	t.edges[from][to] = m
+}
+
+// UpdateLink updates link metrics with an EWMA loss estimator:
+// sample=0 for success, sample=1 for failure.
+// If rtt > 0, RTT is updated; otherwise RTT is kept.
+func (t *Topology) UpdateLink(from, to NodeID, rtt time.Duration, success bool, alpha float64) {
+	if t == nil {
+		return
+	}
+	if alpha <= 0 || alpha > 1 {
+		alpha = 0.2
+	}
+	sample := 1.0
+	if success {
+		sample = 0
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.edges[from] == nil {
+		t.edges[from] = make(map[NodeID]LinkMetrics)
+	}
+	cur := t.edges[from][to]
+	if rtt > 0 {
+		cur.RTT = rtt
+	}
+	if cur.UpdatedAt.IsZero() {
+		cur.LossRatio = sample
+	} else {
+		cur.LossRatio = clamp01(alpha*sample + (1-alpha)*cur.LossRatio)
+	}
+	cur.UpdatedAt = time.Now()
+	t.edges[from][to] = cur
 }
 
 func (t *Topology) Snapshot() map[NodeID]map[NodeID]LinkMetrics {
@@ -163,18 +244,87 @@ func (t *Topology) Snapshot() map[NodeID]map[NodeID]LinkMetrics {
 	return out
 }
 
+type LinkFailure struct {
+	Count int64
+	Time  time.Time
+}
+
+func (t *Topology) FailureSnapshot() map[NodeID]map[NodeID]LinkFailure {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	out := make(map[NodeID]map[NodeID]LinkFailure, len(t.fails))
+	for from, row := range t.fails {
+		copyRow := make(map[NodeID]LinkFailure, len(row))
+		for to, m := range row {
+			copyRow[to] = LinkFailure{
+				Count: m.Count(),
+				Time:  m.Time(),
+			}
+		}
+		out[from] = copyRow
+	}
+	return out
+}
+
+func (t *Topology) MarkFail(from, to NodeID) {
+	t.mu.Lock()
+	row := t.fails[from]
+	if row == nil {
+		row = make(map[NodeID]*failMarker)
+		t.fails[from] = row
+	}
+	m := row[to]
+	if m == nil {
+		m = &failMarker{}
+		row[to] = m
+	}
+	t.mu.Unlock()
+	m.Mark()
+}
+
+func (t *Topology) ResetFail(from, to NodeID) {
+	t.mu.RLock()
+	row := t.fails[from]
+	m := (*failMarker)(nil)
+	if row != nil {
+		m = row[to]
+	}
+	t.mu.RUnlock()
+	if m != nil {
+		m.Reset()
+	}
+}
+
 // Metrics 以原子计数记录流量与会话情况，暴露 /metrics 供采集。
 type Metrics struct {
 	tcpSessions int64
 	udpSessions int64
 	bytesUp     int64
 	bytesDown   int64
+	Self        NodeID
+	Topology    *Topology
+	MuxPool     interface {
+		PoolSnapshot() map[NodeID]MuxPoolStats
+	}
 }
 
 func (m *Metrics) IncTCP()         { atomic.AddInt64(&m.tcpSessions, 1) }
 func (m *Metrics) IncUDP()         { atomic.AddInt64(&m.udpSessions, 1) }
 func (m *Metrics) AddUp(n int64)   { atomic.AddInt64(&m.bytesUp, n) }
 func (m *Metrics) AddDown(n int64) { atomic.AddInt64(&m.bytesDown, n) }
+
+type MuxPoolStats struct {
+	Total      int
+	Active     int
+	Draining   int
+	MinRTTEWMA time.Duration
+	MaxRTTEWMA time.Duration
+	AvgRTTEWMA time.Duration
+	LastPing   time.Time
+	LastFail   time.Time
+	TotalFails int
+}
 
 // NodeStatus 描述节点自身运行状态，用于上报给控制器。
 type NodeStatus struct {
@@ -199,6 +349,49 @@ func (m *Metrics) Serve(addr string) *http.Server {
 		fmt.Fprintf(w, "udp_sessions_total %d\n", atomic.LoadInt64(&m.udpSessions))
 		fmt.Fprintf(w, "bytes_up_total %d\n", atomic.LoadInt64(&m.bytesUp))
 		fmt.Fprintf(w, "bytes_down_total %d\n", atomic.LoadInt64(&m.bytesDown))
+
+		if m.Topology != nil {
+			graph := m.Topology.Snapshot()
+			fails := m.Topology.FailureSnapshot()
+			writeRow := func(from NodeID, row map[NodeID]LinkMetrics) {
+				for to, lm := range row {
+					fmt.Fprintf(w, "link_rtt_ms{from=%q,to=%q} %d\n", string(from), string(to), lm.RTT.Milliseconds())
+					fmt.Fprintf(w, "link_loss_ratio{from=%q,to=%q} %.6f\n", string(from), string(to), clamp01(lm.LossRatio))
+					fmt.Fprintf(w, "link_updated_at_seconds{from=%q,to=%q} %d\n", string(from), string(to), lm.UpdatedAt.Unix())
+					if fr := fails[from]; fr != nil {
+						if lf, ok := fr[to]; ok {
+							fmt.Fprintf(w, "link_fail_count{from=%q,to=%q} %d\n", string(from), string(to), lf.Count)
+							fmt.Fprintf(w, "link_last_fail_seconds{from=%q,to=%q} %d\n", string(from), string(to), lf.Time.Unix())
+						}
+					}
+				}
+			}
+
+			if m.Self != "" {
+				if row := graph[m.Self]; row != nil {
+					writeRow(m.Self, row)
+				}
+			} else {
+				for from, row := range graph {
+					writeRow(from, row)
+				}
+			}
+		}
+
+		if m.MuxPool != nil {
+			snap := m.MuxPool.PoolSnapshot()
+			for peer, st := range snap {
+				fmt.Fprintf(w, "mux_pool_total{peer=%q} %d\n", string(peer), st.Total)
+				fmt.Fprintf(w, "mux_pool_active{peer=%q} %d\n", string(peer), st.Active)
+				fmt.Fprintf(w, "mux_pool_draining{peer=%q} %d\n", string(peer), st.Draining)
+				fmt.Fprintf(w, "mux_pool_rtt_ewma_min_ms{peer=%q} %d\n", string(peer), st.MinRTTEWMA.Milliseconds())
+				fmt.Fprintf(w, "mux_pool_rtt_ewma_max_ms{peer=%q} %d\n", string(peer), st.MaxRTTEWMA.Milliseconds())
+				fmt.Fprintf(w, "mux_pool_rtt_ewma_avg_ms{peer=%q} %d\n", string(peer), st.AvgRTTEWMA.Milliseconds())
+				fmt.Fprintf(w, "mux_pool_last_ping_seconds{peer=%q} %d\n", string(peer), st.LastPing.Unix())
+				fmt.Fprintf(w, "mux_pool_last_fail_seconds{peer=%q} %d\n", string(peer), st.LastFail.Unix())
+				fmt.Fprintf(w, "mux_pool_fail_total{peer=%q} %d\n", string(peer), st.TotalFails)
+			}
+		}
 	})
 	srv := &http.Server{Addr: addr, Handler: mux}
 	go func() {
@@ -211,11 +404,15 @@ func (m *Metrics) Serve(addr string) *http.Server {
 
 // Router picks a path using the latest metrics.
 type Router struct {
-	Topology *Topology
+	Topology      *Topology
+	FailThreshold int64
+	FailTimeout   time.Duration
+	FailPenalty   time.Duration
 }
 
 func (r *Router) BestPath(src, dst NodeID) ([]NodeID, error) {
 	graph := r.Topology.Snapshot()
+	fails := r.Topology.FailureSnapshot()
 	dist := make(map[NodeID]float64)
 	prev := make(map[NodeID]NodeID)
 	unseen := make(map[NodeID]bool)
@@ -258,7 +455,7 @@ func (r *Router) BestPath(src, dst NodeID) ([]NodeID, error) {
 		}
 		delete(unseen, u)
 		for v, metrics := range graph[u] {
-			alt := dist[u] + weight(metrics)
+			alt := dist[u] + weight(metrics) + r.failPenalty(fails, u, v)
 			if alt < dist[v] {
 				dist[v] = alt
 				prev[v] = u
@@ -277,6 +474,48 @@ func (r *Router) BestPath(src, dst NodeID) ([]NodeID, error) {
 		at = p
 	}
 	return path, nil
+}
+
+func (r *Router) failPenalty(fails map[NodeID]map[NodeID]LinkFailure, from, to NodeID) float64 {
+	if r == nil {
+		return 0
+	}
+	row := fails[from]
+	if row == nil {
+		return 0
+	}
+	f := row[to]
+	if f.Count == 0 || f.Time.IsZero() {
+		return 0
+	}
+
+	failTimeout := r.FailTimeout
+	if failTimeout <= 0 {
+		failTimeout = 30 * time.Second
+	}
+	if time.Since(f.Time) > failTimeout {
+		return 0
+	}
+
+	threshold := r.FailThreshold
+	if threshold <= 0 {
+		threshold = 3
+	}
+	if f.Count >= threshold {
+		return 1e18
+	}
+
+	penalty := r.FailPenalty
+	if penalty <= 0 {
+		penalty = 250 * time.Millisecond
+	}
+
+	// multiply penalty by fail count with cap.
+	c := f.Count
+	if c > 10 {
+		c = 10
+	}
+	return float64((penalty * time.Duration(c)).Milliseconds())
 }
 
 func fmtVal(v float64) string {
@@ -608,6 +847,22 @@ func detectOSInfo() (string, string) {
 	return runtime.GOOS, arch
 }
 
+func autoMaxMuxStreams() int {
+	// Conservative defaults: enough parallelism for multi-connection apps (e.g. iperf3 control+data),
+	// but avoid too many long-lived WS conns to a single peer.
+	n := runtime.NumCPU()
+	if n < 1 {
+		n = 1
+	}
+	if n > 4 {
+		n = 4
+	}
+	if n < 2 {
+		n = 2
+	}
+	return n
+}
+
 func gatherPublicIPs() []string {
 	seen := make(map[string]struct{})
 	for _, ip := range publicIPsFromInterfaces() {
@@ -800,6 +1055,13 @@ func (n *Node) pushMetrics(ctx context.Context) bool {
 		snapshot[k] = v
 	}
 	n.metricsMu.Unlock()
+	if n.Router != nil && n.Router.Topology != nil {
+		if row := n.Router.Topology.Snapshot()[n.ID]; row != nil {
+			for to, m := range row {
+				snapshot[to] = m
+			}
+		}
+	}
 	payload := struct {
 		From    NodeID                     `json:"from"`
 		Metrics map[NodeID]LinkMetricsJSON `json:"metrics"`
@@ -1234,16 +1496,15 @@ func (n *Node) pullTopology(ctx context.Context) {
 	}
 	for from, row := range payload.Edges {
 		for to, jm := range row {
-			n.Router.Topology.Set(from, to, LinkMetrics{
+			m := LinkMetrics{
 				RTT:       time.Duration(jm.RTTms) * time.Millisecond,
 				LossRatio: jm.Loss,
 				UpdatedAt: jm.UpdatedAt,
-			})
-			n.recordMetric(to, LinkMetrics{
-				RTT:       time.Duration(jm.RTTms) * time.Millisecond,
-				LossRatio: jm.Loss,
-				UpdatedAt: jm.UpdatedAt,
-			})
+			}
+			n.Router.Topology.Set(from, to, m)
+			if from == n.ID {
+				n.recordMetric(to, m)
+			}
 		}
 	}
 }
@@ -1672,211 +1933,97 @@ type pooledWS struct {
 	lastUsed  time.Time
 	active    int
 	draining  bool
+	rttEWMA   time.Duration
+	lastRTT   time.Duration
+	lastPing  time.Time
+	failCount int
+	lastFail  time.Time
 }
 
 // WSSTransport 通过 WebSocket 级联转发，可同时监听 WS 与 WSS。
 type WSSTransport struct {
-	Self          NodeID
-	ListenAddr    string
-	TLSListenAddr string
-	CertFile      string
-	KeyFile       string
-	Endpoints     map[NodeID]string // peer -> ws(s)://host:port/mesh
-	TLSConfig     *tls.Config
-	ServerName    string
-	IdleTimeout   time.Duration
-	AuthKey       []byte
-	NodeToken     string
-	Metrics       *Metrics
-	Compression   string
-	CompressMin   int
-	EncPolicies   []EncryptionPolicy
-	poolMu        sync.Mutex
-	pool          map[NodeID][]*pooledWS
-	maxConnAge    time.Duration
-	maxIdle       time.Duration
-	maxStreams    int
+	Self                   NodeID
+	ListenAddr             string
+	TLSListenAddr          string
+	CertFile               string
+	KeyFile                string
+	Endpoints              map[NodeID]string // peer -> ws(s)://host:port/mesh
+	TLSConfig              *tls.Config
+	ServerName             string
+	IdleTimeout            time.Duration
+	AuthKey                []byte
+	NodeToken              string
+	Metrics                *Metrics
+	Topology               *Topology
+	Compression            string
+	CompressMin            int
+	EncPolicies            []EncryptionPolicy
+	poolMu                 sync.Mutex
+	pool                   map[NodeID][]*pooledWS
+	maxConnAge             time.Duration
+	maxIdle                time.Duration
+	maxStreams             int
+	disablePool            bool
+	muxPingInterval        time.Duration
+	muxPingTimeout         time.Duration
+	muxCleanupInterval     time.Duration
+	muxRTTAlpha            float64
+	linkLossAlpha          float64
+	muxDefaultQueue        int
+	muxStreamQueue         int
+	muxBlockOnBackpressure bool
 }
 
-func (t *WSSTransport) Forward(ctx context.Context, src NodeID, path []NodeID, proto Protocol, downstream net.Conn, remoteAddr string) error {
-	if len(path) < 2 {
-		return fmt.Errorf("path too short: %v", path)
+func (t *WSSTransport) PoolSnapshot() map[NodeID]MuxPoolStats {
+	if t == nil {
+		return nil
 	}
-	next := path[1]
-	targetURL, ok := t.Endpoints[next]
-	if !ok {
-		return fmt.Errorf("no endpoint for %s", next)
+	t.poolMu.Lock()
+	defer t.poolMu.Unlock()
+	if t.pool == nil {
+		return nil
 	}
-	targetURL = normalizeWSEndpoint(targetURL)
-	ctxDial, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
-	_, mux, pw, err := t.getOrDialMux(ctxDial, next, targetURL)
-	if err != nil {
-		downstream.Close()
-		return fmt.Errorf("dial next %s failed: %w", next, err)
-	}
-	stream := mux.OpenStream()
-	defer stream.Close(context.Background())
-	session := fmt.Sprintf("mux-%d", stream.ID())
-	pol := selectPolicy(t.EncPolicies)
-	header := ControlHeader{
-		Path:        path[1:],
-		RemoteAddr:  remoteAddr,
-		Proto:       proto,
-		Compression: t.Compression,
-		CompressMin: t.CompressMin,
-	}
-	if pol != nil {
-		header.EncID = pol.ID
-	}
-	hdrPayload, _ := json.Marshal(header)
-	if err := stream.WriteFlags(ctxDial, flagCTRL, marshalCtrl(ctrlHeader, hdrPayload)); err != nil {
-		downstream.Close()
-		t.releasePooled(next, pw)
-		t.evictPooled(next, pw)
-		return fmt.Errorf("send header failed: %w", err)
-	}
-	defer stream.Close(context.Background())
-	logDebug("[mux stream=%d] sent header to %s proto=%s remote=%s path=%v", stream.ID(), next, proto, remoteAddr, header.Path)
-	wsConn := muxStreamConn(ctx, stream, func() {
-		logDebug("[mux stream=%d] release pooled mux %s (addr=%p)", stream.ID(), next, pw)
-		t.releasePooled(next, pw)
-	})
-	defer t.releasePooled(next, pw)
-	if pol != nil {
-		logDebug("[mux stream=%d] enable encryption enc_id=%d method=%s", stream.ID(), pol.ID, pol.Method)
-		secured, err := wrapSecureConn(wsConn, pol)
-		if err != nil {
-			downstream.Close()
-			t.evictPooled(next, pw)
-			return fmt.Errorf("enable encryption failed: %w", err)
+
+	out := make(map[NodeID]MuxPoolStats, len(t.pool))
+	for peer, list := range t.pool {
+		var st MuxPoolStats
+		st.Total = len(list)
+		var sum time.Duration
+		var sumCount int64
+		for _, p := range list {
+			st.Active += p.active
+			if p.draining {
+				st.Draining++
+			}
+			st.TotalFails += p.failCount
+			if p.lastPing.After(st.LastPing) {
+				st.LastPing = p.lastPing
+			}
+			if p.lastFail.After(st.LastFail) {
+				st.LastFail = p.lastFail
+			}
+			if p.rttEWMA > 0 {
+				if st.MinRTTEWMA == 0 || p.rttEWMA < st.MinRTTEWMA {
+					st.MinRTTEWMA = p.rttEWMA
+				}
+				if p.rttEWMA > st.MaxRTTEWMA {
+					st.MaxRTTEWMA = p.rttEWMA
+				}
+				sum += p.rttEWMA
+				sumCount++
+			}
 		}
-		wsConn = secured
-	}
-	logDebug("[session=%s] tunnel start proto=%s remote=%s path=%v compression=%s enc=%v", session, proto, remoteAddr, header.Path, header.Compression, header.EncID)
-	err = bridgeMaybeCompressed(session, downstream, wsConn, header.Compression, header.CompressMin, t.Metrics, path, remoteAddr)
-	if errors.Is(err, io.EOF) {
-		err = nil
-	}
-	if err != nil {
-		// 出错后关闭流并驱逐连接，避免复用可能异常的 mux
-		_ = stream.Reset(context.Background())
-		if isCipherErr(err) || isConnBroken(err) || isFrameErr(err) {
-			logWarn("[mux stream=%d] bridge fatal (cipher/broken/frame), closing mux: %v", stream.ID(), err)
-			t.evictPooled(next, pw)
+		if sumCount > 0 {
+			st.AvgRTTEWMA = time.Duration(int64(sum) / sumCount)
 		}
+		out[peer] = st
 	}
-	if err == nil {
-		logDebug("[session=%s] tunnel finish proto=%s remote=%s path=%v", session, proto, remoteAddr, header.Path)
-	}
-	return err
-}
-
-// ProbeHTTP 在给定路径上发起 HTTP 探测（入口->多跳->出口->目标 URL），返回端到端耗时。
-func (t *WSSTransport) ProbeHTTP(ctx context.Context, path []NodeID, target string, timeout time.Duration) (time.Duration, error) {
-	if len(path) < 2 {
-		return 0, fmt.Errorf("path too short: %v", path)
-	}
-	if timeout <= 0 {
-		timeout = 20 * time.Second
-	}
-	logTest("probe http start path=%v target=%s timeout=%s", path, target, timeout)
-	next := path[1]
-	targetURL, ok := t.Endpoints[next]
-	if !ok {
-		return 0, fmt.Errorf("no endpoint for %s", next)
-	}
-	targetURL = normalizeWSEndpoint(targetURL)
-	logTest("probe http dial next=%s url=%s", next, targetURL)
-	start := time.Now()
-	ctxDial, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	_, mux, pw, err := t.getOrDialMux(ctxDial, next, targetURL)
-	if err != nil {
-		return 0, fmt.Errorf("dial next %s failed: %w", next, err)
-	}
-	defer t.releasePooled(next, pw)
-	stream := mux.OpenStream()
-	defer stream.Close(context.Background())
-	header := ControlHeader{
-		Path:       path[1:],
-		RemoteAddr: target, // 复用 RemoteAddr 字段传目标 URL
-		Proto:      Protocol("probe"),
-	}
-	hdrPayload, _ := json.Marshal(header)
-	logTest("probe http send ctrl path=%v target=%s", header.Path, header.RemoteAddr)
-	if err := stream.WriteFlags(ctxDial, flagCTRL, marshalCtrl(ctrlProbe, hdrPayload)); err != nil {
-		return 0, fmt.Errorf("send probe failed: %w", err)
-	}
-	// 等待 FIN 表示完成
-	ch := mux.subscribe(stream.ID())
-	for f := range ch {
-		if f.flags&(flagFIN|flagRST) != 0 {
-			logTest("probe http recv fin flags=%d stream=%d", f.flags, stream.ID())
-			break
-		}
-	}
-	elapsed := time.Since(start)
-	logTest("probe http finished path=%v target=%s rtt=%s", path, target, elapsed)
-	return elapsed, nil
-}
-
-// ReconnectTCP 在桥接出错时尝试重新选路重建连接。
-func (t *WSSTransport) ReconnectTCP(ctx context.Context, src NodeID, proto Protocol, downstream net.Conn, remoteAddr string, computePath func(try int) ([]NodeID, error), attempts int) error {
-	// 仅对入口->隧道、隧道->隧道做一次尝试，出口/远端断开不再重试。
-	path, err := computePath(0)
-	if err != nil {
-		return err
-	}
-	return t.Forward(ctx, src, path, proto, downstream, remoteAddr)
-}
-
-// OpenUDPSession 建立 UDP 隧道的控制面，返回已握手的 WS 连接与会话 ID。
-func (t *WSSTransport) OpenUDPSession(ctx context.Context, path []NodeID, remoteAddr string) (*wscompat.Conn, string, error) {
-	if len(path) < 2 {
-		return nil, "", fmt.Errorf("path too short: %v", path)
-	}
-	next := path[1]
-	targetURL, ok := t.Endpoints[next]
-	if !ok {
-		return nil, "", fmt.Errorf("no endpoint for %s", next)
-	}
-	session := newSessionID()
-	header := ControlHeader{
-		Path:        path[1:],
-		RemoteAddr:  remoteAddr,
-		Proto:       ProtocolUDP,
-		Compression: t.Compression,
-		CompressMin: t.CompressMin,
-	}
-	ctxDial, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
-	c, err := t.getOrDial(ctxDial, next, targetURL)
-	if err != nil {
-		return nil, "", fmt.Errorf("dial next %s failed: %w", next, err)
-	}
-	if err := writeSignedEnvelope(ctxDial, c, ControlEnvelope{
-		Type:    "header",
-		Session: session,
-		Header:  &header,
-	}, t.AuthKey); err != nil {
-		c.Close()
-		return nil, "", err
-	}
-	ack, err := readVerifiedEnvelope(ctxDial, c, t.AuthKey)
-	if err != nil {
-		c.Close()
-		return nil, "", err
-	}
-	if ack.Type != "ack" || ack.Ack == nil {
-		c.Close()
-		return nil, "", fmt.Errorf("expected ack, got %s: %s", ack.Type, ack.Error)
-	}
-	log.Printf("[session=%s] UDP 下游 %s 确认链路，已确认: %v", session, next, ack.Ack.Confirmed)
-	return c, session, nil
+	return out
 }
 
 func (t *WSSTransport) Serve(ctx context.Context) error {
+	go t.cleanupMuxPool(ctx)
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/mesh", func(w http.ResponseWriter, r *http.Request) {
 		c, err := wscompat.Accept(w, r, &wscompat.AcceptOptions{})
@@ -1950,12 +2097,70 @@ func (t *WSSTransport) Serve(ctx context.Context) error {
 	return nil
 }
 
+func (t *WSSTransport) cleanupMuxPool(ctx context.Context) {
+	interval := t.muxCleanupInterval
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			t.poolMu.Lock()
+			if t.pool == nil {
+				t.poolMu.Unlock()
+				continue
+			}
+			now := time.Now()
+			for next, list := range t.pool {
+				newList := list[:0]
+				for _, p := range list {
+					select {
+					case <-p.mux.Done():
+						p.conn.Close()
+						continue
+					default:
+					}
+					expired := t.isExpired(p, now)
+					if expired && p.active == 0 {
+						p.conn.Close()
+						continue
+					}
+					if expired && !p.draining {
+						p.draining = true
+					}
+					// if repeated failures and idle, drop it.
+					if p.failCount >= 3 && p.active == 0 && now.Sub(p.lastFail) < 2*time.Minute {
+						p.conn.Close()
+						continue
+					}
+					newList = append(newList, p)
+				}
+				if len(newList) == 0 {
+					delete(t.pool, next)
+				} else {
+					t.pool[next] = newList
+				}
+			}
+			t.poolMu.Unlock()
+		}
+	}
+}
+
 func (t *WSSTransport) handleConn(ctx context.Context, c *wscompat.Conn) {
 	defer c.Close()
 	if t.IdleTimeout > 0 {
 		c.SetReadLimit(64 << 20)
 	}
-	mux := NewMuxManager(NewMuxConn(c))
+	mux := NewMuxManagerWithConfig(NewMuxConn(c), MuxConfig{
+		DefaultQueue:        t.muxDefaultQueue,
+		StreamQueue:         t.muxStreamQueue,
+		BlockOnBackpressure: t.muxBlockOnBackpressure,
+	})
 	t.muxServe(ctx, mux)
 }
 
@@ -1972,6 +2177,20 @@ func (t *WSSTransport) getOrDial(ctx context.Context, next NodeID, url string) (
 }
 
 func (t *WSSTransport) getOrDialMux(ctx context.Context, next NodeID, url string) (*wscompat.Conn, *MuxManager, *pooledWS, error) {
+	// 无池模式：每次新建，流结束后关闭
+	if t.disablePool {
+		conn, _, err := dialWSWithFallback(ctx, url, t.TLSConfig, t.ServerName)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		mux := NewMuxManager(NewMuxConn(conn))
+		go func() {
+			<-mux.Done()
+			conn.Close()
+		}()
+		return conn, mux, nil, nil
+	}
+
 	t.poolMu.Lock()
 	if t.pool == nil {
 		t.pool = make(map[NodeID][]*pooledWS)
@@ -1986,6 +2205,7 @@ func (t *WSSTransport) getOrDialMux(ctx context.Context, next NodeID, url string
 	// filter out expired or closed
 	valid := make([]*pooledWS, 0, len(candidates))
 	var chosen *pooledWS
+	var chosenScore time.Duration
 	var fallback *pooledWS // draining mux as last resort
 	for _, p := range candidates {
 		select {
@@ -2005,10 +2225,18 @@ func (t *WSSTransport) getOrDialMux(ctx context.Context, next NodeID, url string
 			p.draining = true
 			logDebug("[mux pool %s] mark mux draining (addr=%p)", next, p)
 		}
-		if chosen == nil && !p.draining && p.active < maxStreams {
-			chosen = p
-			p.active++
-			p.lastUsed = now
+		if !p.draining && p.active < maxStreams {
+			score := p.rttEWMA
+			if score <= 0 {
+				// Prefer connections with measured RTT; unmeasured ones are treated as slow.
+				score = 365 * 24 * time.Hour
+			}
+			// Slightly penalize busy connections.
+			score += time.Duration(p.active) * 5 * time.Millisecond
+			if chosen == nil || score < chosenScore {
+				chosen = p
+				chosenScore = score
+			}
 		}
 		if fallback == nil && p.draining && p.active < maxStreams {
 			fallback = p
@@ -2019,6 +2247,10 @@ func (t *WSSTransport) getOrDialMux(ctx context.Context, next NodeID, url string
 		delete(t.pool, next)
 	} else {
 		t.pool[next] = valid
+	}
+	if chosen != nil {
+		chosen.active++
+		chosen.lastUsed = now
 	}
 	t.poolMu.Unlock()
 	if chosen != nil {
@@ -2037,14 +2269,25 @@ func (t *WSSTransport) getOrDialMux(ctx context.Context, next NodeID, url string
 			logWarn("[mux pool %s] dial failed, fallback to draining mux (addr=%p): %v", next, fallback, err)
 			return fallback.conn, fallback.mux, fallback, nil
 		}
+		if t.Topology != nil {
+			t.Topology.UpdateLink(t.Self, next, 0, false, t.linkLossAlpha)
+			t.Topology.MarkFail(t.Self, next)
+		}
 		return nil, nil, nil, err
 	}
-	mux := NewMuxManager(NewMuxConn(conn))
+	mux := NewMuxManagerWithConfig(NewMuxConn(conn), MuxConfig{
+		DefaultQueue:        t.muxDefaultQueue,
+		StreamQueue:         t.muxStreamQueue,
+		BlockOnBackpressure: t.muxBlockOnBackpressure,
+	})
 	pw := &pooledWS{conn: conn, mux: mux, createdAt: now, lastUsed: now, active: 1}
 	t.poolMu.Lock()
 	t.pool[next] = append(t.pool[next], pw)
 	t.poolMu.Unlock()
 	logDebug("[mux pool %s] new mux dialed (addr=%p) active=1/%d", next, pw, maxStreams)
+	if t.Topology != nil {
+		t.Topology.ResetFail(t.Self, next)
+	}
 	go t.keepaliveMux(next, pw)
 	go func() {
 		<-mux.Done()
@@ -2127,7 +2370,24 @@ func (t *WSSTransport) isExpired(p *pooledWS, now time.Time) bool {
 }
 
 func (t *WSSTransport) keepaliveMux(next NodeID, pw *pooledWS) {
-	ticker := time.NewTicker(30 * time.Second)
+	interval := t.muxPingInterval
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
+	timeout := t.muxPingTimeout
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	alpha := t.muxRTTAlpha
+	if alpha <= 0 || alpha > 1 {
+		alpha = 0.2
+	}
+	lossAlpha := t.linkLossAlpha
+	if lossAlpha <= 0 || lossAlpha > 1 {
+		lossAlpha = 0.2
+	}
+
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -2135,14 +2395,38 @@ func (t *WSSTransport) keepaliveMux(next NodeID, pw *pooledWS) {
 			logDebug("[mux pool %s] keepalive stop, mux closed (addr=%p)", next, pw)
 			return
 		case <-ticker.C:
-			if err := pw.mux.Conn().Ping(context.Background()); err != nil {
+			ctxPing, cancel := context.WithTimeout(context.Background(), timeout)
+			rtt, err := pw.mux.Ping(ctxPing)
+			cancel()
+			if err != nil {
 				logWarn("[mux pool %s] keepalive failed (addr=%p): %v", next, pw, err)
-				pw.conn.Close()
 				t.poolMu.Lock()
-				delete(t.pool, next)
+				pw.failCount++
+				pw.lastFail = time.Now()
 				t.poolMu.Unlock()
+				if t.Topology != nil {
+					t.Topology.UpdateLink(t.Self, next, 0, false, lossAlpha)
+					t.Topology.MarkFail(t.Self, next)
+				}
+				t.evictPooled(next, pw)
 				return
 			}
+			var ewma time.Duration
+			t.poolMu.Lock()
+			pw.lastPing = time.Now()
+			pw.lastRTT = rtt
+			if pw.rttEWMA <= 0 {
+				pw.rttEWMA = rtt
+			} else {
+				pw.rttEWMA = time.Duration(alpha*float64(rtt) + (1-alpha)*float64(pw.rttEWMA))
+			}
+			ewma = pw.rttEWMA
+			t.poolMu.Unlock()
+			if t.Topology != nil {
+				t.Topology.UpdateLink(t.Self, next, ewma, true, lossAlpha)
+				t.Topology.ResetFail(t.Self, next)
+			}
+			logDebug("[mux pool %s] keepalive ok (addr=%p) rtt=%v ewma=%v", next, pw, rtt, ewma)
 		}
 	}
 }
@@ -2184,16 +2468,18 @@ func muxStreamConn(ctx context.Context, stream *MuxStream, onClose func()) net.C
 }
 
 type muxConnAdapter struct {
-	ctx     context.Context
-	stream  *MuxStream
-	ch      <-chan muxFrame
-	buf     []byte
-	closed  bool
-	onClose func()
+	ctx         context.Context
+	stream      *MuxStream
+	ch          <-chan muxFrame
+	buf         []byte
+	closed      bool
+	readClosed  bool
+	writeClosed bool
+	onClose     func()
 }
 
 func (m *muxConnAdapter) Read(p []byte) (int, error) {
-	if m.closed {
+	if m.closed || m.readClosed {
 		return 0, io.EOF
 	}
 	for {
@@ -2202,22 +2488,40 @@ func (m *muxConnAdapter) Read(p []byte) (int, error) {
 			m.buf = m.buf[n:]
 			return n, nil
 		}
-		f, ok := <-m.ch
-		if !ok {
+		var f muxFrame
+		var ok bool
+		select {
+		case f, ok = <-m.ch:
+			if !ok {
+				m.closed = true
+				return 0, io.EOF
+			}
+		case <-m.stream.mgr.Done():
+			m.closed = true
+			return 0, io.EOF
+		case <-m.ctx.Done():
 			m.closed = true
 			return 0, io.EOF
 		}
 		if len(f.payload) > 0 {
 			m.buf = f.payload
 		}
-		if f.flags&(flagFIN|flagRST) != 0 {
-			log.Printf("[mux stream=%d] upstream fin/rst flags=%d", m.stream.ID(), f.flags)
+		if f.flags&(flagFIN|flagRST|flagFINW) != 0 {
+			log.Printf("[mux=%p stream=%d] upstream fin/rst flags=%d", m.stream.mgr, m.stream.ID(), f.flags)
 			if len(m.buf) == 0 {
-				m.closed = true
-				if m.onClose != nil {
-					m.onClose()
+				if f.flags&flagFINW != 0 {
+					m.readClosed = true
+				} else {
+					m.closed = true
+					if m.onClose != nil {
+						m.onClose()
+					}
 				}
 				return 0, io.EOF
+			}
+			if f.flags&flagFINW != 0 {
+				// We still return buffered payload first; EOF will be returned on next Read.
+				m.readClosed = true
 			}
 		}
 	}
@@ -2225,6 +2529,9 @@ func (m *muxConnAdapter) Read(p []byte) (int, error) {
 
 func (m *muxConnAdapter) Write(p []byte) (int, error) {
 	if m.closed {
+		return 0, io.ErrClosedPipe
+	}
+	if m.writeClosed {
 		return 0, io.ErrClosedPipe
 	}
 	if err := m.stream.Write(context.Background(), p); err != nil {
@@ -2247,6 +2554,19 @@ func (m *muxConnAdapter) Close() error {
 	return m.stream.Close(context.Background())
 }
 
+func (m *muxConnAdapter) CloseWrite() error {
+	if m.writeClosed {
+		return nil
+	}
+	m.writeClosed = true
+	return m.stream.CloseWrite(context.Background())
+}
+
+func (m *muxConnAdapter) CloseRead() error {
+	m.readClosed = true
+	return nil
+}
+
 func (m *muxConnAdapter) LocalAddr() net.Addr  { return dummyAddr("mux") }
 func (m *muxConnAdapter) RemoteAddr() net.Addr { return dummyAddr("mux") }
 func (m *muxConnAdapter) SetDeadline(t time.Time) error {
@@ -2258,7 +2578,6 @@ func (m *muxConnAdapter) SetWriteDeadline(t time.Time) error { return nil }
 // muxServe handles incoming mux frames on an accepted WS connection.
 func (t *WSSTransport) muxServe(ctx context.Context, mm *MuxManager) {
 	defaultCh := mm.subscribeDefault()
-	go mm.Conn().KeepAlive(ctx, 15*time.Second)
 	for {
 		select {
 		case <-ctx.Done():
@@ -2294,7 +2613,22 @@ func (t *WSSTransport) muxServe(ctx context.Context, mm *MuxManager) {
 			} else {
 				// 数据帧可能在订阅前先到 defaultCh，推送到对应 stream channel，避免阻塞
 				ch := mm.subscribe(f.streamID)
-				ch <- f
+				if mm.cfg.BlockOnBackpressure {
+					select {
+					case ch <- f:
+					case <-mm.Done():
+						return
+					case <-ctx.Done():
+						return
+					}
+				} else {
+					select {
+					case ch <- f:
+					default:
+						mm.resetStream(f.streamID)
+						continue
+					}
+				}
 			}
 		}
 	}
@@ -2306,144 +2640,16 @@ func (t *WSSTransport) handleMuxHeader(ctx context.Context, mm *MuxManager, stre
 		log.Printf("[mux stream=%d] header path mismatch, expected start %s got %v", streamID, t.Self, hdr.Path)
 		return
 	}
-	upStream := &MuxStream{id: streamID, m: mm.Conn(), mgr: mm}
-	streamCh := mm.subscribe(streamID)
-	sessionID := fmt.Sprintf("mux-%d", streamID)
 	remaining := hdr.Path[1:]
+
+	upStream := &MuxStream{id: streamID, m: mm.Conn(), mgr: mm}
 	if len(remaining) == 0 {
-		// exit
-		log.Printf("[mux stream=%d] exit handle proto=%s remote=%s compress=%s enc_id=%d", streamID, hdr.Proto, hdr.RemoteAddr, hdr.Compression, hdr.EncID)
-		pol := findPolicy(t.EncPolicies, hdr.EncID)
-		if hdr.EncID != 0 && pol == nil {
-			log.Printf("[mux stream=%d] unknown enc policy id=%d", streamID, hdr.EncID)
-			_ = upStream.WriteFlags(context.Background(), flagRST, []byte("unknown enc policy"))
-			return
-		}
-		switch hdr.Proto {
-		case ProtocolTCP:
-			conn, err := net.DialTimeout("tcp", hdr.RemoteAddr, 5*time.Second)
-			if err != nil {
-				_ = upStream.WriteFlags(context.Background(), flagRST, []byte(err.Error()))
-				return
-			}
-			wsConn := muxStreamConn(ctx, upStream, func() { conn.Close() })
-			if pol != nil {
-				log.Printf("[mux stream=%d] decrypt with enc_id=%d method=%s", streamID, pol.ID, pol.Method)
-				secured, err := wrapSecureConn(wsConn, pol)
-				if err != nil {
-					_ = upStream.WriteFlags(context.Background(), flagRST, []byte(err.Error()))
-					conn.Close()
-					return
-				}
-				wsConn = secured
-			}
-			go func() {
-				defer upStream.Close(context.Background())
-				if err := bridgeMaybeCompressed(sessionID, conn, wsConn, hdr.Compression, hdr.CompressMin, t.Metrics, nil, hdr.RemoteAddr); err != nil {
-					log.Printf("[session=%s] exit bridge failed: %v", sessionID, err)
-					_ = upStream.Reset(context.Background())
-					if isCipherErr(err) || isConnBroken(err) {
-						log.Printf("[session=%s] bridge fatal error, closing mux conn", sessionID)
-						mm.Conn().Close()
-					}
-				}
-			}()
-		case ProtocolUDP:
-			udpConn, err := net.Dial("udp", hdr.RemoteAddr)
-			if err != nil {
-				_ = upStream.WriteFlags(context.Background(), flagRST, []byte(err.Error()))
-				return
-			}
-			wsConn := muxStreamConn(ctx, upStream, func() { udpConn.Close() })
-			if pol != nil {
-				log.Printf("[mux stream=%d] decrypt with enc_id=%d method=%s (udp)", streamID, pol.ID, pol.Method)
-				secured, err := wrapSecureConn(wsConn, pol)
-				if err != nil {
-					_ = upStream.WriteFlags(context.Background(), flagRST, []byte(err.Error()))
-					udpConn.Close()
-					return
-				}
-				wsConn = secured
-			}
-			go forwardUDPToStream(wsConn, udpConn, t.Metrics)
-			go forwardStreamToUDP(wsConn, udpConn, t.Metrics)
-		case Protocol("probe"):
-			// 出口执行 HTTP 探测
-			ctxReq, cancel := context.WithTimeout(ctx, 20*time.Second)
-			defer cancel()
-			req, _ := http.NewRequestWithContext(ctxReq, "GET", hdr.RemoteAddr, nil)
-			resp, err := http.DefaultClient.Do(req)
-			if err == nil {
-				resp.Body.Close()
-			}
-			_ = upStream.WriteFlags(context.Background(), flagFIN, nil)
-		}
+		t.handleMuxHeaderEgress(ctx, mm, streamID, hdr, upStream)
 		return
 	}
-	// forward to next hop
-	next := remaining[0]
-	targetURL, ok := t.Endpoints[next]
-	if !ok {
-		_ = upStream.WriteFlags(context.Background(), flagRST, []byte("no endpoint"))
-		return
-	}
-	logDebug("[mux stream=%d] forward to %s path=%v", streamID, next, remaining)
-	ctxDial, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
-	_, nextMux, pw, err := t.getOrDialMux(ctxDial, next, targetURL)
-	if err != nil || nextMux == nil {
-		_ = upStream.WriteFlags(context.Background(), flagRST, []byte("dial next failed"))
-		return
-	}
-	downStream := nextMux.OpenStream()
-	hdr.Path = remaining
-	payload, _ := json.Marshal(hdr)
-	if err := downStream.WriteFlags(ctxDial, flagCTRL, marshalCtrl(ctrlHeader, payload)); err != nil {
-		t.releasePooled(next, pw)
-		t.evictPooled(next, pw)
-		logWarn("[mux stream=%d] cascade header write to %s failed: %v", streamID, next, err)
-		return
-	}
-	downCh := nextMux.subscribe(downStream.ID())
-	var once sync.Once
-	release := func() { once.Do(func() { t.releasePooled(next, pw) }) }
-	logDebug("[mux stream=%d] cascade start next=%s path=%v", streamID, next, remaining)
-	// downstream -> upstream
-	go func() {
-		for f := range downCh {
-			if len(f.payload) > 0 {
-				logTest("mux stream=%d cascade downstream payload len=%d", streamID, len(f.payload))
-				_ = upStream.Write(context.Background(), f.payload)
-			}
-			if f.flags&(flagFIN|flagRST) != 0 {
-				_ = upStream.WriteFlags(context.Background(), flagFIN, nil)
-				logTest("mux stream=%d cascade downstream fin/rst flags=%d", streamID, f.flags)
-				release()
-				return
-			}
-		}
-		// channel closed without fin/rst, still notify upstream
-		_ = upStream.WriteFlags(context.Background(), flagFIN, nil)
-		release()
-	}()
-	// upstream -> downstream
-	go func() {
-		for f := range streamCh {
-			if len(f.payload) > 0 {
-				logTest("mux stream=%d cascade upstream payload len=%d", streamID, len(f.payload))
-				_ = downStream.Write(context.Background(), f.payload)
-			}
-			if f.flags&(flagFIN|flagRST) != 0 {
-				_ = downStream.WriteFlags(context.Background(), flagFIN, nil)
-				logTest("mux stream=%d cascade upstream fin/rst flags=%d", streamID, f.flags)
-				release()
-				return
-			}
-		}
-		// channel closed without fin/rst, still notify downstream
-		_ = downStream.WriteFlags(context.Background(), flagFIN, nil)
-		release()
-	}()
+
+	streamCh := mm.subscribe(streamID)
+	t.handleMuxHeaderRelay(ctx, mm, streamID, hdr, upStream, streamCh, remaining)
 }
 
 func forwardUDPToStream(wsConn net.Conn, udpConn net.Conn, metrics *Metrics) {
@@ -2683,9 +2889,17 @@ func bridgeMaybeCompressed(session string, dst, src net.Conn, compression string
 
 	errCh := make(chan error, 2)
 	go func() {
+		if compression == "none" {
+			errCh <- pipeNone(dst, src, downCounter, false)
+			return
+		}
 		errCh <- copyWithCompression(dst, src, compression, minBytes, downCounter, false)
 	}()
 	go func() {
+		if compression == "none" {
+			errCh <- pipeNone(src, dst, upCounter, true)
+			return
+		}
 		errCh <- copyWithCompression(src, dst, compression, minBytes, upCounter, true)
 	}()
 	startUp := int64(0)
@@ -2701,6 +2915,9 @@ func bridgeMaybeCompressed(session string, dst, src net.Conn, compression string
 	err := err1
 	if err == nil {
 		err = err2
+	}
+	if err != nil && (errors.Is(err, io.EOF) || isClosedPipeErr(err) || isCanceledErr(err)) {
+		err = nil
 	}
 	if err != nil && !isCanceledErr(err) && !errors.Is(err, io.EOF) {
 		log.Printf("[session=%s] bridge error: %v", session, err)
@@ -2718,6 +2935,36 @@ func bridgeMaybeCompressed(session string, dst, src net.Conn, compression string
 		}
 		log.Printf("[flow session=%s] in=%dB out=%dB from=%s to=%s remote=%s path=%s compression=%s", session, down, up, safeAddr(src), safeAddr(dst), remote, pathStr, compression)
 	}
+	return err
+}
+
+type closeReader interface {
+	CloseRead() error
+}
+
+type closeWriter interface {
+	CloseWrite() error
+}
+
+func pipeNone(dst, src net.Conn, counter *int64, compress bool) error {
+	startMsg := fmt.Sprintf("[copy %s] compression=none src=%s dst=%s", dirLabel(compress), safeAddr(src), safeAddr(dst))
+	n, err := io.Copy(&countingWriter{Writer: dst, counter: counter}, src)
+
+	if cr, ok := src.(closeReader); ok {
+		_ = cr.CloseRead()
+	}
+	// NOTE: Mux stream connections (wsConnAdapter) do not support TCP half-close semantics.
+	// For those, we must not close the stream here because it would terminate the reverse direction
+	// (e.g., iperf3 -R where client->server finishes early but server->client is still sending).
+	// We only half-close when the underlying conn supports it; full close happens after both directions complete.
+	if cw, ok := dst.(closeWriter); ok {
+		_ = cw.CloseWrite()
+	}
+
+	if isClosedPipeErr(err) || errors.Is(err, net.ErrClosed) {
+		err = io.EOF
+	}
+	log.Printf("%s done bytes=%d err=%v", startMsg, n, err)
 	return err
 }
 
@@ -2755,6 +3002,9 @@ func copyWithCompression(dst net.Conn, src net.Conn, compression string, minByte
 	// none: direct copy
 	if compression == "none" {
 		n, err := io.Copy(&countingWriter{Writer: dst, counter: counter}, src)
+		if isClosedPipeErr(err) || errors.Is(err, net.ErrClosed) {
+			err = io.EOF
+		}
 		log.Printf("%s done bytes=%d err=%v", startMsg, n, err)
 		return err
 	}
@@ -3588,8 +3838,6 @@ type nodeConfig struct {
 	MaxDatagramSize int                `json:"quic_max_datagram_size"`
 	AuthKey         string             `json:"auth_key"`
 	MetricsListen   string             `json:"metrics_listen"`
-	RerouteAttempts int                `json:"reroute_attempts"`
-	UDPSessionTTL   string             `json:"udp_session_ttl"`
 	MTLSCert        string             `json:"mtls_cert"`
 	MTLSKey         string             `json:"mtls_key"`
 	MTLSCA          string             `json:"mtls_ca"`
@@ -3603,9 +3851,6 @@ type nodeConfig struct {
 	DebugLog        bool               `json:"debug_log"`
 	HTTPProbeURL    string             `json:"http_probe_url"`
 	EncPolicies     []EncryptionPolicy `json:"encryption_policies"`
-	MaxMuxStreams   int                `json:"max_mux_streams"`
-	MuxMaxAge       string             `json:"mux_max_age"`
-	MuxMaxIdle      string             `json:"mux_max_idle"`
 	MemLimit        string             `json:"mem_limit"`
 }
 
@@ -3616,7 +3861,6 @@ func loadConfig(path string) (nodeConfig, error) {
 		return cfg, err
 	}
 
-	fmt.Println("Config data:", string(data))
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return cfg, err
 	}
@@ -3966,7 +4210,14 @@ func main() {
 			log.Printf("metrics listening on %s", cfg.MetricsListen)
 		}
 		topology := NewTopology()
-		router := &Router{Topology: topology}
+		metrics.Topology = topology
+		metrics.Self = NodeID(cfg.ID)
+		router := &Router{
+			Topology:      topology,
+			FailThreshold: 3,
+			FailTimeout:   30 * time.Second,
+			FailPenalty:   250 * time.Millisecond,
+		}
 
 		{
 			//构建之前要先拉取certs
@@ -4042,7 +4293,7 @@ func main() {
 			})
 		}
 
-		udpTTL := parseDurationOrDefault(cfg.UDPSessionTTL, 60*time.Second)
+		udpTTL := 60 * time.Second
 		routePull := parseDurationOrDefault(cfg.RoutePull, 0)
 		compression := strings.ToLower(cfg.Compression)
 		if compression == "" {
@@ -4053,9 +4304,17 @@ func main() {
 		cfg.WSSListen = ensureListenAddr(cfg.WSSListen)
 		cfg.QUICListen = ensureListenAddr(cfg.QUICListen)
 		cfg.MetricsListen = ensureListenAddr(cfg.MetricsListen)
-		muxMaxAge := parseDurationOrDefault(cfg.MuxMaxAge, 0)
-		muxMaxIdle := parseDurationOrDefault(cfg.MuxMaxIdle, 0)
-		maxStreams := cfg.MaxMuxStreams
+		muxMaxAge := 10 * time.Minute
+		muxMaxIdle := 2 * time.Minute
+		muxPingInterval := 30 * time.Second
+		muxPingTimeout := 5 * time.Second
+		muxCleanup := 30 * time.Second
+		muxRTTAlpha := 0.2
+		linkLossAlpha := 0.2
+		maxStreams := autoMaxMuxStreams()
+		muxDefaultQueue := 256 * maxStreams
+		muxStreamQueue := 64 * maxStreams
+		muxBlockOnBackpressure := true
 		switch mode {
 		case "quic":
 			transport = &QUICTransport{
@@ -4068,48 +4327,73 @@ func main() {
 				MaxDatagramSize: cfg.MaxDatagramSize,
 				AuthKey:         authKey,
 				Metrics:         metrics,
+				Topology:        topology,
 				Compression:     compression,
 				CompressMin:     cfg.CompressionMin,
+				LinkLossAlpha:   linkLossAlpha,
 			}
 		case "wss", "ws":
 			transport = &WSSTransport{
-				Self:          NodeID(cfg.ID),
-				ListenAddr:    cfg.WSListen,
-				TLSListenAddr: cfg.WSSListen,
-				CertFile:      platformPath(defaultIfEmpty(cfg.MTLSCert, "/opt/arouter/certs/arouter.crt")),
-				KeyFile:       platformPath(defaultIfEmpty(cfg.MTLSKey, "/opt/arouter/certs/arouter.key")),
-				Endpoints:     endpoints,
-				TLSConfig:     tlsConf,
-				ServerName:    cfg.QUICServerName,
-				AuthKey:       authKey,
-				Metrics:       metrics,
-				Compression:   compression,
-				CompressMin:   cfg.CompressionMin,
-				EncPolicies:   cfg.EncPolicies,
-				maxStreams:    maxStreams,
-				maxConnAge:    muxMaxAge,
-				maxIdle:       muxMaxIdle,
+				Self:                   NodeID(cfg.ID),
+				ListenAddr:             cfg.WSListen,
+				TLSListenAddr:          cfg.WSSListen,
+				CertFile:               platformPath(defaultIfEmpty(cfg.MTLSCert, "/opt/arouter/certs/arouter.crt")),
+				KeyFile:                platformPath(defaultIfEmpty(cfg.MTLSKey, "/opt/arouter/certs/arouter.key")),
+				Endpoints:              endpoints,
+				TLSConfig:              tlsConf,
+				ServerName:             cfg.QUICServerName,
+				AuthKey:                authKey,
+				Metrics:                metrics,
+				Topology:               topology,
+				Compression:            compression,
+				CompressMin:            cfg.CompressionMin,
+				EncPolicies:            cfg.EncPolicies,
+				maxStreams:             maxStreams,
+				disablePool:            maxStreams <= 1,
+				maxConnAge:             muxMaxAge,
+				maxIdle:                muxMaxIdle,
+				muxPingInterval:        muxPingInterval,
+				muxPingTimeout:         muxPingTimeout,
+				muxCleanupInterval:     muxCleanup,
+				muxRTTAlpha:            muxRTTAlpha,
+				linkLossAlpha:          linkLossAlpha,
+				muxDefaultQueue:        muxDefaultQueue,
+				muxStreamQueue:         muxStreamQueue,
+				muxBlockOnBackpressure: muxBlockOnBackpressure,
 			}
 		default:
 			log.Printf("unknown transport %s, fallback to ws", mode)
 			transport = &WSSTransport{
-				Self:          NodeID(cfg.ID),
-				ListenAddr:    cfg.WSListen,
-				TLSListenAddr: cfg.WSSListen,
-				CertFile:      platformPath(defaultIfEmpty(cfg.MTLSCert, "/opt/arouter/certs/arouter.crt")),
-				KeyFile:       platformPath(defaultIfEmpty(cfg.MTLSKey, "/opt/arouter/certs/arouter.key")),
-				Endpoints:     endpoints,
-				TLSConfig:     tlsConf,
-				ServerName:    cfg.QUICServerName,
-				AuthKey:       authKey,
-				Metrics:       metrics,
-				Compression:   compression,
-				CompressMin:   cfg.CompressionMin,
-				EncPolicies:   cfg.EncPolicies,
-				maxStreams:    maxStreams,
-				maxConnAge:    muxMaxAge,
-				maxIdle:       muxMaxIdle,
+				Self:                   NodeID(cfg.ID),
+				ListenAddr:             cfg.WSListen,
+				TLSListenAddr:          cfg.WSSListen,
+				CertFile:               platformPath(defaultIfEmpty(cfg.MTLSCert, "/opt/arouter/certs/arouter.crt")),
+				KeyFile:                platformPath(defaultIfEmpty(cfg.MTLSKey, "/opt/arouter/certs/arouter.key")),
+				Endpoints:              endpoints,
+				TLSConfig:              tlsConf,
+				ServerName:             cfg.QUICServerName,
+				AuthKey:                authKey,
+				Metrics:                metrics,
+				Topology:               topology,
+				Compression:            compression,
+				CompressMin:            cfg.CompressionMin,
+				EncPolicies:            cfg.EncPolicies,
+				maxStreams:             maxStreams,
+				disablePool:            maxStreams <= 1,
+				maxConnAge:             muxMaxAge,
+				maxIdle:                muxMaxIdle,
+				muxPingInterval:        muxPingInterval,
+				muxPingTimeout:         muxPingTimeout,
+				muxCleanupInterval:     muxCleanup,
+				muxRTTAlpha:            muxRTTAlpha,
+				linkLossAlpha:          linkLossAlpha,
+				muxDefaultQueue:        muxDefaultQueue,
+				muxStreamQueue:         muxStreamQueue,
+				muxBlockOnBackpressure: muxBlockOnBackpressure,
 			}
+		}
+		if ws, ok := transport.(*WSSTransport); ok {
+			metrics.MuxPool = ws
 		}
 		prober := &WSProber{
 			Endpoints:  endpoints,
@@ -4129,7 +4413,7 @@ func main() {
 			Peers:          peerIDs,
 			PollPeriod:     parseDurationOrDefault(cfg.PollPeriod, 5*time.Second),
 			Metrics:        metrics,
-			MaxReroute:     cfg.RerouteAttempts,
+			MaxReroute:     1,
 			udpTTL:         udpTTL,
 			ControllerURL:  cfg.ControllerURL,
 			TopologyPull:   parseDurationOrDefault(cfg.TopologyPull, 5*time.Minute),
@@ -4145,7 +4429,7 @@ func main() {
 			TokenPath:      platformPath(defaultIfEmpty(*tokenPath, "/opt/arouter/.token")),
 			DebugLog:       cfg.DebugLog,
 			EncPolicies:    cfg.EncPolicies,
-			maxMuxStreams:  cfg.MaxMuxStreams,
+			maxMuxStreams:  maxStreams,
 			muxMaxAge:      muxMaxAge,
 			muxMaxIdle:     muxMaxIdle,
 			memLimit:       cfg.MemLimit,

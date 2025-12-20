@@ -11,9 +11,11 @@
   },
   "poll_period": "5s",
   "transport": "quic",
+  "compression": "gzip",
+  "compression_min_bytes": 0,
+  "debug_log": false,
   "auth_key": "changeme-shared-hmac-key",
   "metrics_listen": ":19090",
-  "reroute_attempts": 2,
   "encryption_policies": [
     {
       "id": 1,
@@ -28,7 +30,6 @@
       "key": "YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWE="
     }
   ],
-  "udp_session_ttl": "60s",
   "mtls_cert": "/opt/arouter/certs/arouter.crt",
   "mtls_key": "/opt/arouter/certs/arouter.key",
   "mtls_ca": "",

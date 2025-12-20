@@ -122,6 +122,33 @@ func (c *Conn) Write(ctx context.Context, msgType int, data []byte) error {
 	return c.WriteMessage(msgType, data)
 }
 
+// WriteBinaryv writes a single binary websocket message composed of multiple byte slices
+// without concatenating them into a single buffer.
+func (c *Conn) WriteBinaryv(ctx context.Context, parts ...[]byte) error {
+	if c == nil {
+		return net.ErrClosed
+	}
+	deadline, ok := ctx.Deadline()
+	if ok {
+		_ = c.SetWriteDeadline(deadline)
+		defer c.SetWriteDeadline(time.Time{})
+	}
+	w, err := c.NextWriter(websocket.BinaryMessage)
+	if err != nil {
+		return err
+	}
+	for _, p := range parts {
+		if len(p) == 0 {
+			continue
+		}
+		if _, err := w.Write(p); err != nil {
+			_ = w.Close()
+			return err
+		}
+	}
+	return w.Close()
+}
+
 // NetConn 兼容 nhooyr 的 NetConn 用法。
 func NetConn(ctx context.Context, c *Conn, msgType int) net.Conn {
 	if c == nil {

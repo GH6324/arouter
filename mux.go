@@ -20,6 +20,9 @@ const (
 	flagPING   = 1 << 2
 	flagPONG   = 1 << 3
 	flagCTRL   = 1 << 4 // payload 为控制信息（header/ack/error/probe 等）
+	// flagFINW indicates the sender has closed its write side (half-close).
+	// The receiver should treat it as EOF for Read(), while keeping its own write side usable.
+	flagFINW = 1 << 5
 )
 
 type muxFrame struct {
@@ -52,14 +55,14 @@ func (m *MuxConn) WriteFrame(ctx context.Context, f muxFrame) error {
 	if f.version == 0 {
 		f.version = muxVersion
 	}
-	header := make([]byte, 10) // 1+1+4+4
+	m.wmu.Lock()
+	defer m.wmu.Unlock()
+	var header [10]byte // 1+1+4+4
 	header[0] = f.version
 	header[1] = f.flags
 	binary.BigEndian.PutUint32(header[2:], f.streamID)
 	binary.BigEndian.PutUint32(header[6:], uint32(len(f.payload)))
-	m.wmu.Lock()
-	defer m.wmu.Unlock()
-	return m.ws.Write(ctx, wscompat.MessageBinary, append(header, f.payload...))
+	return m.ws.WriteBinaryv(ctx, header[:], f.payload)
 }
 
 func (m *MuxConn) ReadFrame(ctx context.Context) (muxFrame, error) {
