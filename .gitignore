@@ -266,4 +266,4 @@ publish_beta.sh
 scripts/upload_static_to_server.sh
 .release-static
 .release
-_deps
+_deps/*
