@@ -31,7 +31,7 @@ type QUICTransport struct {
 	LinkLossAlpha   float64
 }
 
-func (t *QUICTransport) Forward(ctx context.Context, src NodeID, path []NodeID, proto Protocol, downstream net.Conn, remoteAddr string) error {
+func (t *QUICTransport) Forward(ctx context.Context, src NodeID, path []NodeID, returnPath []NodeID, proto Protocol, downstream net.Conn, remoteAddr string, routeName string) error {
 	if proto != ProtocolTCP {
 		return fmt.Errorf("quic transport currently supports tcp only")
 	}
@@ -80,10 +80,16 @@ func (t *QUICTransport) Forward(ctx context.Context, src NodeID, path []NodeID, 
 	}
 	header := ControlHeader{
 		Path:        path[1:],
+		FullPath:    path,
 		RemoteAddr:  remoteAddr,
 		Proto:       proto,
 		Compression: t.Compression,
 		CompressMin: t.CompressMin,
+		EntryNode:   src,
+		ClientAddr:  safeAddr(downstream),
+	}
+	if routeName != "" {
+		header.RouteName = routeName
 	}
 	if err := writeSignedEnvelopeStream(stream, ControlEnvelope{
 		Type:    "header",
@@ -141,7 +147,7 @@ func (t *QUICTransport) ReconnectTCP(ctx context.Context, src NodeID, proto Prot
 			time.Sleep(200 * time.Millisecond)
 			continue
 		}
-		err = t.Forward(ctx, src, path, proto, downstream, remoteAddr)
+		err = t.Forward(ctx, src, path, nil, proto, downstream, remoteAddr, "")
 		if err == nil {
 			return nil
 		}
@@ -217,6 +223,7 @@ func (t *QUICTransport) handleStream(ctx context.Context, conn *quic.Conn, strea
 			stream.Close()
 			return
 		}
+		log.Printf("[quic] exit handle proto=%s remote=%s entry=%s client=%s", header.Proto, header.RemoteAddr, header.EntryNode, header.ClientAddr)
 		if err := t.handleTCPExit(ctx, session, newStreamConn(stream, conn), header.RemoteAddr, header.Compression, header.CompressMin); err != nil {
 			writeSignedEnvelopeStream(stream, ControlEnvelope{Type: "error", Error: err.Error()}, t.AuthKey)
 		}

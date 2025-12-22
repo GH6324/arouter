@@ -3,7 +3,8 @@ FROM golang:1.25-alpine AS build
 WORKDIR /src
 COPY . .
 ARG BUILD_VERSION=dev
-RUN go build -ldflags "-X main.buildVersion=${BUILD_VERSION}" -o /out/arouter ./cmd/controller
+RUN BUILD_VERSION="${BUILD_VERSION:-$(cat VERSION 2>/dev/null || echo dev)}" \
+  && go build -ldflags "-X main.buildVersion=${BUILD_VERSION}" -o /out/arouter ./cmd/controller
 
 # Runtime stage
 FROM alpine:3.23

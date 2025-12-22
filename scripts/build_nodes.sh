@@ -6,6 +6,11 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT_DIR="${ROOT_DIR}/cmd/controller/dist"
 PKG="${ROOT_DIR}"
+if [ -z "${VERSION:-}" ] && [ -f "${ROOT_DIR}/VERSION" ]; then
+  VERSION="$(cat "${ROOT_DIR}/VERSION" | tr -d ' \t\r\n')"
+fi
+VERSION="${VERSION:-$(TZ=Asia/Shanghai date +v%Y%m%d%H%M)}"
+LD_FLAGS="-s -w -X main.buildVersion=${VERSION}"
 
 mkdir -p "${OUT_DIR}"
 
@@ -19,9 +24,9 @@ targets=(
 for t in "${targets[@]}"; do
   read -r GOOS GOARCH <<<"${t}"
   out="${OUT_DIR}/arouter-${GOOS}-${GOARCH}"
-  echo "==> Building ${out}"
+  echo "==> Building ${out} (version ${VERSION})"
   env CGO_ENABLED=0 GOOS="${GOOS}" GOARCH="${GOARCH}" \
-    go build -trimpath -ldflags="-s -w" -o "${out}" "${PKG}"
+    go build -trimpath -ldflags="${LD_FLAGS}" -o "${out}" "${PKG}"
 done
 
 echo "Done. Binaries are in ${OUT_DIR}"

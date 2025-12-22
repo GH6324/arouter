@@ -22,6 +22,8 @@ TOKEN="$(cat ${INSTALL_DIR}/.token 2>/dev/null || true)"
 if [ -n "${TOKEN_OVERRIDE}" ]; then TOKEN="${TOKEN_OVERRIDE}"; fi
 
 TMP=$(mktemp)
+TMP_NORM=$(mktemp)
+CUR_NORM=$(mktemp)
 if [ -n "${TOKEN}" ]; then
   CURL_CMD=(curl -v -fsSL --connect-timeout 10 --max-time 30 -H "Authorization: Bearer ${TOKEN}" "${CONFIG_URL}")
 else
@@ -29,7 +31,25 @@ else
 fi
 
 if "${CURL_CMD[@]}" -o "$TMP"; then
-  if ! cmp -s "$TMP" "${INSTALL_DIR}/config.json"; then
+  python3 - <<'PY' "$TMP" "$TMP_NORM"
+import json, sys
+src, dst = sys.argv[1], sys.argv[2]
+with open(src, "r", encoding="utf-8") as f:
+    data = json.load(f)
+with open(dst, "w", encoding="utf-8") as f:
+    json.dump(data, f, sort_keys=True, separators=(",", ":"))
+PY
+  if [ -f "${INSTALL_DIR}/config.json" ]; then
+    python3 - <<'PY' "${INSTALL_DIR}/config.json" "$CUR_NORM"
+import json, sys
+src, dst = sys.argv[1], sys.argv[2]
+with open(src, "r", encoding="utf-8") as f:
+    data = json.load(f)
+with open(dst, "w", encoding="utf-8") as f:
+    json.dump(data, f, sort_keys=True, separators=(",", ":"))
+PY
+  fi
+  if [ ! -f "$CUR_NORM" ] || ! cmp -s "$TMP_NORM" "$CUR_NORM"; then
     echo "[config-sync] config changed, updating and restarting..."
     mv "$TMP" "${INSTALL_DIR}/config.json"
     if command -v systemctl >/dev/null 2>&1; then
@@ -47,3 +67,5 @@ else
   echo "[config-sync] fetch failed: CONFIG_URL=${CONFIG_URL}"
   rm -f "$TMP"
 fi
+
+rm -f "$TMP_NORM" "$CUR_NORM" 2>/dev/null || true

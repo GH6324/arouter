@@ -263,6 +263,52 @@ body {
   margin: 0 auto;
 }
 
+.return-info-card {
+  display: grid;
+  gap: 6px;
+  padding: 8px 10px;
+  border-radius: 12px;
+  border: 1px solid rgba(60, 60, 67, 0.12);
+  background: rgba(255, 255, 255, 0.6);
+  box-shadow: 0 4px 10px rgba(15, 23, 42, 0.04);
+}
+
+.diag-report-list {
+  display: grid;
+  gap: 12px;
+  max-height: 420px;
+  overflow: auto;
+  padding-right: 6px;
+}
+
+.diag-report-card .ant-card-body {
+  background: rgba(255, 255, 255, 0.7);
+}
+
+.diag-node-fail {
+  border-color: rgba(220, 38, 38, 0.35);
+  box-shadow: 0 6px 16px rgba(220, 38, 38, 0.15);
+}
+
+.diag-event-list {
+  display: grid;
+  gap: 6px;
+  padding-left: 6px;
+}
+
+.diag-link-summary {
+  display: grid;
+  gap: 4px;
+  padding: 6px 8px;
+  border-radius: 10px;
+  background: rgba(15, 23, 42, 0.04);
+}
+
+.diag-event-fail {
+  color: #dc2626;
+  font-weight: 600;
+}
+
 .node-list-viewport {
   position: relative;
 }

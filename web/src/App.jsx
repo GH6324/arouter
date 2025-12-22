@@ -26,6 +26,7 @@ import {
   Grid,
   Typography,
   Badge,
+  Checkbox,
 } from 'antd';
 import { api, API_BASE, joinUrl } from './api';
 import './App.css';
@@ -120,6 +121,28 @@ const loadColor = (percent = 0) => {
   if (percent >= 50) return { '0%': '#0a66ff', '100%': '#22c55e' };
   return '#0a66ff';
 };
+const normalizeTimestamp = (ts) => {
+  if (!ts) return 0;
+  if (typeof ts === 'number') {
+    return ts < 1e12 ? ts * 1000 : ts;
+  }
+  const t = new Date(ts).getTime();
+  return t < 1e12 && t > 0 ? t * 1000 : t;
+};
+const formatRelativeTime = (ts) => {
+  if (!ts) return '-';
+  const t = normalizeTimestamp(ts);
+  if (!t) return '-';
+  const diff = Math.max(0, Date.now() - t);
+  const sec = Math.floor(diff / 1000);
+  if (sec < 60) return `${sec}秒前`;
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min}分钟前`;
+  const hour = Math.floor(min / 60);
+  if (hour < 24) return `${hour}小时前`;
+  const day = Math.floor(hour / 24);
+  return `${day}天前`;
+};
 
 function NodeList({ onSelect, onShowInstall, refreshSignal }) {
   const [data, setData] = useState([]);
@@ -127,6 +150,18 @@ function NodeList({ onSelect, onShowInstall, refreshSignal }) {
   const [form] = Form.useForm();
   const screens = useBreakpoint();
   const [isScrolling, setIsScrolling] = useState(false);
+  const [diagOpen, setDiagOpen] = useState(false);
+  const [diagRunId, setDiagRunId] = useState('');
+  const [diagReports, setDiagReports] = useState([]);
+  const [diagMissing, setDiagMissing] = useState([]);
+  const [diagTargets, setDiagTargets] = useState([]);
+  const [diagFilter, setDiagFilter] = useState('');
+  const [diagLimit, setDiagLimit] = useState(200);
+  const [diagLoading, setDiagLoading] = useState(false);
+  const [endpointOpen, setEndpointOpen] = useState(false);
+  const [endpointLoading, setEndpointLoading] = useState(false);
+  const [endpointResults, setEndpointResults] = useState([]);
+  const [endpointRunId, setEndpointRunId] = useState('');
 
   const load = async () => {
     if (document.hidden || isScrolling) return;
@@ -160,6 +195,44 @@ function NodeList({ onSelect, onShowInstall, refreshSignal }) {
       if (t) window.clearTimeout(t);
     };
   }, []);
+
+  const openDiag = () => {
+    const online = data.filter((n) => isOnline(n.last_seen_at)).map((n) => n.name);
+    setDiagTargets(online);
+    setDiagOpen(true);
+  };
+
+  const fetchDiag = async (runId) => {
+    if (!runId) return;
+    setDiagLoading(true);
+    try {
+      const res = await api('GET', `/api/diag?run_id=${encodeURIComponent(runId)}`);
+      setDiagReports(res.reports || []);
+      setDiagMissing(res.missing || []);
+    } catch (e) {
+      message.error(e.message);
+    }
+    setDiagLoading(false);
+  };
+
+  useEffect(() => {
+    if (!diagOpen || !diagRunId) return;
+    const t = setInterval(() => fetchDiag(diagRunId), 2000);
+    return () => clearInterval(t);
+  }, [diagOpen, diagRunId]);
+
+  useEffect(() => {
+    if (!endpointOpen || !endpointRunId) return;
+    const t = setInterval(async () => {
+      try {
+        const res = await api('GET', `/api/endpoint-check?run_id=${encodeURIComponent(endpointRunId)}`);
+        setEndpointResults(res.results || []);
+      } catch (e) {
+        message.error(e.message);
+      }
+    }, 2000);
+    return () => clearInterval(t);
+  }, [endpointOpen, endpointRunId]);
 
   const columns = useMemo(() => {
     if (screens.xl) return 4;
@@ -229,7 +302,44 @@ function NodeList({ onSelect, onShowInstall, refreshSignal }) {
           </Col>
         </Row>
       </Card>
-      <Card className="page-card" title="节点列表">
+      <Card
+        className="page-card"
+        title="节点列表"
+        extra={
+          <Space>
+            <Button onClick={openDiag}>诊断采集</Button>
+            <Button
+              onClick={async () => {
+                try {
+                  const res = await api('POST', '/api/peers/auto', {});
+                  message.success(`已批量配置对端：新增${res.created || 0}，补全${res.updated || 0}`);
+                  load();
+                } catch (e) {
+                  message.error(e.message);
+                }
+              }}
+            >
+              一键配置对端
+            </Button>
+            <Button
+              onClick={async () => {
+                setEndpointOpen(true);
+                setEndpointLoading(true);
+                try {
+                  const res = await api('POST', '/api/endpoint-check/run', {});
+                  setEndpointRunId(res.run_id || '');
+                  setEndpointResults([]);
+                } catch (e) {
+                  message.error(e.message);
+                }
+                setEndpointLoading(false);
+              }}
+            >
+              Endpoint检测
+            </Button>
+          </Space>
+        }
+      >
         <div className="node-list-viewport">
           <WindowScroller scrollElement={window}>
             {({ height, isScrolling, onChildScroll, scrollTop }) => (
@@ -361,6 +471,209 @@ function NodeList({ onSelect, onShowInstall, refreshSignal }) {
           </WindowScroller>
         </div>
       </Card>
+      <Modal
+        open={endpointOpen}
+        onCancel={() => setEndpointOpen(false)}
+        onOk={() => setEndpointOpen(false)}
+        title="Endpoint 健康检测"
+        width={900}
+        okText="关闭"
+      >
+        <Space direction="vertical" size={12} style={{ width: '100%' }}>
+          <Space>
+            <Button
+              loading={endpointLoading}
+              onClick={async () => {
+                setEndpointLoading(true);
+                try {
+                  const res = await api('POST', '/api/endpoint-check/run', {});
+                  setEndpointRunId(res.run_id || '');
+                  setEndpointResults([]);
+                } catch (e) {
+                  message.error(e.message);
+                }
+                setEndpointLoading(false);
+              }}
+            >
+              重新检测
+            </Button>
+            <Button
+              disabled={!endpointRunId}
+              onClick={async () => {
+                try {
+                  const res = await api('GET', `/api/endpoint-check?run_id=${encodeURIComponent(endpointRunId)}`);
+                  setEndpointResults(res.results || []);
+                } catch (e) {
+                  message.error(e.message);
+                }
+              }}
+            >
+              刷新
+            </Button>
+            <Button
+              disabled={!endpointResults.length}
+              onClick={async () => {
+                const text = endpointResults
+                  .map((r) => `${r.node} -> ${r.peer} ${r.endpoint} ok=${r.ok} rtt=${r.rtt_ms || 0}ms ${r.status || ''} ${r.error || ''}`.trim())
+                  .join('\n');
+                try {
+                  await navigator.clipboard.writeText(text);
+                  message.success('已复制检测结果');
+                } catch (e) {
+                  message.error('复制失败，请手动选择文本');
+                }
+              }}
+            >
+              复制结果
+            </Button>
+          </Space>
+          <Table
+            rowKey={(r) => `${r.node}-${r.peer}-${r.endpoint}`}
+            dataSource={endpointResults}
+            loading={endpointLoading}
+            pagination={{ pageSize: 8 }}
+            columns={[
+              { title: '节点', dataIndex: 'node' },
+              { title: 'Peer', dataIndex: 'peer' },
+              { title: 'Endpoint', dataIndex: 'endpoint' },
+              {
+                title: '状态',
+                render: (_, r) => (
+                  r.ok ? <Tag color="green">OK</Tag> : <Tag color="red">FAIL</Tag>
+                ),
+              },
+              { title: 'RTT', dataIndex: 'rtt_ms', render: (v) => (v ? `${v}ms` : '-') },
+              { title: 'HTTP', dataIndex: 'status' },
+              { title: '错误', dataIndex: 'error' },
+            ]}
+          />
+        </Space>
+      </Modal>
+      <Modal
+        open={diagOpen}
+        onCancel={() => setDiagOpen(false)}
+        onOk={() => setDiagOpen(false)}
+        title="诊断日志采集"
+        width={900}
+        okText="关闭"
+      >
+        <Space direction="vertical" size={12} style={{ width: '100%' }}>
+          <Row gutter={[12, 12]}>
+            <Col xs={24} md={12}>
+              <Text type="secondary">目标节点</Text>
+              <Checkbox.Group
+                style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 6 }}
+                value={diagTargets}
+                onChange={(vals) => setDiagTargets(vals)}
+              >
+                {(data || []).map((n) => (
+                  <Checkbox key={n.name} value={n.name}>
+                    {n.name}
+                  </Checkbox>
+                ))}
+              </Checkbox.Group>
+            </Col>
+            <Col xs={12} md={6}>
+              <Text type="secondary">行数</Text>
+              <Input
+                type="number"
+                min={50}
+                max={2000}
+                value={diagLimit}
+                onChange={(e) => setDiagLimit(Number(e.target.value || 0))}
+              />
+            </Col>
+            <Col xs={12} md={6}>
+              <Text type="secondary">过滤关键字</Text>
+              <Input value={diagFilter} onChange={(e) => setDiagFilter(e.target.value)} placeholder="可选" />
+            </Col>
+          </Row>
+          <Space>
+            <Button
+              type="primary"
+              loading={diagLoading}
+              onClick={async () => {
+                if (!diagTargets.length) {
+                  message.warning('请先选择节点');
+                  return;
+                }
+                setDiagLoading(true);
+                try {
+                  const res = await api('POST', '/api/diag/run', {
+                    nodes: diagTargets,
+                    limit: diagLimit,
+                    contains: diagFilter,
+                  });
+                  setDiagRunId(res.run_id || '');
+                  setDiagMissing(res.offline || []);
+                  setDiagReports([]);
+                  message.success(`已下发诊断到 ${res.sent?.length || 0} 个节点`);
+                  setTimeout(() => fetchDiag(res.run_id), 800);
+                } catch (e) {
+                  message.error(e.message);
+                }
+                setDiagLoading(false);
+              }}
+            >
+              开始采集
+            </Button>
+            <Button disabled={!diagRunId} onClick={() => fetchDiag(diagRunId)}>
+              刷新
+            </Button>
+            <Button
+              disabled={!diagReports.length}
+              onClick={async () => {
+                const text = diagReports
+                  .map((r) => `### ${r.node}\n${(r.lines || []).join('\n')}`)
+                  .join('\n\n');
+                try {
+                  await navigator.clipboard.writeText(text);
+                  message.success('已复制全部日志');
+                } catch (e) {
+                  message.error('复制失败，请手动选择文本');
+                }
+              }}
+            >
+              复制全部
+            </Button>
+          </Space>
+          {diagMissing.length > 0 && (
+            <Text type="secondary">未返回：{diagMissing.join(', ')}</Text>
+          )}
+          <div className="diag-report-list">
+            {(diagReports || []).map((r) => (
+              <Card
+                key={r.node}
+                size="small"
+                className="diag-report-card"
+                title={<Space><Tag color="blue">{r.node}</Tag><Text type="secondary">{r.at ? new Date(r.at).toLocaleString() : '-'}</Text></Space>}
+                extra={
+                  <Button
+                    size="small"
+                    onClick={async () => {
+                      const text = `### ${r.node}\n${(r.lines || []).join('\n')}`;
+                      try {
+                        await navigator.clipboard.writeText(text);
+                        message.success(`已复制 ${r.node}`);
+                      } catch (e) {
+                        message.error('复制失败，请手动选择文本');
+                      }
+                    }}
+                  >
+                    复制
+                  </Button>
+                }
+              >
+                <Input.TextArea
+                  value={(r.lines || []).join('\n')}
+                  rows={8}
+                  readOnly
+                />
+              </Card>
+            ))}
+          </div>
+        </Space>
+      </Modal>
       <Modal open={modalOpen} onCancel={() => setModalOpen(false)} onOk={onCreate} title="新建节点">
         <Form layout="vertical" form={form} initialValues={{ ws_listen: ":18080", metrics_listen: ":19090" }}>
           <Form.Item name="name" label="节点名称" rules={[{ required: true }]}><Input /></Form.Item>
@@ -382,6 +695,7 @@ function NodeList({ onSelect, onShowInstall, refreshSignal }) {
 
 function NodeDetail({ node, onBack, refreshList, onShowInstall }) {
   const [detail, setDetail] = useState(node);
+  const [updateStatus, setUpdateStatus] = useState(null);
   const [entryOpen, setEntryOpen] = useState(false);
   const [peerOpen, setPeerOpen] = useState(false);
   const [allNodes, setAllNodes] = useState([]);
@@ -403,6 +717,7 @@ function NodeDetail({ node, onBack, refreshList, onShowInstall }) {
   const load = async () => {
     try {
       setDetail(await api('GET', `/api/nodes/${node.id}`));
+      setUpdateStatus(await api('GET', `/api/nodes/${node.id}/update-status`));
       refreshList();
       setAllNodes(await api('GET', '/api/nodes'));
     } catch (e) {
@@ -529,6 +844,8 @@ function NodeDetail({ node, onBack, refreshList, onShowInstall }) {
     { title: '远端', dataIndex: 'remote' },
     { title: '优先级', dataIndex: 'priority' },
     { title: '路径', dataIndex: 'path', render: (p = []) => p.map((n) => <Tag key={n}>{n}</Tag>) },
+    { title: '回程路径', dataIndex: 'return_path', render: (p = []) => (p || []).map((n) => <Tag key={n}>{n}</Tag>) },
+    { title: '回程模式', render: (_, r) => ((r.return_path || []).length ? <Tag color="green">指定回程</Tag> : <Tag>自动回程</Tag>) },
     {
       title: '操作',
       render: (_, r) => (
@@ -570,6 +887,25 @@ function NodeDetail({ node, onBack, refreshList, onShowInstall }) {
           <Button onClick={() => onShowInstall(detail)}>安装脚本</Button>
           <Button
             onClick={() => {
+              Modal.confirm({
+                title: '确认触发强制更新？',
+                content: '节点将重新下载并替换二进制，随后自动重启。',
+                onOk: async () => {
+                  try {
+                    await api('POST', `/api/nodes/${detail.id}/force-update`);
+                    message.success('已触发强制更新');
+                    load();
+                  } catch (e) {
+                    message.error(e.message);
+                  }
+                },
+              });
+            }}
+          >
+            强制更新
+          </Button>
+          <Button
+            onClick={() => {
               editForm.setFieldsValue({
                 ws_listen: detail.ws_listen,
                 wss_listen: detail.wss_listen,
@@ -603,6 +939,43 @@ function NodeDetail({ node, onBack, refreshList, onShowInstall }) {
         <Descriptions.Item label="运行时长">{formatUptime(detail.uptime_sec || 0)}</Descriptions.Item>
         <Descriptions.Item label="网络累计">{`↑${formatBytes(detail.net_out_bytes || 0)} ↓${formatBytes(detail.net_in_bytes || 0)}`}</Descriptions.Item>
         <Descriptions.Item label="版本">{detail.node_version || '-'}</Descriptions.Item>
+        <Descriptions.Item label="更新状态">
+          {(() => {
+            if (!updateStatus) return '-';
+            const status = updateStatus.status || 'unknown';
+            const labelMap = {
+              in_progress: '更新中',
+              success: '更新成功',
+              failed: '更新失败',
+              skipped: '已是最新',
+            };
+            const colorMap = {
+              in_progress: 'blue',
+              success: 'green',
+              failed: 'red',
+              skipped: 'default',
+              unknown: 'default',
+            };
+            const label = labelMap[status] || '未知';
+            const tip = (
+              <div>
+                <div>版本：{updateStatus.version || '-'}</div>
+                <div>触发：{updateStatus.forced ? '强制' : '自动'}</div>
+                {updateStatus.reason ? <div>原因：{updateStatus.reason}</div> : null}
+              </div>
+            );
+            return (
+              <Tooltip title={tip}>
+                <Tag color={colorMap[status] || 'default'}>{label}</Tag>
+              </Tooltip>
+            );
+          })()}
+        </Descriptions.Item>
+        <Descriptions.Item label="更新结果时间">
+          {updateStatus && updateStatus.updated_at
+            ? <Tooltip title={new Date(updateStatus.updated_at).toLocaleString()}>{formatRelativeTime(updateStatus.updated_at)}</Tooltip>
+            : '-'}
+        </Descriptions.Item>
         <Descriptions.Item label="最后心跳">{detail.last_seen_at ? new Date(detail.last_seen_at).toLocaleString() : '-'}</Descriptions.Item>
       </Descriptions>
       <Space style={{ marginTop: 8, marginBottom: 8 }} wrap>
@@ -664,7 +1037,22 @@ function NodeDetail({ node, onBack, refreshList, onShowInstall }) {
             label: '对端',
             children: (
               <>
-                <Button type="primary" onClick={() => setPeerOpen(true)} style={{ marginBottom: 8 }}>添加对端</Button>
+                <Space style={{ marginBottom: 8 }}>
+                  <Button type="primary" onClick={() => setPeerOpen(true)}>添加对端</Button>
+                  <Button
+                    onClick={async () => {
+                      try {
+                        const res = await api('POST', `/api/nodes/${detail.id}/peers/auto`, {});
+                        message.success(`已生成对端：新增${res.created || 0}，补全${res.updated || 0}`);
+                        load();
+                      } catch (e) {
+                        message.error(e.message);
+                      }
+                    }}
+                  >
+                    自动配置对端
+                  </Button>
+                </Space>
                 <Table rowKey="id" dataSource={detail.peers || []} columns={peerCols} pagination={false} />
               </>
             ),
@@ -857,6 +1245,19 @@ function NodeDetail({ node, onBack, refreshList, onShowInstall }) {
               optionFilterProp="label"
             />
           </Form.Item>
+          <Form.Item
+            name="return_path"
+            label="回程路径节点顺序 (可选)"
+            tooltip="从出口回到入口的节点顺序，需以出口开头、入口结尾"
+          >
+            <Select
+              mode="multiple"
+              placeholder="从出口回到入口的节点顺序"
+              options={(allNodes || []).map((n) => ({ label: n.name, value: n.name }))}
+              showSearch
+              optionFilterProp="label"
+            />
+          </Form.Item>
           <Divider>可选：入口/出口 IP 参考</Divider>
           <Space direction="vertical" style={{ width: '100%' }}>
             <div>
@@ -907,6 +1308,19 @@ function NodeDetail({ node, onBack, refreshList, onShowInstall }) {
               optionFilterProp="label"
             />
           </Form.Item>
+          <Form.Item
+            name="return_path"
+            label="回程路径节点顺序 (可选)"
+            tooltip="从出口回到入口的节点顺序，需以出口开头、入口结尾"
+          >
+            <Select
+              mode="multiple"
+              placeholder="从出口回到入口的节点顺序"
+              options={(allNodes || []).map((n) => ({ label: n.name, value: n.name }))}
+              showSearch
+              optionFilterProp="label"
+            />
+          </Form.Item>
         </Form>
       </Modal>
     </Card>
@@ -917,12 +1331,20 @@ function RouteList({ settings }) {
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(false);
   const [onlineMap, setOnlineMap] = useState(new Map());
+  const [diagOpen, setDiagOpen] = useState(false);
+  const [diagRunId, setDiagRunId] = useState('');
+  const [diagEvents, setDiagEvents] = useState([]);
+  const [diagReports, setDiagReports] = useState([]);
+  const [diagMissing, setDiagMissing] = useState([]);
+  const [diagRoute, setDiagRoute] = useState(null);
+  const [diagLoading, setDiagLoading] = useState(false);
   const load = async () => {
     setLoading(true);
     try {
-      const [nodes, probes] = await Promise.all([
+      const [nodes, probes, returnStatus] = await Promise.all([
         api('GET', '/api/nodes'),
         api('GET', '/api/probes'),
+        api('GET', '/api/return-status'),
       ]);
       const online = new Map();
       (nodes || []).forEach((n) => {
@@ -933,11 +1355,23 @@ function RouteList({ settings }) {
       (probes || []).forEach((p) => {
         probeMap.set(`${p.node}::${p.route}`, p);
       });
+      const statusMap = new Map();
+      (returnStatus || []).forEach((st) => {
+        const key = `${st.entry}::${st.route}::${st.exit}`;
+        const prev = statusMap.get(key);
+        const nextTs = new Date(st.updated_at || 0).getTime();
+        const prevTs = prev ? new Date(prev.updated_at || 0).getTime() : 0;
+        if (!prev || nextTs > prevTs) {
+          statusMap.set(key, st);
+        }
+      });
       const r = [];
       (nodes || []).forEach((n) => {
         (n.routes || []).forEach((rt) => {
           const key = `${n.name}::${rt.name}`;
           const pb = probeMap.get(key);
+          const stKey = `${n.name}::${rt.name}::${rt.exit}`;
+          const st = statusMap.get(stKey) || null;
           r.push({
             key,
             node: n.name,
@@ -945,6 +1379,8 @@ function RouteList({ settings }) {
             exit: rt.exit,
             priority: rt.priority,
             path: rt.path || [],
+            return_path: rt.return_path || [],
+            return_status: st,
             probe: pb || null,
           });
         });
@@ -960,12 +1396,72 @@ function RouteList({ settings }) {
     const t = setInterval(load, 10000);
     return () => clearInterval(t);
   }, []);
+
+  const fetchDiag = async (runId) => {
+    if (!runId) return;
+    setDiagLoading(true);
+    try {
+      const [trace, logs] = await Promise.all([
+        api('GET', `/api/route-diag?run_id=${encodeURIComponent(runId)}`),
+        api('GET', `/api/diag?run_id=${encodeURIComponent(runId)}`),
+      ]);
+      setDiagEvents(trace.events || []);
+      setDiagReports(logs.reports || []);
+      setDiagMissing(logs.missing || []);
+    } catch (e) {
+      message.error(e.message);
+    }
+    setDiagLoading(false);
+  };
+
+  useEffect(() => {
+    if (!diagOpen || !diagRunId) return;
+    const t = setInterval(() => fetchDiag(diagRunId), 2000);
+    return () => clearInterval(t);
+  }, [diagOpen, diagRunId]);
   const cols = [
     { title: '节点', dataIndex: 'node' },
     { title: '线路', dataIndex: 'route' },
     { title: '出口', dataIndex: 'exit' },
     { title: '优先级', dataIndex: 'priority' },
     { title: '路径', dataIndex: 'path', render: (p = []) => (p || []).map((x) => <Tag key={x}>{x}</Tag>) },
+    {
+      title: '回程信息',
+      render: (_, r) => {
+        const st = r.return_status;
+        const modeTag = (r.return_path || []).length ? <Tag color="green">指定回程</Tag> : <Tag>自动回程</Tag>;
+        let statusTag = <Tag>未上报</Tag>;
+        if (st) {
+          const detail = `pending=${st.pending || 0}, ready_total=${st.ready_total || 0}, fail_total=${st.fail_total || 0}${st.fail_reason ? `, reason=${st.fail_reason}` : ''}`;
+          if (st.pending > 0) {
+            statusTag = <Tooltip title={detail}><Tag color="gold">切换中</Tag></Tooltip>;
+          } else if ((st.fail_at || 0) > (st.ready_at || 0)) {
+            statusTag = <Tooltip title={detail}><Tag color="red">切换失败</Tag></Tooltip>;
+          } else if (st.ready_total > 0) {
+            statusTag = (
+              <Tooltip title={detail}>
+                {st.auto ? <Tag color="blue">已切换(自动)</Tag> : <Tag color="green">已切换(指定)</Tag>}
+              </Tooltip>
+            );
+          } else {
+            statusTag = <Tooltip title={detail}><Tag>未切换</Tag></Tooltip>;
+          }
+        }
+        const ts = st
+          ? (normalizeTimestamp(st.fail_at) || normalizeTimestamp(st.ready_at) || normalizeTimestamp(st.updated_at))
+          : 0;
+        const timeTag = ts
+          ? <Tooltip title={new Date(ts).toLocaleString()}>{formatRelativeTime(ts)}</Tooltip>
+          : '-';
+        return (
+          <div className="return-info-card">
+            <div>{modeTag}</div>
+            <div>{statusTag}</div>
+            <div style={{ color: 'rgba(60, 60, 67, 0.68)', fontSize: 12 }}>{timeTag}</div>
+          </div>
+        );
+      },
+    },
     {
       title: '延迟(ms)',
       render: (_, r) => {
@@ -991,6 +1487,38 @@ function RouteList({ settings }) {
         if (!pb || !pb.updated_at) return '-';
         return new Date(pb.updated_at).toLocaleString();
       },
+    },
+    {
+      title: '操作',
+      render: (_, r) => (
+        <Button
+          size="small"
+          disabled={!onlineMap.get(r.node)}
+              onClick={async () => {
+                const target = settings?.http_probe_url || 'https://www.google.com/generate_204';
+                try {
+                  setDiagRoute(r);
+                  const res = await api('POST', '/api/route-diag/run', {
+                node: r.node,
+                route: r.route,
+                path: r.path || [],
+                return_path: r.return_path || [],
+                target,
+              });
+                  setDiagRunId(res.run_id || '');
+                  setDiagEvents([]);
+                  setDiagReports([]);
+                  setDiagMissing(res.offline || []);
+                  setDiagOpen(true);
+                  setTimeout(() => fetchDiag(res.run_id), 800);
+                } catch (e) {
+                  message.error(e.message);
+                }
+          }}
+        >
+          诊断
+        </Button>
+      ),
     },
   ];
   const triggerAllTests = async () => {
@@ -1028,9 +1556,168 @@ function RouteList({ settings }) {
     }
   };
   return (
-    <Card className="page-card" title="线路列表（含端到端延迟）" extra={<Button onClick={triggerAllTests}>测试全部</Button>}>
-      <Table rowKey="key" dataSource={rows} columns={cols} loading={loading} pagination={false} />
-    </Card>
+    <>
+      <Card className="page-card" title="线路列表（含端到端延迟）" extra={<Button onClick={triggerAllTests}>测试全部</Button>}>
+        <Table rowKey="key" dataSource={rows} columns={cols} loading={loading} pagination={false} />
+      </Card>
+      <Modal
+        open={diagOpen}
+        onCancel={() => setDiagOpen(false)}
+        onOk={() => setDiagOpen(false)}
+        width={900}
+        okText="关闭"
+        title={diagRoute ? `线路诊断：${diagRoute.node} / ${diagRoute.route}` : '线路诊断'}
+      >
+        <Space direction="vertical" size={10} style={{ width: '100%' }}>
+          <Space>
+            <Button
+              disabled={!diagRunId}
+              onClick={async () => {
+                try {
+                  await api('POST', '/api/diag/refresh', {
+                    run_id: diagRunId,
+                    limit: 400,
+                    contains: '',
+                  });
+                } catch (e) {
+                  message.error(e.message);
+                }
+                fetchDiag(diagRunId);
+              }}
+            >
+              刷新
+            </Button>
+            <Button
+              disabled={!diagEvents.length}
+              onClick={async () => {
+                const text = [...diagEvents]
+                  .sort((a, b) => (a.at || 0) - (b.at || 0))
+                  .map((e) => `${new Date(e.at || 0).toLocaleTimeString()} [${e.node}] ${e.stage} ${e.detail || ''}`.trim())
+                  .join('\n');
+                try {
+                  await navigator.clipboard.writeText(text);
+                  message.success('已复制诊断日志');
+                } catch (e) {
+                  message.error('复制失败，请手动选择文本');
+                }
+              }}
+            >
+              复制步骤
+            </Button>
+            <Button
+              disabled={!diagReports.length}
+              onClick={async () => {
+                const text = diagReports
+                  .map((r) => `### ${r.node}\n${(r.lines || []).join('\n')}`)
+                  .join('\n\n');
+                try {
+                  await navigator.clipboard.writeText(text);
+                  message.success('已复制节点日志');
+                } catch (e) {
+                  message.error('复制失败，请手动选择文本');
+                }
+              }}
+            >
+              复制节点日志
+            </Button>
+          </Space>
+          {diagMissing.length > 0 && (
+            <Text type="secondary">未返回：{diagMissing.join(', ')}</Text>
+          )}
+          <div className="diag-report-list">
+            {(() => {
+              const groups = new Map();
+              (diagEvents || []).forEach((e) => {
+                if (!groups.has(e.node)) groups.set(e.node, []);
+                groups.get(e.node).push(e);
+              });
+              const isReturnStage = (stage = '') => {
+                const s = stage.toLowerCase();
+                return s.includes('return') || s.includes('ack');
+              };
+              const isFailStage = (e) => /fail|error/i.test(e.stage || '') || /timeout/i.test(e.detail || '');
+              return Array.from(groups.entries()).map(([node, items]) => {
+                items.sort((a, b) => (a.at || 0) - (b.at || 0));
+                const hasFail = items.some((e) => isFailStage(e));
+                const forward = items.filter((e) => !isReturnStage(e.stage));
+                const ret = items.filter((e) => isReturnStage(e.stage));
+                const inbound = [...items].reverse().find((e) => e.stage === 'links_inbound');
+                const outbound = [...items].reverse().find((e) => e.stage === 'links_outbound');
+                return (
+                  <Card
+                    key={node}
+                    size="small"
+                    className={`diag-report-card ${hasFail ? 'diag-node-fail' : ''}`}
+                    title={<Space><Tag color={hasFail ? 'red' : 'blue'}>{node}</Tag></Space>}
+                    extra={
+                      <Button
+                        size="small"
+                        onClick={async () => {
+                          const text = `### ${node}\n${items
+                            .map((e) => `${new Date(e.at || 0).toLocaleTimeString()} ${e.stage} ${e.detail || ''}`.trim())
+                            .join('\n')}`;
+                          try {
+                            await navigator.clipboard.writeText(text);
+                            message.success(`已复制 ${node}`);
+                          } catch (e) {
+                            message.error('复制失败，请手动选择文本');
+                          }
+                        }}
+                    >
+                      复制
+                    </Button>
+                  }
+                >
+                  <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                    <div className="diag-link-summary">
+                      <Text type="secondary">入站：{inbound?.detail || '-'}</Text>
+                      <Text type="secondary">出站：{outbound?.detail || '-'}</Text>
+                    </div>
+                    <Text type="secondary">去程</Text>
+                      <div className="diag-event-list">
+                        {(forward.length ? forward : items).map((e, idx) => (
+                          <Text key={`${node}-f-${e.at}-${idx}`} className={isFailStage(e) ? 'diag-event-fail' : ''}>
+                            {e.at ? new Date(e.at).toLocaleTimeString() : '--'} {e.stage}
+                            {e.detail ? ` - ${e.detail}` : ''}
+                          </Text>
+                        ))}
+                      </div>
+                      <Text type="secondary">回程</Text>
+                      <div className="diag-event-list">
+                        {(ret.length ? ret : []).map((e, idx) => (
+                          <Text key={`${node}-r-${e.at}-${idx}`} className={isFailStage(e) ? 'diag-event-fail' : ''}>
+                            {e.at ? new Date(e.at).toLocaleTimeString() : '--'} {e.stage}
+                            {e.detail ? ` - ${e.detail}` : ''}
+                          </Text>
+                        ))}
+                        {!ret.length && <Text type="secondary">无回程事件</Text>}
+                      </div>
+                    </Space>
+                  </Card>
+                );
+              });
+            })()}
+          </div>
+          <Divider>节点日志</Divider>
+          <div className="diag-report-list">
+            {(diagReports || []).map((r) => (
+              <Card
+                key={r.node}
+                size="small"
+                className="diag-report-card"
+                title={<Space><Tag color="blue">{r.node}</Tag></Space>}
+              >
+                <Input.TextArea
+                  value={(r.lines || []).join('\n')}
+                  rows={8}
+                  readOnly
+                />
+              </Card>
+            ))}
+          </div>
+        </Space>
+      </Modal>
+    </>
   );
 }
 

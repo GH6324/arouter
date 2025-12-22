@@ -14,6 +14,14 @@ OUT_DIR="dist"
 rm -rf "$OUT_DIR"
 mkdir -p "$OUT_DIR"
 
+# Persist VERSION so docker/binary builds share the same tag.
+echo "$VERSION" > VERSION
+
+# Build embedded node binaries for controller downloads.
+echo "Building embedded node binaries..."
+VERSION="${VERSION}" ./scripts/build_nodes.sh
+cp -f cmd/controller/dist/arouter-* "$OUT_DIR"/
+
 # Build front-end and prepare embed assets
 echo "Building front-end..."
 (cd web && npm install && npm run build)
@@ -25,10 +33,6 @@ tar -czf "${OUT_DIR}/web-dist.tar.gz" -C cmd/controller/web dist
 
 build_one() {
   OS=$1; ARCH=$2
-  BIN="${OUT_DIR}/arouter-${OS}-${ARCH}"
-  echo "Building node binary $BIN"
-  GOOS=$OS GOARCH=$ARCH CGO_ENABLED=0 go build -ldflags "-X main.buildVersion=${VERSION}" -o "$BIN" .
-
   CTRL_BIN="${OUT_DIR}/arouter-controller-${OS}-${ARCH}"
   echo "Building controller binary $CTRL_BIN"
   GOOS=$OS GOARCH=$ARCH CGO_ENABLED=0 go build -ldflags "-X main.buildVersion=${VERSION}" -o "$CTRL_BIN" ./cmd/controller

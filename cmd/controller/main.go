@@ -5,6 +5,7 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"errors"
 	"database/sql/driver"
 	"embed"
 	_ "embed"
@@ -109,6 +110,122 @@ type LinkMetricsJSON struct {
 	RTTms     int64     `json:"rtt_ms"`
 	Loss      float64   `json:"loss"`
 	UpdatedAt time.Time `json:"updated_at"`
+}
+
+type ReturnRouteStatus struct {
+	ID         uint      `gorm:"primaryKey" json:"id"`
+	CreatedAt  time.Time `json:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
+	Node       string    `gorm:"uniqueIndex:idx_return_route" json:"node"`
+	Route      string    `gorm:"uniqueIndex:idx_return_route" json:"route"`
+	Entry      string    `gorm:"uniqueIndex:idx_return_route" json:"entry"`
+	Exit       string    `gorm:"uniqueIndex:idx_return_route" json:"exit"`
+	Auto       bool      `gorm:"uniqueIndex:idx_return_route" json:"auto"`
+	Pending    int64     `json:"pending"`
+	ReadyTotal int64     `json:"ready_total"`
+	ReadyAt    int64     `json:"ready_at"`
+	FailTotal  int64     `json:"fail_total"`
+	FailAt     int64     `json:"fail_at"`
+	FailReason string    `json:"fail_reason"`
+}
+
+type ReturnStatJSON struct {
+	Entry      string `json:"entry"`
+	Exit       string `json:"exit"`
+	Route      string `json:"route"`
+	Auto       bool   `json:"auto"`
+	Pending    int64  `json:"pending"`
+	ReadyTotal int64  `json:"ready_total"`
+	ReadyAt    int64  `json:"ready_at"`
+	FailTotal  int64  `json:"fail_total"`
+	FailAt     int64  `json:"fail_at"`
+	FailReason string `json:"fail_reason"`
+}
+
+type DiagReport struct {
+	RunID  string    `json:"run_id"`
+	Node   string    `json:"node"`
+	At     time.Time `json:"at"`
+	Lines  []string  `json:"lines"`
+	Limit  int       `json:"limit"`
+	Filter string    `json:"filter,omitempty"`
+}
+
+type diagRun struct {
+	RunID     string
+	CreatedAt time.Time
+	Nodes     []string
+	Reports   map[string]DiagReport
+}
+
+var (
+	diagMu       sync.Mutex
+	diagRuns     = make(map[string]*diagRun)
+	diagRunOrder []string
+)
+
+type DiagTraceEvent struct {
+	RunID      string   `json:"run_id"`
+	Route      string   `json:"route"`
+	Node       string   `json:"node"`
+	Stage      string   `json:"stage"`
+	Detail     string   `json:"detail,omitempty"`
+	Session    string   `json:"session,omitempty"`
+	Path       []string `json:"path,omitempty"`
+	ReturnPath []string `json:"return_path,omitempty"`
+	At         int64    `json:"at"`
+}
+
+type diagTraceRun struct {
+	RunID     string
+	CreatedAt time.Time
+	Events    []DiagTraceEvent
+}
+
+var (
+	diagTraceMu   sync.Mutex
+	diagTraceRuns = make(map[string]*diagTraceRun)
+)
+
+type EndpointCheckResult struct {
+	Node     string `json:"node"`
+	Peer     string `json:"peer"`
+	Endpoint string `json:"endpoint"`
+	OK       bool   `json:"ok"`
+	RTTMs    int64  `json:"rtt_ms"`
+	Status   string `json:"status,omitempty"`
+	Error    string `json:"error,omitempty"`
+}
+
+type endpointCheckRun struct {
+	RunID     string
+	CreatedAt time.Time
+	Nodes     []string
+	Results   []EndpointCheckResult
+}
+
+var (
+	endpointCheckMu   sync.Mutex
+	endpointCheckRuns = make(map[string]*endpointCheckRun)
+)
+
+type NodeUpdateStatus struct {
+	ID        uint      `gorm:"primaryKey" json:"id"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Node      string    `gorm:"uniqueIndex" json:"node"`
+	Status    string    `json:"status"`
+	Version   string    `json:"version"`
+	Reason    string    `json:"reason"`
+	Forced    bool      `json:"forced"`
+}
+
+type UpdateStatusJSON struct {
+	Node    string `json:"node"`
+	Status  string `json:"status"`
+	Version string `json:"version"`
+	Reason  string `json:"reason"`
+	Forced  bool   `json:"forced"`
 }
 
 type Entry struct {
@@ -329,6 +446,7 @@ type RoutePlan struct {
 	Remote    string     `json:"remote"`
 	Priority  int        `json:"priority"`
 	Path      StringList `json:"path"`
+	ReturnPath StringList `json:"return_path"`
 	CreatedAt time.Time  `json:"created_at"`
 	UpdatedAt time.Time  `json:"updated_at"`
 }
@@ -461,6 +579,7 @@ type RouteConfig struct {
 	Remote   string   `json:"remote,omitempty"`
 	Priority int      `json:"priority"`
 	Path     []string `json:"path"`
+	ReturnPath []string `json:"return_path,omitempty"`
 }
 
 type EntryConfig struct {
@@ -500,7 +619,8 @@ func main() {
 	maybeCheckpoint(db)
 	auth := NewGlobalAuth(envOrDefault("AUTH_KEY_FILE", "/app/data/auth.key"))
 	globalKey := auth.LoadOrCreate()
-	if err := db.AutoMigrate(&Node{}, &Entry{}, &Peer{}, &LinkMetric{}, &RoutePlan{}, &Setting{}, &User{}, &RouteProbe{}); err != nil {
+	buildVersion = canonicalVersion(buildVersion)
+	if err := db.AutoMigrate(&Node{}, &Entry{}, &Peer{}, &LinkMetric{}, &RoutePlan{}, &Setting{}, &User{}, &RouteProbe{}, &ReturnRouteStatus{}, &NodeUpdateStatus{}); err != nil {
 		log.Fatalf("migrate failed: %v", err)
 	}
 	ensureColumns(db)
@@ -868,6 +988,24 @@ func main() {
 		}
 		c.JSON(http.StatusOK, node)
 	})
+	authGroup.GET("/nodes/:id/update-status", func(c *gin.Context) {
+		id := c.Param("id")
+		var node Node
+		if err := db.First(&node, id).Error; err != nil {
+			c.String(http.StatusNotFound, "not found")
+			return
+		}
+		var status NodeUpdateStatus
+		if err := db.Where("node = ?", node.Name).First(&status).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				c.JSON(http.StatusOK, nil)
+				return
+			}
+			c.String(http.StatusInternalServerError, "query failed")
+			return
+		}
+		c.JSON(http.StatusOK, status)
+	})
 	authGroup.PUT("/nodes/:id", func(c *gin.Context) {
 		id := c.Param("id")
 		var node Node
@@ -914,6 +1052,22 @@ func main() {
 		db.Delete(&RoutePlan{}, "node_id = ?", id)
 		db.Delete(&Node{}, "id = ?", id)
 		c.Status(http.StatusNoContent)
+	})
+	authGroup.POST("/nodes/:id/force-update", func(c *gin.Context) {
+		id := c.Param("id")
+		var node Node
+		if err := db.First(&node, id).Error; err != nil {
+			c.String(http.StatusNotFound, "not found")
+			return
+		}
+		if err := hub.sendCommand(node.Name, map[string]any{
+			"type": "force_update",
+			"data": map[string]any{},
+		}); err != nil {
+			c.String(http.StatusServiceUnavailable, "node offline or send failed: %v", err)
+			return
+		}
+		c.Status(http.StatusAccepted)
 	})
 	authGroup.POST("/nodes/:id/entries", func(c *gin.Context) {
 		id := c.Param("id")
@@ -968,6 +1122,221 @@ func main() {
 			return
 		}
 		c.JSON(http.StatusCreated, req)
+	})
+	authGroup.POST("/nodes/:id/peers/auto", func(c *gin.Context) {
+		id := c.Param("id")
+		var node Node
+		if err := db.Preload("Routes").Preload("Peers").First(&node, id).Error; err != nil {
+			c.String(http.StatusNotFound, "not found")
+			return
+		}
+		var allNodes []Node
+		db.Find(&allNodes)
+		pubMap := make(map[string][]string, len(allNodes))
+		selfHasV6 := false
+		for _, ip := range node.PublicIPs {
+			if strings.Contains(ip, ":") {
+				selfHasV6 = true
+				break
+			}
+		}
+		for _, n := range allNodes {
+			if len(n.PublicIPs) > 0 {
+				pubMap[n.Name] = n.PublicIPs
+			}
+		}
+		neighbors := make(map[string]struct{})
+		for _, r := range node.Routes {
+			for i := 0; i+1 < len(r.Path); i++ {
+				if r.Path[i] == node.Name {
+					neighbors[string(r.Path[i+1])] = struct{}{}
+				}
+			}
+		}
+		existing := make(map[string]*Peer, len(node.Peers))
+		for i := range node.Peers {
+			p := &node.Peers[i]
+			existing[p.PeerName] = p
+		}
+		created := 0
+		updated := 0
+		for peerName := range neighbors {
+			if peerName == "" || peerName == node.Name {
+				continue
+			}
+			if cur, ok := existing[peerName]; ok {
+				update := map[string]interface{}{}
+				if cur.EntryIP == "" {
+					entryIP := ""
+					if ips, ok := pubMap[peerName]; ok && len(ips) > 0 {
+						for _, ip := range ips {
+							if selfHasV6 && strings.Contains(ip, ":") {
+								entryIP = ip
+								break
+							}
+						}
+						if entryIP == "" {
+							for _, ip := range ips {
+								if !strings.Contains(ip, ":") {
+									entryIP = ip
+									break
+								}
+							}
+						}
+						if entryIP == "" {
+							entryIP = ips[0]
+						}
+					}
+					if entryIP != "" {
+						update["entry_ip"] = entryIP
+					}
+				}
+				if len(update) > 0 {
+					if err := db.Model(&Peer{}).Where("id = ? AND node_id = ?", cur.ID, node.ID).Updates(update).Error; err == nil {
+						updated++
+					}
+				}
+				continue
+			}
+			entryIP := ""
+			if ips, ok := pubMap[peerName]; ok && len(ips) > 0 {
+				for _, ip := range ips {
+					if selfHasV6 && strings.Contains(ip, ":") {
+						entryIP = ip
+						break
+					}
+				}
+				if entryIP == "" {
+					for _, ip := range ips {
+						if !strings.Contains(ip, ":") {
+							entryIP = ip
+							break
+						}
+					}
+				}
+				if entryIP == "" {
+					entryIP = ips[0]
+				}
+			}
+			newPeer := Peer{
+				NodeID:   node.ID,
+				PeerName: peerName,
+				EntryIP:  entryIP,
+			}
+			if err := db.Create(&newPeer).Error; err == nil {
+				created++
+			}
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"created": created,
+			"updated": updated,
+		})
+	})
+	authGroup.POST("/peers/auto", func(c *gin.Context) {
+		var nodes []Node
+		db.Preload("Routes").Preload("Peers").Find(&nodes)
+		var allNodes []Node
+		db.Find(&allNodes)
+		pubMap := make(map[string][]string, len(allNodes))
+		for _, n := range allNodes {
+			if len(n.PublicIPs) > 0 {
+				pubMap[n.Name] = n.PublicIPs
+			}
+		}
+		created := 0
+		updated := 0
+		for i := range nodes {
+			node := &nodes[i]
+			selfHasV6 := false
+			for _, ip := range node.PublicIPs {
+				if strings.Contains(ip, ":") {
+					selfHasV6 = true
+					break
+				}
+			}
+			neighbors := make(map[string]struct{})
+			for _, r := range node.Routes {
+				for i := 0; i+1 < len(r.Path); i++ {
+					if r.Path[i] == node.Name {
+						neighbors[string(r.Path[i+1])] = struct{}{}
+					}
+				}
+			}
+			existing := make(map[string]*Peer, len(node.Peers))
+			for i := range node.Peers {
+				p := &node.Peers[i]
+				existing[p.PeerName] = p
+			}
+			for peerName := range neighbors {
+				if peerName == "" || peerName == node.Name {
+					continue
+				}
+				if cur, ok := existing[peerName]; ok {
+					if cur.EntryIP == "" {
+						entryIP := ""
+						if ips, ok := pubMap[peerName]; ok && len(ips) > 0 {
+							for _, ip := range ips {
+								if selfHasV6 && strings.Contains(ip, ":") {
+									entryIP = ip
+									break
+								}
+							}
+							if entryIP == "" {
+								for _, ip := range ips {
+									if !strings.Contains(ip, ":") {
+										entryIP = ip
+										break
+									}
+								}
+							}
+							if entryIP == "" {
+								entryIP = ips[0]
+							}
+						}
+						if entryIP != "" {
+							if err := db.Model(&Peer{}).Where("id = ? AND node_id = ?", cur.ID, node.ID).Updates(map[string]interface{}{
+								"entry_ip": entryIP,
+							}).Error; err == nil {
+								updated++
+							}
+						}
+					}
+					continue
+				}
+				entryIP := ""
+				if ips, ok := pubMap[peerName]; ok && len(ips) > 0 {
+					for _, ip := range ips {
+						if selfHasV6 && strings.Contains(ip, ":") {
+							entryIP = ip
+							break
+						}
+					}
+					if entryIP == "" {
+						for _, ip := range ips {
+							if !strings.Contains(ip, ":") {
+								entryIP = ip
+								break
+							}
+						}
+					}
+					if entryIP == "" {
+						entryIP = ips[0]
+					}
+				}
+				newPeer := Peer{
+					NodeID:   node.ID,
+					PeerName: peerName,
+					EntryIP:  entryIP,
+				}
+				if err := db.Create(&newPeer).Error; err == nil {
+					created++
+				}
+			}
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"created": created,
+			"updated": updated,
+		})
 	})
 	authGroup.PUT("/nodes/:id/peers/:peerId", func(c *gin.Context) {
 		id := c.Param("id")
@@ -1037,6 +1406,7 @@ func main() {
 				Remote:   r.Remote,
 				Priority: r.Priority,
 				Path:     []string(r.Path),
+				ReturnPath: []string(r.ReturnPath),
 			})
 		}
 		sort.Slice(routes, func(i, j int) bool {
@@ -1088,6 +1458,7 @@ func main() {
 			"remote":     req.Remote,
 			"priority":   req.Priority,
 			"path":       req.Path,
+			"return_path": req.ReturnPath,
 			"updated_at": time.Now(),
 		}).Error; err != nil {
 			c.String(http.StatusBadRequest, "update failed: %v", err)
@@ -1110,6 +1481,12 @@ func main() {
 			return
 		}
 		c.Status(http.StatusNoContent)
+	})
+
+	authGroup.GET("/return-status", func(c *gin.Context) {
+		var rows []ReturnRouteStatus
+		db.Order("updated_at desc").Find(&rows)
+		c.JSON(http.StatusOK, rows)
 	})
 
 	// 手工设置节点公网IP
@@ -1147,6 +1524,7 @@ func main() {
 		var payload struct {
 			From    string                     `json:"from"`
 			Metrics map[string]LinkMetricsJSON `json:"metrics"`
+			ReturnStats []ReturnStatJSON       `json:"return_stats"`
 			Status  struct {
 				CPUUsage    float64  `json:"cpu_usage"`
 				MemUsed     uint64   `json:"mem_used_bytes"`
@@ -1256,6 +1634,197 @@ func main() {
 		c.Status(http.StatusAccepted)
 	})
 
+	authGroup.POST("/route-diag/run", func(c *gin.Context) {
+		var req struct {
+			Node       string   `json:"node"`
+			Route      string   `json:"route"`
+			Path       []string `json:"path"`
+			ReturnPath []string `json:"return_path"`
+			Target     string   `json:"target"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.Node) == "" || len(req.Path) == 0 {
+			c.String(http.StatusBadRequest, "node, path required")
+			return
+		}
+		run := newDiagTraceRun()
+		// collect logs for forward + return nodes
+		nodeSet := make(map[string]struct{})
+		for _, p := range req.Path {
+			if strings.TrimSpace(p) != "" {
+				nodeSet[p] = struct{}{}
+			}
+		}
+		for _, p := range req.ReturnPath {
+			if strings.TrimSpace(p) != "" {
+				nodeSet[p] = struct{}{}
+			}
+		}
+		nodes := make([]string, 0, len(nodeSet))
+		for n := range nodeSet {
+			nodes = append(nodes, n)
+		}
+		sort.Strings(nodes)
+		ensureDiagRun(run.RunID, nodes)
+		offline := make([]string, 0)
+		for _, name := range nodes {
+			if err := hub.sendCommand(name, map[string]any{
+				"type": "diag_collect",
+				"data": map[string]any{
+					"run_id":   run.RunID,
+					"limit":        400,
+					"contains":     "",
+					"clear_before": true,
+					"delay_ms":     12000,
+				},
+			}); err != nil {
+				offline = append(offline, name)
+			}
+		}
+		if err := hub.sendCommand(req.Node, map[string]any{
+			"type": "route_diag",
+			"data": map[string]any{
+				"run_id":      run.RunID,
+				"route":       req.Route,
+				"path":        req.Path,
+				"return_path": req.ReturnPath,
+				"target":      req.Target,
+			},
+		}); err != nil {
+			c.String(http.StatusServiceUnavailable, "node offline or send failed: %v", err)
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"run_id":  run.RunID,
+			"offline": offline,
+		})
+	})
+
+	authGroup.GET("/route-diag", func(c *gin.Context) {
+		runID := strings.TrimSpace(c.Query("run_id"))
+		run := getDiagTraceRun(runID)
+		if run == nil {
+			c.JSON(http.StatusOK, gin.H{"run_id": runID, "events": []DiagTraceEvent{}})
+			return
+		}
+		sort.Slice(run.Events, func(i, j int) bool {
+			return run.Events[i].At < run.Events[j].At
+		})
+		c.JSON(http.StatusOK, gin.H{
+			"run_id":     run.RunID,
+			"created_at": run.CreatedAt,
+			"events":     run.Events,
+		})
+	})
+
+	authGroup.POST("/diag/run", func(c *gin.Context) {
+		var req struct {
+			Nodes    []string `json:"nodes"`
+			Limit    int      `json:"limit"`
+			Contains string   `json:"contains"`
+		}
+		_ = c.ShouldBindJSON(&req)
+		var nodes []Node
+		db.Find(&nodes)
+		targets := make([]string, 0)
+		if len(req.Nodes) == 0 {
+			for _, n := range nodes {
+				targets = append(targets, n.Name)
+			}
+		} else {
+			targets = append(targets, req.Nodes...)
+		}
+		run := newDiagRun(targets)
+		sent := make([]string, 0, len(targets))
+		offline := make([]string, 0)
+		for _, name := range targets {
+			if err := hub.sendCommand(name, map[string]any{
+				"type": "diag_collect",
+				"data": map[string]any{
+					"run_id":   run.RunID,
+					"limit":    req.Limit,
+					"contains": req.Contains,
+				},
+			}); err != nil {
+				offline = append(offline, name)
+				continue
+			}
+			sent = append(sent, name)
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"run_id":   run.RunID,
+			"sent":     sent,
+			"offline":  offline,
+			"nodes":    targets,
+			"limit":    req.Limit,
+			"contains": req.Contains,
+		})
+	})
+
+	authGroup.GET("/diag", func(c *gin.Context) {
+		runID := strings.TrimSpace(c.Query("run_id"))
+		run := getDiagRun(runID)
+		if run == nil {
+			c.JSON(http.StatusOK, gin.H{"run_id": runID, "nodes": []string{}, "reports": []DiagReport{}, "missing": []string{}})
+			return
+		}
+		reports := make([]DiagReport, 0, len(run.Reports))
+		missing := make([]string, 0)
+		seen := make(map[string]struct{}, len(run.Reports))
+		for node, rep := range run.Reports {
+			reports = append(reports, rep)
+			seen[node] = struct{}{}
+		}
+		for _, node := range run.Nodes {
+			if _, ok := seen[node]; !ok {
+				missing = append(missing, node)
+			}
+		}
+		sort.Slice(reports, func(i, j int) bool {
+			return reports[i].Node < reports[j].Node
+		})
+		c.JSON(http.StatusOK, gin.H{
+			"run_id":     run.RunID,
+			"created_at": run.CreatedAt,
+			"nodes":      run.Nodes,
+			"reports":    reports,
+			"missing":    missing,
+		})
+	})
+
+	authGroup.POST("/diag/refresh", func(c *gin.Context) {
+		var req struct {
+			RunID    string `json:"run_id"`
+			Limit    int    `json:"limit"`
+			Contains string `json:"contains"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.RunID) == "" {
+			c.String(http.StatusBadRequest, "run_id required")
+			return
+		}
+		run := getDiagRun(req.RunID)
+		if run == nil || len(run.Nodes) == 0 {
+			c.String(http.StatusNotFound, "run not found")
+			return
+		}
+		offline := make([]string, 0)
+		for _, name := range run.Nodes {
+			if err := hub.sendCommand(name, map[string]any{
+				"type": "diag_collect",
+				"data": map[string]any{
+					"run_id":   run.RunID,
+					"limit":    req.Limit,
+					"contains": req.Contains,
+				},
+			}); err != nil {
+				offline = append(offline, name)
+			}
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"run_id":  run.RunID,
+			"offline": offline,
+		})
+	})
+
 	// WebSocket 通道：节点推送 metrics，后续可扩展控制器下发实时指令。
 	api.GET("/ws", func(c *gin.Context) {
 		nodeToken := getBearerToken(c)
@@ -1306,6 +1875,7 @@ func main() {
 				var payload struct {
 					From    string                     `json:"from"`
 					Metrics map[string]LinkMetricsJSON `json:"metrics"`
+					ReturnStats []ReturnStatJSON       `json:"return_stats"`
 					Status  struct {
 						CPUUsage    float64  `json:"cpu_usage"`
 						MemUsed     uint64   `json:"mem_used_bytes"`
@@ -1355,6 +1925,84 @@ func main() {
 					Columns:   []clause.Column{{Name: "node"}, {Name: "route"}},
 					DoUpdates: clause.Assignments(map[string]interface{}{"path": probe.Path, "rtt_ms": probe.RTTMs, "success": probe.Success, "error": probe.Error, "updated_at": time.Now()}),
 				}).Create(&probe)
+			case "update_status":
+				var res struct {
+					Status  string `json:"status"`
+					Version string `json:"version"`
+					Reason  string `json:"reason"`
+					Forced  bool   `json:"forced"`
+				}
+				if err := json.Unmarshal(msg.Data, &res); err != nil {
+					continue
+				}
+				status := NodeUpdateStatus{
+					Node:    node.Name,
+					Status:  res.Status,
+					Version: res.Version,
+					Reason:  res.Reason,
+					Forced:  res.Forced,
+				}
+				db.Clauses(clause.OnConflict{
+					Columns:   []clause.Column{{Name: "node"}},
+					DoUpdates: clause.Assignments(map[string]interface{}{"status": status.Status, "version": status.Version, "reason": status.Reason, "forced": status.Forced, "updated_at": time.Now()}),
+				}).Create(&status)
+			case "diag_report":
+				var res struct {
+					RunID   string   `json:"run_id"`
+					Node    string   `json:"node"`
+					At      int64    `json:"at"`
+					Lines   []string `json:"lines"`
+					Limit   int      `json:"limit"`
+					Filter  string   `json:"filter"`
+				}
+				if err := json.Unmarshal(msg.Data, &res); err != nil {
+					continue
+				}
+				if res.Node == "" {
+					res.Node = node.Name
+				}
+				at := time.Now()
+				if res.At > 0 {
+					at = time.UnixMilli(res.At)
+				}
+				storeDiagReport(res.RunID, DiagReport{
+					RunID:  res.RunID,
+					Node:   res.Node,
+					At:     at,
+					Lines:  res.Lines,
+					Limit:  res.Limit,
+					Filter: res.Filter,
+				})
+			case "diag_event":
+				var res DiagTraceEvent
+				if err := json.Unmarshal(msg.Data, &res); err != nil {
+					continue
+				}
+				if res.Node == "" {
+					res.Node = node.Name
+				}
+				if res.At == 0 {
+					res.At = time.Now().UnixMilli()
+				}
+				storeDiagTraceEvent(res)
+			case "endpoint_check_result":
+				var res struct {
+					RunID   string               `json:"run_id"`
+					Node    string               `json:"node"`
+					Results []EndpointCheckResult `json:"results"`
+				}
+				if err := json.Unmarshal(msg.Data, &res); err != nil {
+					continue
+				}
+				if res.Node == "" {
+					res.Node = node.Name
+				}
+				for i := range res.Results {
+					if res.Results[i].Node == "" {
+						res.Results[i].Node = res.Node
+					}
+				}
+				storeEndpointCheckResults(res.RunID, res.Results)
 			default:
 			}
 		}
@@ -1384,6 +2032,48 @@ func main() {
 		c.JSON(http.StatusOK, gin.H{"edges": edges})
 	})
 
+	authGroup.POST("/endpoint-check/run", func(c *gin.Context) {
+		var req struct {
+			Nodes []string `json:"nodes"`
+		}
+		_ = c.ShouldBindJSON(&req)
+		var nodes []Node
+		db.Find(&nodes)
+		targets := make([]string, 0, len(nodes))
+		if len(req.Nodes) == 0 {
+			for _, n := range nodes {
+				targets = append(targets, n.Name)
+			}
+		} else {
+			targets = append(targets, req.Nodes...)
+		}
+		run := newEndpointCheckRun(targets)
+		offline := make([]string, 0)
+		for _, name := range targets {
+			if err := hub.sendCommand(name, map[string]any{
+				"type": "endpoint_check",
+				"data": map[string]any{
+					"run_id": run.RunID,
+				},
+			}); err != nil {
+				offline = append(offline, name)
+			}
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"run_id":  run.RunID,
+			"offline": offline,
+		})
+	})
+	authGroup.GET("/endpoint-check", func(c *gin.Context) {
+		runID := strings.TrimSpace(c.Query("run_id"))
+		run := getEndpointCheckRun(runID)
+		if run == nil {
+			c.JSON(http.StatusOK, gin.H{"run_id": runID, "results": []EndpointCheckResult{}})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"run_id": run.RunID, "results": run.Results, "nodes": run.Nodes})
+	})
+
 	// 提供嵌入的节点二进制下载，按 os/arch 返回对应文件。
 	r.GET("/downloads/arouter", func(c *gin.Context) {
 		osName := strings.ToLower(c.Query("os"))
@@ -1400,6 +2090,8 @@ func main() {
 			c.String(http.StatusNotFound, "binary not found for %s/%s", osName, arch)
 			return
 		}
+		sum := sha256.Sum256(data)
+		c.Header("X-Checksum-SHA256", hex.EncodeToString(sum[:]))
 		c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename="arouter-%s-%s"`, osName, arch))
 		c.Data(http.StatusOK, "application/octet-stream", data)
 	})
@@ -1666,6 +2358,18 @@ func buildConfig(node Node, allNodes []Node, globalKey string, controllerBase st
 			Remote: e.Remote,
 		})
 	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].Listen != entries[j].Listen {
+			return entries[i].Listen < entries[j].Listen
+		}
+		if entries[i].Proto != entries[j].Proto {
+			return entries[i].Proto < entries[j].Proto
+		}
+		if entries[i].Exit != entries[j].Exit {
+			return entries[i].Exit < entries[j].Exit
+		}
+		return entries[i].Remote < entries[j].Remote
+	})
 	routes := make([]RouteConfig, 0, len(node.Routes))
 	for _, r := range node.Routes {
 		routes = append(routes, RouteConfig{
@@ -1674,6 +2378,7 @@ func buildConfig(node Node, allNodes []Node, globalKey string, controllerBase st
 			Remote:   r.Remote,
 			Priority: r.Priority,
 			Path:     []string(r.Path),
+			ReturnPath: []string(r.ReturnPath),
 		})
 	}
 	sort.Slice(routes, func(i, j int) bool {
@@ -1735,6 +2440,16 @@ func renderConfigPullScript(installDir, configURL, token, proxy string) string {
 type IfAddr struct {
 	Iface string `json:"iface"`
 	Addr  string `json:"addr"`
+}
+
+func canonicalVersion(v string) string {
+	v = strings.TrimSpace(v)
+	v = strings.TrimPrefix(v, "v")
+	v = strings.TrimPrefix(v, "V")
+	if v == "" {
+		return v
+	}
+	return "v" + v
 }
 
 func listPublicIfAddrs() []IfAddr {
@@ -2332,6 +3047,7 @@ func getBearerToken(c *gin.Context) string {
 func applyMetricsPayload(db *gorm.DB, node *Node, payload struct {
 	From    string                     `json:"from"`
 	Metrics map[string]LinkMetricsJSON `json:"metrics"`
+	ReturnStats []ReturnStatJSON       `json:"return_stats"`
 	Status  struct {
 		CPUUsage    float64  `json:"cpu_usage"`
 		MemUsed     uint64   `json:"mem_used_bytes"`
@@ -2353,6 +3069,42 @@ func applyMetricsPayload(db *gorm.DB, node *Node, payload struct {
 			FirstOrCreate(&LinkMetric{
 				From: payload.From, To: to, RTTMs: m.RTTms, Loss: m.Loss, UpdatedAt: time.Now(),
 			})
+	}
+	for _, rs := range payload.ReturnStats {
+		if rs.Route == "" {
+			rs.Route = "auto"
+		}
+		if rs.Entry == "" {
+			rs.Entry = payload.From
+		}
+		if rs.Exit == "" || rs.Entry == "" {
+			continue
+		}
+		status := ReturnRouteStatus{
+			Node:       payload.From,
+			Route:      rs.Route,
+			Entry:      rs.Entry,
+			Exit:       rs.Exit,
+			Auto:       rs.Auto,
+			Pending:    rs.Pending,
+			ReadyTotal: rs.ReadyTotal,
+			ReadyAt:    rs.ReadyAt,
+			FailTotal:  rs.FailTotal,
+			FailAt:     rs.FailAt,
+			FailReason: rs.FailReason,
+		}
+		db.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "node"}, {Name: "route"}, {Name: "entry"}, {Name: "exit"}, {Name: "auto"}},
+			DoUpdates: clause.Assignments(map[string]interface{}{
+				"pending":     status.Pending,
+				"ready_total": status.ReadyTotal,
+				"ready_at":    status.ReadyAt,
+				"fail_total":  status.FailTotal,
+				"fail_at":     status.FailAt,
+				"fail_reason": status.FailReason,
+				"updated_at":  time.Now(),
+			}),
+		}).Create(&status)
 	}
 	updates := map[string]any{
 		"last_cpu":      payload.Status.CPUUsage,
@@ -2458,6 +3210,215 @@ func (h *wsHub) sendCommand(node string, cmd interface{}) error {
 	return nil
 }
 
+func newDiagRun(nodes []string) *diagRun {
+	runID := fmt.Sprintf("diag-%d", time.Now().UnixNano())
+	run := &diagRun{
+		RunID:     runID,
+		CreatedAt: time.Now(),
+		Nodes:     nodes,
+		Reports:   make(map[string]DiagReport),
+	}
+	diagMu.Lock()
+	diagRuns[runID] = run
+	diagRunOrder = append(diagRunOrder, runID)
+	if len(diagRunOrder) > 20 {
+		old := diagRunOrder[0]
+		delete(diagRuns, old)
+		diagRunOrder = diagRunOrder[1:]
+	}
+	diagMu.Unlock()
+	return run
+}
+
+func ensureDiagRun(runID string, nodes []string) {
+	if runID == "" {
+		return
+	}
+	diagMu.Lock()
+	run := diagRuns[runID]
+	if run == nil {
+		run = &diagRun{
+			RunID:     runID,
+			CreatedAt: time.Now(),
+			Nodes:     append([]string(nil), nodes...),
+			Reports:   make(map[string]DiagReport),
+		}
+		diagRuns[runID] = run
+		diagRunOrder = append(diagRunOrder, runID)
+	} else if len(run.Nodes) == 0 && len(nodes) > 0 {
+		run.Nodes = append([]string(nil), nodes...)
+	}
+	diagMu.Unlock()
+}
+
+func storeDiagReport(runID string, report DiagReport) {
+	if runID == "" || report.Node == "" {
+		return
+	}
+	diagMu.Lock()
+	run := diagRuns[runID]
+	if run == nil {
+		run = &diagRun{
+			RunID:     runID,
+			CreatedAt: time.Now(),
+			Reports:   make(map[string]DiagReport),
+		}
+		diagRuns[runID] = run
+		diagRunOrder = append(diagRunOrder, runID)
+	}
+	if prev, ok := run.Reports[report.Node]; ok {
+		if report.At.After(prev.At) {
+			prev.At = report.At
+		}
+		if report.Limit > 0 {
+			prev.Limit = report.Limit
+		}
+		if report.Filter != "" {
+			prev.Filter = report.Filter
+		}
+		seen := make(map[string]struct{}, len(prev.Lines))
+		for _, line := range prev.Lines {
+			seen[line] = struct{}{}
+		}
+		for _, line := range report.Lines {
+			if _, ok := seen[line]; ok {
+				continue
+			}
+			prev.Lines = append(prev.Lines, line)
+			seen[line] = struct{}{}
+		}
+		if len(prev.Lines) > 2000 {
+			prev.Lines = prev.Lines[len(prev.Lines)-2000:]
+		}
+		run.Reports[report.Node] = prev
+	} else {
+		run.Reports[report.Node] = report
+	}
+	diagMu.Unlock()
+}
+
+func getDiagRun(runID string) *diagRun {
+	diagMu.Lock()
+	defer diagMu.Unlock()
+	if runID == "" && len(diagRunOrder) > 0 {
+		runID = diagRunOrder[len(diagRunOrder)-1]
+	}
+	if runID == "" {
+		return nil
+	}
+	run := diagRuns[runID]
+	if run == nil {
+		return nil
+	}
+	clone := &diagRun{
+		RunID:     run.RunID,
+		CreatedAt: run.CreatedAt,
+		Nodes:     append([]string(nil), run.Nodes...),
+		Reports:   make(map[string]DiagReport, len(run.Reports)),
+	}
+	for k, v := range run.Reports {
+		clone.Reports[k] = v
+	}
+	return clone
+}
+
+func newDiagTraceRun() *diagTraceRun {
+	runID := fmt.Sprintf("trace-%d", time.Now().UnixNano())
+	run := &diagTraceRun{
+		RunID:     runID,
+		CreatedAt: time.Now(),
+		Events:    make([]DiagTraceEvent, 0),
+	}
+	diagTraceMu.Lock()
+	diagTraceRuns[runID] = run
+	diagTraceMu.Unlock()
+	return run
+}
+
+func storeDiagTraceEvent(ev DiagTraceEvent) {
+	if ev.RunID == "" {
+		return
+	}
+	diagTraceMu.Lock()
+	run := diagTraceRuns[ev.RunID]
+	if run == nil {
+		run = &diagTraceRun{RunID: ev.RunID, CreatedAt: time.Now()}
+		diagTraceRuns[ev.RunID] = run
+	}
+	run.Events = append(run.Events, ev)
+	if len(run.Events) > 2000 {
+		run.Events = run.Events[len(run.Events)-2000:]
+	}
+	diagTraceMu.Unlock()
+}
+
+func getDiagTraceRun(runID string) *diagTraceRun {
+	diagTraceMu.Lock()
+	defer diagTraceMu.Unlock()
+	if runID == "" {
+		return nil
+	}
+	run := diagTraceRuns[runID]
+	if run == nil {
+		return nil
+	}
+	clone := &diagTraceRun{
+		RunID:     run.RunID,
+		CreatedAt: run.CreatedAt,
+		Events:    append([]DiagTraceEvent(nil), run.Events...),
+	}
+	return clone
+}
+
+func newEndpointCheckRun(nodes []string) *endpointCheckRun {
+	runID := fmt.Sprintf("ep-%d", time.Now().UnixNano())
+	run := &endpointCheckRun{
+		RunID:     runID,
+		CreatedAt: time.Now(),
+		Nodes:     append([]string(nil), nodes...),
+		Results:   make([]EndpointCheckResult, 0),
+	}
+	endpointCheckMu.Lock()
+	endpointCheckRuns[runID] = run
+	endpointCheckMu.Unlock()
+	return run
+}
+
+func storeEndpointCheckResults(runID string, results []EndpointCheckResult) {
+	if runID == "" {
+		return
+	}
+	endpointCheckMu.Lock()
+	run := endpointCheckRuns[runID]
+	if run == nil {
+		run = &endpointCheckRun{RunID: runID, CreatedAt: time.Now()}
+		endpointCheckRuns[runID] = run
+	}
+	if len(results) > 0 {
+		run.Results = append(run.Results, results...)
+	}
+	endpointCheckMu.Unlock()
+}
+
+func getEndpointCheckRun(runID string) *endpointCheckRun {
+	endpointCheckMu.Lock()
+	defer endpointCheckMu.Unlock()
+	if runID == "" {
+		return nil
+	}
+	run := endpointCheckRuns[runID]
+	if run == nil {
+		return nil
+	}
+	clone := &endpointCheckRun{
+		RunID:     run.RunID,
+		CreatedAt: run.CreatedAt,
+		Nodes:     append([]string(nil), run.Nodes...),
+		Results:   append([]EndpointCheckResult(nil), run.Results...),
+	}
+	return clone
+}
+
 // ensureColumns 兜底补齐旧库缺失的字段，避免“no such column”。
 func ensureColumns(db *gorm.DB) {
 	type col struct {
@@ -2499,6 +3460,11 @@ func ensureColumns(db *gorm.DB) {
 		{&Setting{}, "debug_log", "settings", "BOOLEAN"},
 		{&Setting{}, "http_probe_url", "settings", "TEXT"},
 		{&Setting{}, "encryption_policies", "settings", "TEXT"},
+		{&RoutePlan{}, "return_path", "route_plans", "TEXT"},
+		{&ReturnRouteStatus{}, "ready_at", "return_route_statuses", "BIGINT"},
+		{&ReturnRouteStatus{}, "fail_total", "return_route_statuses", "BIGINT"},
+		{&ReturnRouteStatus{}, "fail_at", "return_route_statuses", "BIGINT"},
+		{&ReturnRouteStatus{}, "fail_reason", "return_route_statuses", "TEXT"},
 		{&Peer{}, "entry_ip", "peers", "TEXT"},
 		{&Peer{}, "exit_ip", "peers", "TEXT"},
 	}

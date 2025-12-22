@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"sync"
 	"time"
 )
@@ -15,25 +16,53 @@ import (
 
 func (t *WSSTransport) handleMuxHeaderRelay(ctx context.Context, mm *MuxManager, streamID uint32, hdr ControlHeader, upStream *MuxStream, streamCh <-chan muxFrame, remaining []NodeID) {
 	next := remaining[0]
-	targetURL, ok := t.Endpoints[next]
-	if !ok {
-		_ = upStream.WriteFlags(context.Background(), flagRST, []byte("no endpoint"))
-		return
+	logDebug("[mux=%p stream=%d] relay forward to %s path=%v return=%v session=%s", mm, streamID, next, remaining, hdr.Return, hdr.Session)
+	t.reportDiag(hdr, "relay_next", fmt.Sprintf("next=%s return=%v", next, hdr.Return))
+	var (
+		nextMux *MuxManager
+		pw      *pooledWS
+	)
+	if hdr.Return {
+		if inbound := t.getInboundMux(next); inbound != nil && inbound != mm {
+			select {
+			case <-inbound.Done():
+				logWarn("[mux=%p stream=%d] relay return inbound mux closed for %s", mm, streamID, next)
+			default:
+				nextMux = inbound
+				logDebug("[mux=%p stream=%d] relay return using inbound mux to %s (addr=%p)", mm, streamID, next, inbound)
+			}
+		} else {
+			logWarn("[mux=%p stream=%d] relay return inbound missing for %s", mm, streamID, next)
+		}
+		if nextMux == nil {
+			_ = upStream.WriteFlags(context.Background(), flagRST, []byte("return hop unreachable"))
+			return
+		}
 	}
-
-	logDebug("[mux=%p stream=%d] relay forward to %s path=%v", mm, streamID, next, remaining)
-	ctxDial, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
-	_, nextMux, pw, err := t.getOrDialMux(ctxDial, next, targetURL)
-	if err != nil || nextMux == nil {
-		_ = upStream.WriteFlags(context.Background(), flagRST, []byte("dial next failed"))
-		return
+	if nextMux == nil {
+		targetURL, ok := t.Endpoints[next]
+		if !ok {
+			_ = upStream.WriteFlags(context.Background(), flagRST, []byte("no endpoint"))
+			return
+		}
+		targetURL = normalizeWSEndpoint(targetURL)
+		ctxDial, cancel := context.WithTimeout(ctx, 3*time.Second)
+		defer cancel()
+		var err error
+		_, nextMux, pw, err = t.getOrDialMux(ctxDial, next, targetURL)
+		if err != nil || nextMux == nil {
+			if err != nil {
+				logWarn("[mux=%p stream=%d] relay dial to %s failed: %v", mm, streamID, next, err)
+			}
+			_ = upStream.WriteFlags(context.Background(), flagRST, []byte("dial next failed"))
+			return
+		}
 	}
 
 	downStream := nextMux.OpenStream()
 	hdr.Path = remaining
 	payload, _ := json.Marshal(hdr)
-	if err := downStream.WriteFlags(ctxDial, flagCTRL, marshalCtrl(ctrlHeader, payload)); err != nil {
+	if err := downStream.WriteFlags(ctx, flagCTRL, marshalCtrl(ctrlHeader, payload)); err != nil {
 		t.releasePooled(next, pw)
 		t.evictPooled(next, pw)
 		logWarn("[mux=%p stream=%d] relay header write to %s failed: %v", mm, streamID, next, err)
@@ -41,6 +70,7 @@ func (t *WSSTransport) handleMuxHeaderRelay(ctx context.Context, mm *MuxManager,
 	}
 	downCh := nextMux.subscribe(downStream.ID())
 	logDebug("[mux=%p stream=%d] relay start next=%s path=%v down_mux=%p down_stream=%d", mm, streamID, next, remaining, nextMux, downStream.ID())
+	t.registerRelayPair(mm, streamID, downStream, nextMux, downStream.ID(), upStream)
 
 	// We release pooled mux only after both directions finish (strict relay), or at least once (best-effort).
 	var releaseOnce sync.Once
@@ -160,5 +190,6 @@ func (t *WSSTransport) handleMuxHeaderRelay(ctx context.Context, mm *MuxManager,
 		wg.Wait()
 		cancelRelay()
 		release()
+		t.unregisterRelayPair(mm, streamID, nextMux, downStream.ID())
 	}()
 }

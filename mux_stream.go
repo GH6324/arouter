@@ -51,6 +51,10 @@ func NewMuxManager(m *MuxConn) *MuxManager {
 }
 
 func NewMuxManagerWithConfig(m *MuxConn, cfg MuxConfig) *MuxManager {
+	return NewMuxManagerWithConfigStart(m, cfg, 2)
+}
+
+func NewMuxManagerWithConfigStart(m *MuxConn, cfg MuxConfig, startID uint32) *MuxManager {
 	ctx, cancel := context.WithCancel(context.Background())
 	if cfg.DefaultQueue <= 0 {
 		cfg.DefaultQueue = 256
@@ -58,9 +62,12 @@ func NewMuxManagerWithConfig(m *MuxConn, cfg MuxConfig) *MuxManager {
 	if cfg.StreamQueue <= 0 {
 		cfg.StreamQueue = 64
 	}
+	if startID == 0 {
+		startID = 2
+	}
 	mm := &MuxManager{
 		m:         m,
-		nextID:    2, // start from 2, even numbers for initiator
+		nextID:    startID,
 		streams:   make(map[uint32]*MuxStream),
 		recv:      make(map[uint32]chan muxFrame),
 		defaultCh: make(chan muxFrame, cfg.DefaultQueue),
@@ -124,6 +131,24 @@ func (mm *MuxManager) readLoop() {
 				select {
 				case mm.pongCh <- f.payload:
 				default:
+				}
+			}
+			continue
+		}
+		if f.flags&flagCTRL != 0 {
+			// Control frames are always handled by muxServe on defaultCh.
+			if mm.cfg.BlockOnBackpressure {
+				select {
+				case mm.defaultCh <- f:
+				case <-mm.ctx.Done():
+					return
+				}
+			} else {
+				select {
+				case mm.defaultCh <- f:
+				default:
+					mm.Close()
+					return
 				}
 			}
 			continue

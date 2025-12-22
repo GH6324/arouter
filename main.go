@@ -81,12 +81,16 @@ func logTest(format string, args ...interface{}) {
 }
 
 type levelWriter struct {
-	out   io.Writer
-	debug *atomic.Bool
-	mu    sync.Mutex
+	out     io.Writer
+	debug   *atomic.Bool
+	mu      sync.Mutex
+	tailMu  sync.Mutex
+	tail    []string
+	tailMax int
 }
 
 func (w *levelWriter) Write(p []byte) (n int, err error) {
+	w.appendTail(p)
 	if w.debug != nil && w.debug.Load() {
 		w.mu.Lock()
 		defer w.mu.Unlock()
@@ -100,6 +104,69 @@ func (w *levelWriter) Write(p []byte) (n int, err error) {
 	}
 	// 非调试模式下静默吞掉信息级日志
 	return len(p), nil
+}
+
+func (w *levelWriter) appendTail(p []byte) {
+	if len(p) == 0 {
+		return
+	}
+	max := w.tailMax
+	if max <= 0 {
+		max = 2000
+	}
+	s := strings.TrimRight(string(p), "\n")
+	if s == "" {
+		return
+	}
+	lines := strings.Split(s, "\n")
+	w.tailMu.Lock()
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+		w.tail = append(w.tail, line)
+		if len(w.tail) > max {
+			w.tail = w.tail[len(w.tail)-max:]
+		}
+	}
+	w.tailMu.Unlock()
+}
+
+func (w *levelWriter) Tail(limit int, contains string) []string {
+	if limit <= 0 {
+		limit = 200
+	}
+	w.tailMu.Lock()
+	defer w.tailMu.Unlock()
+	if len(w.tail) == 0 {
+		return nil
+	}
+	filter := strings.TrimSpace(contains)
+	out := make([]string, 0, limit)
+	if filter == "" {
+		start := len(w.tail) - limit
+		if start < 0 {
+			start = 0
+		}
+		out = append(out, w.tail[start:]...)
+		return out
+	}
+	for i := len(w.tail) - 1; i >= 0 && len(out) < limit; i-- {
+		if strings.Contains(w.tail[i], filter) {
+			out = append(out, w.tail[i])
+		}
+	}
+	// reverse to keep chronological order
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	return out
+}
+
+func (w *levelWriter) ClearTail() {
+	w.tailMu.Lock()
+	w.tail = nil
+	w.tailMu.Unlock()
 }
 
 // 该版本实现了基础的 WSS 数据平面、JSON 配置加载、动态选路和简单的 RTT 探测。
@@ -298,21 +365,164 @@ func (t *Topology) ResetFail(from, to NodeID) {
 
 // Metrics 以原子计数记录流量与会话情况，暴露 /metrics 供采集。
 type Metrics struct {
-	tcpSessions int64
-	udpSessions int64
-	bytesUp     int64
-	bytesDown   int64
-	Self        NodeID
-	Topology    *Topology
-	MuxPool     interface {
+	tcpSessions             int64
+	udpSessions             int64
+	bytesUp                 int64
+	bytesDown               int64
+	returnPending           int64
+	returnReadyTotal        int64
+	returnReadyLast         int64
+	returnFailTotal         int64
+	returnFailLast          int64
+	returnMu                sync.Mutex
+	returnPendingByLabel    map[string]int64
+	returnReadyByLabel      map[string]int64
+	returnReadyAtByLabel    map[string]int64
+	returnFailByLabel       map[string]int64
+	returnFailAtByLabel     map[string]int64
+	returnFailReasonByLabel map[string]string
+	Self                    NodeID
+	Topology                *Topology
+	MuxPool                 interface {
 		PoolSnapshot() map[NodeID]MuxPoolStats
 	}
 }
 
-func (m *Metrics) IncTCP()         { atomic.AddInt64(&m.tcpSessions, 1) }
-func (m *Metrics) IncUDP()         { atomic.AddInt64(&m.udpSessions, 1) }
-func (m *Metrics) AddUp(n int64)   { atomic.AddInt64(&m.bytesUp, n) }
-func (m *Metrics) AddDown(n int64) { atomic.AddInt64(&m.bytesDown, n) }
+type ReturnStat struct {
+	Entry      string `json:"entry"`
+	Exit       string `json:"exit"`
+	Route      string `json:"route"`
+	Auto       bool   `json:"auto"`
+	Pending    int64  `json:"pending"`
+	ReadyTotal int64  `json:"ready_total"`
+	ReadyAt    int64  `json:"ready_at"`
+	FailTotal  int64  `json:"fail_total"`
+	FailAt     int64  `json:"fail_at"`
+	FailReason string `json:"fail_reason"`
+}
+
+func (m *Metrics) ReturnStatsSnapshot() []ReturnStat {
+	m.returnMu.Lock()
+	defer m.returnMu.Unlock()
+	keys := make(map[string]struct{})
+	for k := range m.returnPendingByLabel {
+		keys[k] = struct{}{}
+	}
+	for k := range m.returnReadyByLabel {
+		keys[k] = struct{}{}
+	}
+	for k := range m.returnFailByLabel {
+		keys[k] = struct{}{}
+	}
+	out := make([]ReturnStat, 0, len(keys))
+	for k := range keys {
+		entry, exit, route, auto := splitReturnLabel(k)
+		out = append(out, ReturnStat{
+			Entry:      entry,
+			Exit:       exit,
+			Route:      route,
+			Auto:       auto,
+			Pending:    m.returnPendingByLabel[k],
+			ReadyTotal: m.returnReadyByLabel[k],
+			ReadyAt:    m.returnReadyAtByLabel[k],
+			FailTotal:  m.returnFailByLabel[k],
+			FailAt:     m.returnFailAtByLabel[k],
+			FailReason: m.returnFailReasonByLabel[k],
+		})
+	}
+	return out
+}
+
+func (m *Metrics) IncTCP()           { atomic.AddInt64(&m.tcpSessions, 1) }
+func (m *Metrics) IncUDP()           { atomic.AddInt64(&m.udpSessions, 1) }
+func (m *Metrics) AddUp(n int64)     { atomic.AddInt64(&m.bytesUp, n) }
+func (m *Metrics) AddDown(n int64)   { atomic.AddInt64(&m.bytesDown, n) }
+func (m *Metrics) IncReturnPending() { atomic.AddInt64(&m.returnPending, 1) }
+func (m *Metrics) DecReturnPending() { atomic.AddInt64(&m.returnPending, -1) }
+func (m *Metrics) MarkReturnReady() {
+	atomic.AddInt64(&m.returnReadyTotal, 1)
+	atomic.StoreInt64(&m.returnReadyLast, time.Now().Unix())
+}
+func (m *Metrics) MarkReturnFail() {
+	atomic.AddInt64(&m.returnFailTotal, 1)
+	atomic.StoreInt64(&m.returnFailLast, time.Now().Unix())
+}
+func (m *Metrics) IncReturnPendingLabels(entry, exit, route string, auto bool) {
+	m.IncReturnPending()
+	key := returnLabelKey(entry, exit, route, auto)
+	m.returnMu.Lock()
+	if m.returnPendingByLabel == nil {
+		m.returnPendingByLabel = make(map[string]int64)
+	}
+	m.returnPendingByLabel[key]++
+	m.returnMu.Unlock()
+}
+func (m *Metrics) DecReturnPendingLabels(entry, exit, route string, auto bool) {
+	m.DecReturnPending()
+	key := returnLabelKey(entry, exit, route, auto)
+	m.returnMu.Lock()
+	if m.returnPendingByLabel != nil {
+		if v := m.returnPendingByLabel[key] - 1; v > 0 {
+			m.returnPendingByLabel[key] = v
+		} else {
+			delete(m.returnPendingByLabel, key)
+		}
+	}
+	m.returnMu.Unlock()
+}
+func (m *Metrics) MarkReturnReadyLabels(entry, exit, route string, auto bool) {
+	m.MarkReturnReady()
+	key := returnLabelKey(entry, exit, route, auto)
+	m.returnMu.Lock()
+	if m.returnReadyByLabel == nil {
+		m.returnReadyByLabel = make(map[string]int64)
+	}
+	if m.returnReadyAtByLabel == nil {
+		m.returnReadyAtByLabel = make(map[string]int64)
+	}
+	m.returnReadyByLabel[key]++
+	m.returnReadyAtByLabel[key] = time.Now().Unix()
+	m.returnMu.Unlock()
+}
+func (m *Metrics) MarkReturnFailLabels(entry, exit, route string, auto bool) {
+	m.MarkReturnFail()
+	key := returnLabelKey(entry, exit, route, auto)
+	m.returnMu.Lock()
+	if m.returnFailByLabel == nil {
+		m.returnFailByLabel = make(map[string]int64)
+	}
+	if m.returnFailAtByLabel == nil {
+		m.returnFailAtByLabel = make(map[string]int64)
+	}
+	m.returnFailByLabel[key]++
+	m.returnFailAtByLabel[key] = time.Now().Unix()
+	m.returnMu.Unlock()
+}
+func (m *Metrics) SetReturnFailReason(entry, exit, route string, auto bool, reason string) {
+	key := returnLabelKey(entry, exit, route, auto)
+	m.returnMu.Lock()
+	if m.returnFailReasonByLabel == nil {
+		m.returnFailReasonByLabel = make(map[string]string)
+	}
+	m.returnFailReasonByLabel[key] = reason
+	m.returnMu.Unlock()
+}
+
+func returnLabelKey(entry, exit, route string, auto bool) string {
+	autoLabel := "false"
+	if auto {
+		autoLabel = "true"
+	}
+	return entry + "|" + exit + "|" + route + "|" + autoLabel
+}
+
+func splitReturnLabel(k string) (string, string, string, bool) {
+	parts := strings.SplitN(k, "|", 4)
+	if len(parts) < 4 {
+		return k, "", "", false
+	}
+	return parts[0], parts[1], parts[2], parts[3] == "true"
+}
 
 type MuxPoolStats struct {
 	Total      int
@@ -349,6 +559,29 @@ func (m *Metrics) Serve(addr string) *http.Server {
 		fmt.Fprintf(w, "udp_sessions_total %d\n", atomic.LoadInt64(&m.udpSessions))
 		fmt.Fprintf(w, "bytes_up_total %d\n", atomic.LoadInt64(&m.bytesUp))
 		fmt.Fprintf(w, "bytes_down_total %d\n", atomic.LoadInt64(&m.bytesDown))
+		fmt.Fprintf(w, "return_sessions_pending %d\n", atomic.LoadInt64(&m.returnPending))
+		fmt.Fprintf(w, "return_path_ready_total %d\n", atomic.LoadInt64(&m.returnReadyTotal))
+		fmt.Fprintf(w, "return_path_fail_total %d\n", atomic.LoadInt64(&m.returnFailTotal))
+		if last := atomic.LoadInt64(&m.returnReadyLast); last > 0 {
+			fmt.Fprintf(w, "return_path_ready_last_seconds %d\n", last)
+		}
+		if last := atomic.LoadInt64(&m.returnFailLast); last > 0 {
+			fmt.Fprintf(w, "return_path_fail_last_seconds %d\n", last)
+		}
+		m.returnMu.Lock()
+		for k, v := range m.returnPendingByLabel {
+			entry, exit, route, auto := splitReturnLabel(k)
+			fmt.Fprintf(w, "return_sessions_pending{entry=%q,exit=%q,route=%q,auto=%t} %d\n", entry, exit, route, auto, v)
+		}
+		for k, v := range m.returnReadyByLabel {
+			entry, exit, route, auto := splitReturnLabel(k)
+			fmt.Fprintf(w, "return_path_ready_total{entry=%q,exit=%q,route=%q,auto=%t} %d\n", entry, exit, route, auto, v)
+		}
+		for k, v := range m.returnFailByLabel {
+			entry, exit, route, auto := splitReturnLabel(k)
+			fmt.Fprintf(w, "return_path_fail_total{entry=%q,exit=%q,route=%q,auto=%t} %d\n", entry, exit, route, auto, v)
+		}
+		m.returnMu.Unlock()
 
 		if m.Topology != nil {
 			graph := m.Topology.Snapshot()
@@ -1063,14 +1296,18 @@ func (n *Node) pushMetrics(ctx context.Context) bool {
 		}
 	}
 	payload := struct {
-		From    NodeID                     `json:"from"`
-		Metrics map[NodeID]LinkMetricsJSON `json:"metrics"`
-		Status  NodeStatus                 `json:"status"`
+		From        NodeID                     `json:"from"`
+		Metrics     map[NodeID]LinkMetricsJSON `json:"metrics"`
+		Status      NodeStatus                 `json:"status"`
+		ReturnStats []ReturnStat               `json:"return_stats,omitempty"`
 	}{From: n.ID, Metrics: make(map[NodeID]LinkMetricsJSON, len(snapshot)), Status: gatherNodeStatus()}
 	payload.Status.Transport = n.TransportMode
 	payload.Status.Compression = n.Compression
 	for k, v := range snapshot {
 		payload.Metrics[k] = LinkMetricsJSON{RTTms: v.RTT.Milliseconds(), Loss: v.LossRatio, UpdatedAt: v.UpdatedAt}
+	}
+	if n.Metrics != nil {
+		payload.ReturnStats = n.Metrics.ReturnStatsSnapshot()
 	}
 	if n.pushMetricsWS(ctx, payload) {
 		return true
@@ -1105,6 +1342,10 @@ func (n *Node) pushMetrics(ctx context.Context) bool {
 
 // pushMetricsWS 通过 WS 推送，成功返回 true。
 func (n *Node) pushMetricsWS(ctx context.Context, payload interface{}) bool {
+	return n.pushWSMessage(ctx, "metrics", payload)
+}
+
+func (n *Node) pushWSMessage(ctx context.Context, msgType string, payload interface{}) bool {
 	conn := n.wsConnSafe()
 	if conn == nil {
 		return false
@@ -1113,7 +1354,7 @@ func (n *Node) pushMetricsWS(ctx context.Context, payload interface{}) bool {
 		Type string      `json:"type"`
 		Data interface{} `json:"data"`
 	}{
-		Type: "metrics",
+		Type: msgType,
 		Data: payload,
 	})
 	if err != nil {
@@ -1122,11 +1363,23 @@ func (n *Node) pushMetricsWS(ctx context.Context, payload interface{}) bool {
 	wsCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	if err := conn.Write(wsCtx, wscompat.MessageText, data); err != nil {
-		logWarn("[controller ws] write metrics failed: %v", err)
+		logWarn("[controller ws] write %s failed: %v", msgType, err)
 		n.setWSConn(nil)
 		return false
 	}
 	return true
+}
+
+func (n *Node) reportDiag(ev DiagEvent) {
+	if ev.Node == "" {
+		ev.Node = string(n.ID)
+	}
+	if ev.At == 0 {
+		ev.At = time.Now().UnixMilli()
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_ = n.pushWSMessage(ctx, "diag_event", ev)
 }
 
 func (n *Node) pullTopologyLoop(ctx context.Context) {
@@ -1199,17 +1452,31 @@ func (n *Node) controllerWSLoop(ctx context.Context) {
 				serverName = host
 			}
 		}
-		conn, _, err := wscompat.Dial(ctx, wsURL, &wscompat.DialOptions{
+		conn, resp, err := wscompat.Dial(ctx, wsURL, &wscompat.DialOptions{
 			HTTPHeader:      header,
 			TLSClientConfig: cloneTLSWithServerName(n.TLSConfig, serverName),
 		})
 		if err != nil {
-			logWarn("[controller ws] dial failed: %v", err)
+			if resp != nil {
+				body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
+				_ = resp.Body.Close()
+				logWarn("[controller ws] dial failed: %v (status=%s body=%s)", err, resp.Status, strings.TrimSpace(string(body)))
+			} else {
+				logWarn("[controller ws] dial failed: %v", err)
+			}
+			if hint := wsHealthHint(err, resp); hint != "" {
+				logWarn("[controller ws] health: %s", hint)
+			}
 			time.Sleep(3 * time.Second)
 			continue
 		}
+		_ = conn.SetReadDeadline(time.Now().Add(75 * time.Second))
+		conn.SetPongHandler(func(string) error {
+			return conn.SetReadDeadline(time.Now().Add(75 * time.Second))
+		})
 		n.setWSConn(conn)
 		log.Printf("[controller ws] connected")
+		go n.checkAndUpdateFromController(ctx, false)
 		done := make(chan struct{})
 		pingTicker := time.NewTicker(20 * time.Second)
 		defer pingTicker.Stop()
@@ -1219,6 +1486,9 @@ func (n *Node) controllerWSLoop(ctx context.Context) {
 				_, data, err := conn.Read(ctx)
 				if err != nil {
 					logWarn("[controller ws] read failed: %v", err)
+					if hint := wsHealthHint(err, nil); hint != "" {
+						logWarn("[controller ws] health: %s", hint)
+					}
 					return
 				}
 				n.handleWSMessage(ctx, data)
@@ -1307,6 +1577,94 @@ func (n *Node) handleWSMessage(ctx context.Context, data []byte) {
 		r := ManualRoute{Name: req.Route, Path: ids, Priority: 1}
 		log.Printf("[controller ws] recv route_test route=%s path=%v target=%s", r.Name, r.Path, target)
 		go n.runRouteTest(ctx, r, target)
+	case "route_diag":
+		var req struct {
+			RunID      string   `json:"run_id"`
+			Route      string   `json:"route"`
+			Path       []string `json:"path"`
+			ReturnPath []string `json:"return_path"`
+			Target     string   `json:"target"`
+		}
+		if err := json.Unmarshal(msg.Data, &req); err != nil {
+			return
+		}
+		if len(req.Path) == 0 {
+			return
+		}
+		ids := make([]NodeID, 0, len(req.Path))
+		for _, p := range req.Path {
+			ids = append(ids, NodeID(p))
+		}
+		if len(ids) == 0 {
+			return
+		}
+		if ids[0] != n.ID {
+			ids = append([]NodeID{n.ID}, ids...)
+		}
+		var rPath []NodeID
+		for _, p := range req.ReturnPath {
+			rPath = append(rPath, NodeID(p))
+		}
+		target := strings.TrimSpace(req.Target)
+		if target == "" {
+			target = n.HTTPProbeURL
+		}
+		routeName := strings.TrimSpace(req.Route)
+		log.Printf("[controller ws] recv route_diag route=%s path=%v return=%v target=%s run=%s", routeName, ids, rPath, target, req.RunID)
+		go n.runRouteDiag(ctx, req.RunID, routeName, ids, rPath, target)
+	case "endpoint_check":
+		var req struct {
+			RunID string `json:"run_id"`
+		}
+		if err := json.Unmarshal(msg.Data, &req); err != nil {
+			return
+		}
+		go n.runEndpointCheck(ctx, req.RunID)
+	case "force_update":
+		go n.checkAndUpdateFromController(ctx, true)
+	case "diag_collect":
+		var req struct {
+			RunID    string `json:"run_id"`
+			Limit    int    `json:"limit"`
+			Contains string `json:"contains"`
+			Clear    bool   `json:"clear_before"`
+			DelayMs  int    `json:"delay_ms"`
+		}
+		if err := json.Unmarshal(msg.Data, &req); err != nil {
+			return
+		}
+		if req.Limit <= 0 {
+			req.Limit = 200
+		}
+		if req.Clear {
+			logFilter.ClearTail()
+		}
+		if req.DelayMs > 0 {
+			timer := time.NewTimer(time.Duration(req.DelayMs) * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+		}
+		lines := logFilter.Tail(req.Limit, req.Contains)
+		payload := struct {
+			RunID  string   `json:"run_id"`
+			Node   string   `json:"node"`
+			At     int64    `json:"at"`
+			Lines  []string `json:"lines"`
+			Limit  int      `json:"limit"`
+			Filter string   `json:"filter"`
+		}{
+			RunID:  req.RunID,
+			Node:   string(n.ID),
+			At:     time.Now().UnixMilli(),
+			Lines:  lines,
+			Limit:  req.Limit,
+			Filter: req.Contains,
+		}
+		go n.pushWSMessage(ctx, "diag_report", payload)
 	default:
 	}
 }
@@ -1316,21 +1674,399 @@ func toWSURL(raw string) string {
 	if err != nil || u.Scheme == "" {
 		return raw
 	}
-	host := u.Hostname()
-	isIP := net.ParseIP(strings.Trim(host, "[]")) != nil
 	switch strings.ToLower(u.Scheme) {
 	case "https":
-		if isIP {
-			u.Scheme = "ws"
-		} else {
-			u.Scheme = "wss"
-		}
+		u.Scheme = "wss"
 	case "http":
 		u.Scheme = "ws"
 	default:
 		return raw
 	}
 	return u.String()
+}
+
+func targetToAddr(target string) string {
+	raw := strings.TrimSpace(target)
+	if raw == "" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return raw
+	}
+	host := u.Hostname()
+	if host == "" {
+		return raw
+	}
+	port := u.Port()
+	if port == "" {
+		switch strings.ToLower(u.Scheme) {
+		case "https":
+			port = "443"
+		case "http":
+			port = "80"
+		default:
+			return raw
+		}
+	}
+	return net.JoinHostPort(host, port)
+}
+
+func wsHealthHint(err error, resp *http.Response) string {
+	if resp != nil {
+		switch resp.StatusCode {
+		case http.StatusUnauthorized, http.StatusForbidden:
+			return "token 无效或缺失，检查节点 token 与控制器是否一致"
+		case http.StatusMovedPermanently, http.StatusFound, http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
+			return "控制器返回重定向，WS 不跟随跳转，请使用最终地址（http/https）"
+		case http.StatusOK:
+			return "服务返回 200 但未升级 WS，可能是反代未开启 Upgrade/Connection 或路径不对"
+		case http.StatusBadRequest:
+			return "控制器认为请求非法，可能是反代未升级 WS 或路径错误"
+		}
+	}
+	if err == nil {
+		return ""
+	}
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "unexpected EOF"):
+		return "连接被对端提前关闭，可能是端口/协议不匹配或反代未升级 WS"
+	case strings.Contains(msg, "i/o timeout"):
+		return "读超时，可能是反代/防火墙空闲超时或未回 Pong"
+	case strings.Contains(msg, "connection refused"):
+		return "连接被拒绝，确认控制器监听地址/端口是否可达"
+	case strings.Contains(msg, "tls"):
+		return "TLS 握手失败，检查是否应使用 ws/wss 以及证书配置"
+	}
+	return ""
+}
+
+func (n *Node) controllerHTTPClient(rawURL string) *http.Client {
+	client := fastWSClient(n.TLSConfig)
+	tr, ok := client.Transport.(*http.Transport)
+	if !ok {
+		return client
+	}
+	if tr.TLSClientConfig == nil {
+		tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	}
+	if u, err := url.Parse(rawURL); err == nil {
+		host := u.Hostname()
+		if host != "" && net.ParseIP(host) == nil {
+			tr.TLSClientConfig.ServerName = host
+		}
+	}
+	return client
+}
+
+func (n *Node) checkAndUpdateFromController(ctx context.Context, forced bool) {
+	if n.ControllerURL == "" {
+		return
+	}
+	n.updateMu.Lock()
+	if n.updating {
+		n.updateMu.Unlock()
+		return
+	}
+	n.updating = true
+	n.updateMu.Unlock()
+	defer func() {
+		n.updateMu.Lock()
+		n.updating = false
+		n.updateMu.Unlock()
+	}()
+
+	base := strings.TrimRight(n.ControllerURL, "/")
+	versionURL := base + "/api/version"
+	reqCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(reqCtx, "GET", versionURL, nil)
+	client := n.controllerHTTPClient(versionURL)
+	client.Timeout = 8 * time.Second
+	resp, err := client.Do(req)
+	if err != nil {
+		logWarn("[update] fetch controller version failed: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		logWarn("[update] fetch controller version failed: %s %s", resp.Status, strings.TrimSpace(string(body)))
+		return
+	}
+	var payload struct {
+		Version string `json:"version"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		logWarn("[update] parse controller version failed: %v", err)
+		return
+	}
+	controllerVersion := strings.TrimSpace(payload.Version)
+	if controllerVersion == "" {
+		_ = n.sendUpdateStatus(ctx, "failed", "", "controller version empty", forced)
+		return
+	}
+	normalizedController := normalizeVersion(controllerVersion)
+	normalizedLocal := normalizeVersion(buildVersion)
+	if normalizedController == normalizedLocal && !forced {
+		_ = n.sendUpdateStatus(ctx, "skipped", controllerVersion, "already latest", forced)
+		return
+	}
+
+	log.Printf("[update] controller version %s detected, updating from %s", controllerVersion, buildVersion)
+	_ = n.sendUpdateStatus(ctx, "in_progress", controllerVersion, "", forced)
+	realExe, backupPath, err := n.updateBinaryFromController(ctx, controllerVersion)
+	if err != nil {
+		logWarn("[update] update failed: %v", err)
+		_ = n.sendUpdateStatus(ctx, "failed", controllerVersion, err.Error(), forced)
+		return
+	}
+	_ = n.sendUpdateStatus(ctx, "success", controllerVersion, "", forced)
+	log.Printf("[update] update complete, restarting")
+	if err := restartSelfWithPath(realExe); err != nil {
+		if rollbackErr := rollbackBinary(realExe, backupPath); rollbackErr != nil {
+			logWarn("[update] rollback failed after restart error: %v", rollbackErr)
+		}
+		logWarn("[update] restart failed: %v", err)
+		_ = n.sendUpdateStatus(ctx, "failed", controllerVersion, err.Error(), forced)
+	}
+}
+
+func normalizeVersion(v string) string {
+	v = strings.TrimSpace(v)
+	v = strings.TrimPrefix(v, "v")
+	v = strings.TrimPrefix(v, "V")
+	return v
+}
+
+func canonicalVersion(v string) string {
+	base := normalizeVersion(v)
+	if base == "" {
+		return v
+	}
+	return "v" + base
+}
+
+func (n *Node) updateBinaryFromController(ctx context.Context, targetVersion string) (string, string, error) {
+	base := strings.TrimRight(n.ControllerURL, "/")
+	downloadURL := fmt.Sprintf("%s/downloads/arouter?os=%s&arch=%s", base, runtime.GOOS, runtime.GOARCH)
+	if runtime.GOOS == "windows" {
+		return "", "", fmt.Errorf("self-update not supported on windows")
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(reqCtx, "GET", downloadURL, nil)
+	client := n.controllerHTTPClient(downloadURL)
+	client.Timeout = 60 * time.Second
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return "", "", fmt.Errorf("download failed: %s %s", resp.Status, strings.TrimSpace(string(body)))
+	}
+	expectedHash := strings.TrimSpace(resp.Header.Get("X-Checksum-SHA256"))
+	if expectedHash == "" {
+		return "", "", fmt.Errorf("missing checksum header from controller")
+	}
+	targetExe, err := resolveUpdateTargetPath()
+	if err != nil {
+		return "", "", err
+	}
+	perm := os.FileMode(0o755)
+	if info, err := os.Stat(targetExe); err == nil {
+		perm = info.Mode().Perm()
+	}
+	tmpPath, sum, err := downloadToTemp(resp.Body, filepath.Dir(targetExe), perm)
+	if err != nil {
+		return "", "", err
+	}
+	if !strings.EqualFold(sum, expectedHash) {
+		_ = os.Remove(tmpPath)
+		return "", "", fmt.Errorf("checksum mismatch: expected %s got %s", expectedHash, sum)
+	}
+	backupPath, err := swapBinary(targetExe, tmpPath)
+	if err != nil {
+		return "", "", err
+	}
+	cleanupBackupChain(targetExe)
+	log.Printf("[update] binary replaced with controller version %s", targetVersion)
+	return targetExe, backupPath, nil
+}
+
+func resolveUpdateTargetPath() (string, error) {
+	exePath, err := os.Executable()
+	if err != nil {
+		return "", err
+	}
+	target := exePath
+	if resolved, err := filepath.EvalSymlinks(exePath); err == nil {
+		target = resolved
+	}
+	target = stripBakPath(target)
+	if exists, _ := fileExists(target); exists {
+		return target, nil
+	}
+	if arg0 := strings.TrimSpace(os.Args[0]); arg0 != "" {
+		if abs, err := filepath.Abs(arg0); err == nil {
+			abs = stripBakPath(abs)
+			if exists, _ := fileExists(abs); exists {
+				return abs, nil
+			}
+		}
+	}
+	return target, nil
+}
+
+func stripBakPath(p string) string {
+	for strings.HasSuffix(p, ".bak") {
+		p = strings.TrimSuffix(p, ".bak")
+	}
+	return p
+}
+
+func cleanupBackupChain(base string) {
+	base = stripBakPath(base)
+	path := base + ".bak"
+	removed := 0
+	for i := 0; i < 10; i++ {
+		if exists, _ := fileExists(path); !exists {
+			break
+		}
+		_ = os.Remove(path)
+		removed++
+		path += ".bak"
+	}
+	if removed > 0 {
+		log.Printf("[update] cleaned %d backup binaries", removed)
+	}
+}
+
+func fileExists(path string) (bool, error) {
+	info, err := os.Stat(path)
+	if err == nil {
+		return !info.IsDir(), nil
+	}
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	return false, err
+}
+
+func downloadToTemp(r io.Reader, dir string, perm os.FileMode) (string, string, error) {
+	tmp, err := os.CreateTemp(dir, ".arouter-update-*")
+	if err != nil {
+		return "", "", err
+	}
+	tmpName := tmp.Name()
+	hasher := sha256.New()
+	if _, err := io.Copy(io.MultiWriter(tmp, hasher), r); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return "", "", err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return "", "", err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return "", "", err
+	}
+	if err := os.Chmod(tmpName, perm); err != nil {
+		_ = os.Remove(tmpName)
+		return "", "", err
+	}
+	sum := hex.EncodeToString(hasher.Sum(nil))
+	return tmpName, sum, nil
+}
+
+func swapBinary(targetExe, tmpPath string) (string, error) {
+	var backupPath string
+	if exists, err := fileExists(targetExe); err != nil {
+		_ = os.Remove(tmpPath)
+		return "", err
+	} else if exists {
+		backupPath = targetExe + ".bak"
+		_ = os.Remove(backupPath)
+		if err := os.Rename(targetExe, backupPath); err != nil {
+			_ = os.Remove(tmpPath)
+			return "", err
+		}
+	}
+	if err := os.Rename(tmpPath, targetExe); err != nil {
+		if backupPath != "" {
+			_ = os.Rename(backupPath, targetExe)
+		}
+		return "", err
+	}
+	return backupPath, nil
+}
+
+func rollbackBinary(realExe, backupPath string) error {
+	if backupPath == "" {
+		return nil
+	}
+	if _, err := os.Stat(backupPath); err != nil {
+		return err
+	}
+	_ = os.Remove(realExe)
+	return os.Rename(backupPath, realExe)
+}
+
+func (n *Node) sendUpdateStatus(ctx context.Context, status, version, reason string, forced bool) error {
+	conn := n.wsConnSafe()
+	if conn == nil {
+		return fmt.Errorf("ws not connected")
+	}
+	payload := struct {
+		Type string `json:"type"`
+		Data struct {
+			Status  string `json:"status"`
+			Version string `json:"version"`
+			Reason  string `json:"reason"`
+			Forced  bool   `json:"forced"`
+		} `json:"data"`
+	}{
+		Type: "update_status",
+	}
+	payload.Data.Status = status
+	payload.Data.Version = version
+	payload.Data.Reason = reason
+	payload.Data.Forced = forced
+	data, _ := json.Marshal(payload)
+	if werr := conn.Write(ctx, wscompat.MessageText, data); werr != nil {
+		return werr
+	}
+	return nil
+}
+
+func restartSelfWithPath(path string) error {
+	exePath := strings.TrimSpace(path)
+	if exePath == "" {
+		var err error
+		exePath, err = os.Executable()
+		if err != nil {
+			return err
+		}
+	}
+	args := append([]string{exePath}, os.Args[1:]...)
+	if runtime.GOOS == "windows" {
+		cmd := exec.Command(exePath, os.Args[1:]...)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		cmd.Stdin = os.Stdin
+		if err := cmd.Start(); err != nil {
+			return err
+		}
+		os.Exit(0)
+		return nil
+	}
+	return syscall.Exec(exePath, args, os.Environ())
 }
 
 // dialWSWithTLS builds dial options respecting SNI/domain and allowing IP override via NetDialContext.
@@ -1421,6 +2157,164 @@ func (n *Node) runRouteTest(ctx context.Context, r ManualRoute, target string) {
 	if e := n.reportProbe(ctx, r, dur, success, err); e != nil {
 		logTest("route_test %s http report failed: %v", r.Name, e)
 	}
+}
+
+func (n *Node) runRouteDiag(ctx context.Context, runID string, routeName string, path []NodeID, returnPath []NodeID, target string) {
+	ws, ok := n.Transport.(*WSSTransport)
+	if !ok {
+		log.Printf("[route_diag %s] transport not ws", routeName)
+		n.reportDiag(DiagEvent{
+			RunID:  runID,
+			Route:  routeName,
+			Node:   string(n.ID),
+			Stage:  "error",
+			Detail: "transport not ws",
+			At:     time.Now().UnixMilli(),
+		})
+		return
+	}
+	if target == "" {
+		target = n.HTTPProbeURL
+	}
+	n.reportDiag(DiagEvent{
+		RunID:  runID,
+		Route:  routeName,
+		Node:   string(n.ID),
+		Stage:  "diag_start",
+		Detail: fmt.Sprintf("target=%s", target),
+		At:     time.Now().UnixMilli(),
+	})
+	if ws != nil {
+		n.reportDiag(DiagEvent{
+			RunID:  runID,
+			Route:  routeName,
+			Node:   string(n.ID),
+			Stage:  "links_inbound",
+			Detail: formatNodeList(ws.inboundPeers()),
+			At:     time.Now().UnixMilli(),
+		})
+		n.reportDiag(DiagEvent{
+			RunID:  runID,
+			Route:  routeName,
+			Node:   string(n.ID),
+			Stage:  "links_outbound",
+			Detail: formatOutboundStats(ws.PoolSnapshot()),
+			At:     time.Now().UnixMilli(),
+		})
+	}
+	timeout := 20 * time.Second
+	dur, err := ws.ProbeHTTPDiag(ctx, path, target, timeout, runID, routeName)
+	if err != nil {
+		n.reportDiag(DiagEvent{
+			RunID:  runID,
+			Route:  routeName,
+			Node:   string(n.ID),
+			Stage:  "probe_fail",
+			Detail: err.Error(),
+			At:     time.Now().UnixMilli(),
+		})
+	} else {
+		n.reportDiag(DiagEvent{
+			RunID:  runID,
+			Route:  routeName,
+			Node:   string(n.ID),
+			Stage:  "probe_ok",
+			Detail: fmt.Sprintf("rtt=%s", dur),
+			At:     time.Now().UnixMilli(),
+		})
+	}
+	if len(returnPath) >= 2 {
+		addr := targetToAddr(target)
+		if addr == "" {
+			n.reportDiag(DiagEvent{
+				RunID:  runID,
+				Route:  routeName,
+				Node:   string(n.ID),
+				Stage:  "return_skip",
+				Detail: "invalid target addr",
+				At:     time.Now().UnixMilli(),
+			})
+			return
+		}
+		n.reportDiag(DiagEvent{
+			RunID:  runID,
+			Route:  routeName,
+			Node:   string(n.ID),
+			Stage:  "return_start",
+			Detail: fmt.Sprintf("addr=%s", addr),
+			At:     time.Now().UnixMilli(),
+		})
+		diagCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+		err = ws.DiagReturnPath(diagCtx, path, returnPath, addr, routeName, runID)
+		cancel()
+		if err != nil {
+			n.reportDiag(DiagEvent{
+				RunID:  runID,
+				Route:  routeName,
+				Node:   string(n.ID),
+				Stage:  "return_fail",
+				Detail: err.Error(),
+				At:     time.Now().UnixMilli(),
+			})
+		} else {
+			n.reportDiag(DiagEvent{
+				RunID:  runID,
+				Route:  routeName,
+				Node:   string(n.ID),
+				Stage:  "return_ok",
+				Detail: "return path established",
+				At:     time.Now().UnixMilli(),
+			})
+		}
+	}
+}
+
+func (n *Node) runEndpointCheck(ctx context.Context, runID string) {
+	if runID == "" {
+		return
+	}
+	endpoints := n.PeerEndpoints
+	if ws, ok := n.Transport.(*WSSTransport); ok {
+		endpoints = ws.Endpoints
+	}
+	results := make([]EndpointCheckResult, 0)
+	if len(endpoints) == 0 {
+		_ = n.pushWSMessage(ctx, "endpoint_check_result", map[string]any{
+			"run_id":  runID,
+			"node":    string(n.ID),
+			"results": results,
+		})
+		return
+	}
+	for peer, ep := range endpoints {
+		epStr := strings.TrimSpace(ep)
+		if epStr == "" {
+			continue
+		}
+		start := time.Now()
+		checkCtx, cancel := context.WithTimeout(ctx, 6*time.Second)
+		status, err := dialWSCheck(checkCtx, epStr, n.TLSConfig, n.ServerName)
+		cancel()
+		res := EndpointCheckResult{
+			Node:     string(n.ID),
+			Peer:     string(peer),
+			Endpoint: epStr,
+			RTTMs:    time.Since(start).Milliseconds(),
+			Status:   status,
+		}
+		if err != nil {
+			res.OK = false
+			res.Error = err.Error()
+		} else {
+			res.OK = true
+		}
+		results = append(results, res)
+	}
+	_ = n.pushWSMessage(ctx, "endpoint_check_result", map[string]any{
+		"run_id":  runID,
+		"node":    string(n.ID),
+		"results": results,
+	})
 }
 
 type topologyPayload struct {
@@ -1718,7 +2612,7 @@ func (p *WSProber) Probe(ctx context.Context, _, remote NodeID) (LinkMetrics, er
 
 // Transport encapsulates WSS data plane.
 type Transport interface {
-	Forward(ctx context.Context, src NodeID, path []NodeID, proto Protocol, downstream net.Conn, remoteAddr string) error
+	Forward(ctx context.Context, src NodeID, path []NodeID, returnPath []NodeID, proto Protocol, downstream net.Conn, remoteAddr string, routeName string) error
 	ReconnectTCP(ctx context.Context, src NodeID, proto Protocol, downstream net.Conn, remoteAddr string, computePath func(try int) ([]NodeID, error), attempts int) error
 	Serve(ctx context.Context) error
 }
@@ -1726,21 +2620,55 @@ type Transport interface {
 // ControlHeader 描述剩余路径和最终出口。
 type ControlHeader struct {
 	Path        []NodeID `json:"path"`
+	FullPath    []NodeID `json:"full_path,omitempty"`
 	RemoteAddr  string   `json:"remote"`
 	Proto       Protocol `json:"proto"`
 	Compression string   `json:"compress,omitempty"`
 	CompressMin int      `json:"compress_min,omitempty"`
 	EncID       int      `json:"enc_id,omitempty"`
+	Session     string   `json:"session,omitempty"`
+	ReturnPath  []NodeID `json:"return_path,omitempty"`
+	Return      bool     `json:"return,omitempty"`
+	RouteName   string   `json:"route,omitempty"`
+	EntryNode   NodeID   `json:"entry,omitempty"`
+	ClientAddr  string   `json:"client,omitempty"`
+	DiagRunID   string   `json:"diag_run_id,omitempty"`
+	DiagRoute   string   `json:"diag_route,omitempty"`
+}
+
+type DiagEvent struct {
+	RunID      string   `json:"run_id"`
+	Route      string   `json:"route"`
+	Node       string   `json:"node"`
+	Stage      string   `json:"stage"`
+	Detail     string   `json:"detail,omitempty"`
+	Session    string   `json:"session,omitempty"`
+	Path       []string `json:"path,omitempty"`
+	ReturnPath []string `json:"return_path,omitempty"`
+	At         int64    `json:"at"`
+}
+
+type EndpointCheckResult struct {
+	Node     string `json:"node"`
+	Peer     string `json:"peer"`
+	Endpoint string `json:"endpoint"`
+	OK       bool   `json:"ok"`
+	RTTMs    int64  `json:"rtt_ms"`
+	Status   string `json:"status,omitempty"`
+	Error    string `json:"error,omitempty"`
 }
 
 type ctrlType uint8
 
 const (
-	ctrlHeader ctrlType = 1
-	ctrlAck    ctrlType = 2
-	ctrlError  ctrlType = 3
-	ctrlUDP    ctrlType = 4
-	ctrlProbe  ctrlType = 5
+	ctrlHeader      ctrlType = 1
+	ctrlAck         ctrlType = 2
+	ctrlError       ctrlType = 3
+	ctrlUDP         ctrlType = 4
+	ctrlProbe       ctrlType = 5
+	ctrlReturnReady ctrlType = 6
+	ctrlReturnFail  ctrlType = 7
+	ctrlReturnAck   ctrlType = 8
 )
 
 func marshalCtrl(t ctrlType, payload []byte) []byte {
@@ -1834,6 +2762,9 @@ func dialWSWithFallback(ctx context.Context, url string, tlsConf *tls.Config, se
 		TLSClientConfig: cloneTLSWithServerName(tlsConf, serverName),
 	}
 	conn, resp, err := wscompat.Dial(ctx, url, opts)
+	if err != nil && resp != nil {
+		return conn, resp, fmt.Errorf("%w (status=%s)", err, resp.Status)
+	}
 	if err == nil || resp != nil || !strings.HasPrefix(url, "wss://") {
 		return conn, resp, err
 	}
@@ -1846,6 +2777,22 @@ func dialWSWithFallback(ctx context.Context, url string, tlsConf *tls.Config, se
 		HTTPClient: fastWSClient(nil),
 	})
 	return conn, resp, err
+}
+
+func dialWSCheck(ctx context.Context, url string, tlsConf *tls.Config, serverName string) (string, error) {
+	opts := &wscompat.DialOptions{
+		HTTPClient:      fastWSClient(tlsConf),
+		TLSClientConfig: cloneTLSWithServerName(tlsConf, serverName),
+	}
+	conn, resp, err := wscompat.Dial(ctx, url, opts)
+	if conn != nil {
+		conn.Close()
+	}
+	status := ""
+	if resp != nil {
+		status = resp.Status
+	}
+	return status, err
 }
 
 func normalizePeerEndpoint(raw string, mode string) string {
@@ -1933,11 +2880,26 @@ type pooledWS struct {
 	lastUsed  time.Time
 	active    int
 	draining  bool
+	serveOn   bool
+	pinned    bool
 	rttEWMA   time.Duration
 	lastRTT   time.Duration
 	lastPing  time.Time
 	failCount int
 	lastFail  time.Time
+}
+
+type returnSession struct {
+	downstream  net.Conn
+	forwardRaw  net.Conn
+	compression string
+	compressMin int
+	encID       int
+	createdAt   time.Time
+	routeName   string
+	entryNode   NodeID
+	exitNode    NodeID
+	auto        bool
 }
 
 // WSSTransport 通过 WebSocket 级联转发，可同时监听 WS 与 WSS。
@@ -1972,6 +2934,23 @@ type WSSTransport struct {
 	muxDefaultQueue        int
 	muxStreamQueue         int
 	muxBlockOnBackpressure bool
+	inboundMu              sync.Mutex
+	inboundMux             map[NodeID]*MuxManager
+	returnAckMu            sync.Mutex
+	returnAckWait          map[string]chan struct{}
+	diagReport             func(DiagEvent)
+	returnMu               sync.Mutex
+	returnSessions         map[string]*returnSession
+	returnReadyMu          sync.Mutex
+	returnReady            map[string]time.Time
+	diagReturnMu           sync.Mutex
+	diagReturnWait         map[string]chan struct{}
+	diagReturnFailWait     map[string]chan error
+	relayMu                sync.Mutex
+	relayPeers             map[string]*MuxStream
+	preconnectMu           sync.Mutex
+	preconnectPeers        map[NodeID]struct{}
+	preconnectInterval     time.Duration
 }
 
 func (t *WSSTransport) PoolSnapshot() map[NodeID]MuxPoolStats {
@@ -2126,15 +3105,15 @@ func (t *WSSTransport) cleanupMuxPool(ctx context.Context) {
 					default:
 					}
 					expired := t.isExpired(p, now)
-					if expired && p.active == 0 {
+					if expired && p.active == 0 && !p.pinned {
 						p.conn.Close()
 						continue
 					}
-					if expired && !p.draining {
+					if expired && !p.draining && !p.pinned {
 						p.draining = true
 					}
 					// if repeated failures and idle, drop it.
-					if p.failCount >= 3 && p.active == 0 && now.Sub(p.lastFail) < 2*time.Minute {
+					if p.failCount >= 3 && p.active == 0 && now.Sub(p.lastFail) < 2*time.Minute && !p.pinned {
 						p.conn.Close()
 						continue
 					}
@@ -2151,16 +3130,133 @@ func (t *WSSTransport) cleanupMuxPool(ctx context.Context) {
 	}
 }
 
+func (t *WSSTransport) StartPreconnect(ctx context.Context, peers []NodeID, interval time.Duration) {
+	if t == nil || len(peers) == 0 || t.disablePool {
+		return
+	}
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
+	set := make(map[NodeID]struct{}, len(peers))
+	for _, p := range peers {
+		if p != "" {
+			set[p] = struct{}{}
+		}
+	}
+	if len(set) == 0 {
+		return
+	}
+	t.preconnectMu.Lock()
+	t.preconnectPeers = set
+	t.preconnectInterval = interval
+	t.preconnectMu.Unlock()
+	go t.preconnectLoop(ctx)
+}
+
+func (t *WSSTransport) preconnectLoop(ctx context.Context) {
+	t.preconnectMu.Lock()
+	interval := t.preconnectInterval
+	peers := make([]NodeID, 0, len(t.preconnectPeers))
+	for p := range t.preconnectPeers {
+		peers = append(peers, p)
+	}
+	t.preconnectMu.Unlock()
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		for _, peer := range peers {
+			t.ensurePreconnect(ctx, peer)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func (t *WSSTransport) ensurePreconnect(ctx context.Context, peer NodeID) {
+	if t == nil || peer == "" || t.disablePool {
+		return
+	}
+	targetURL, ok := t.Endpoints[peer]
+	if !ok || targetURL == "" {
+		return
+	}
+	targetURL = normalizeWSEndpoint(targetURL)
+	if t.markPinnedIfExists(peer) {
+		return
+	}
+	ctxDial, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	_, mux, pw, err := t.getOrDialMux(ctxDial, peer, targetURL)
+	if err != nil || mux == nil {
+		logWarn("[preconnect] dial to %s failed: %v", peer, err)
+		return
+	}
+	if pw != nil {
+		t.poolMu.Lock()
+		pw.pinned = true
+		t.poolMu.Unlock()
+	}
+	stream := mux.OpenStream()
+	defer stream.Close(context.Background())
+	header := ControlHeader{
+		Path:       []NodeID{peer},
+		FullPath:   []NodeID{t.Self, peer},
+		Proto:      Protocol("preconnect"),
+		Session:    newSessionID(),
+		EntryNode:  t.Self,
+		RemoteAddr: "preconnect",
+	}
+	payload, _ := json.Marshal(header)
+	if err := stream.WriteFlags(ctxDial, flagCTRL, marshalCtrl(ctrlHeader, payload)); err != nil {
+		logWarn("[preconnect] send header to %s failed: %v", peer, err)
+		t.releasePooled(peer, pw)
+		return
+	}
+	ch := mux.subscribe(stream.ID())
+	select {
+	case f, ok := <-ch:
+		if ok && f.flags&(flagFIN|flagRST) != 0 {
+		}
+	case <-time.After(2 * time.Second):
+	}
+	t.releasePooled(peer, pw)
+}
+
+func (t *WSSTransport) markPinnedIfExists(peer NodeID) bool {
+	t.poolMu.Lock()
+	defer t.poolMu.Unlock()
+	list := t.pool[peer]
+	for _, p := range list {
+		if p == nil {
+			continue
+		}
+		select {
+		case <-p.mux.Done():
+			continue
+		default:
+		}
+		p.pinned = true
+		return true
+	}
+	return false
+}
+
 func (t *WSSTransport) handleConn(ctx context.Context, c *wscompat.Conn) {
 	defer c.Close()
 	if t.IdleTimeout > 0 {
 		c.SetReadLimit(64 << 20)
 	}
-	mux := NewMuxManagerWithConfig(NewMuxConn(c), MuxConfig{
+	mux := NewMuxManagerWithConfigStart(NewMuxConn(c), MuxConfig{
 		DefaultQueue:        t.muxDefaultQueue,
 		StreamQueue:         t.muxStreamQueue,
 		BlockOnBackpressure: t.muxBlockOnBackpressure,
-	})
+	}, 1) // responder uses odd stream IDs
 	t.muxServe(ctx, mux)
 }
 
@@ -2176,6 +3272,71 @@ func (t *WSSTransport) getOrDial(ctx context.Context, next NodeID, url string) (
 	return conn, nil
 }
 
+func (t *WSSTransport) startMuxServeClient(mux *MuxManager) {
+	if mux == nil {
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		<-mux.Done()
+		cancel()
+	}()
+	go t.muxServe(ctx, mux)
+}
+
+func (t *WSSTransport) registerInboundMux(peer NodeID, mm *MuxManager) {
+	if peer == "" || mm == nil {
+		return
+	}
+	needWatch := false
+	t.inboundMu.Lock()
+	if t.inboundMux == nil {
+		t.inboundMux = make(map[NodeID]*MuxManager)
+	}
+	cur := t.inboundMux[peer]
+	if cur != mm {
+		t.inboundMux[peer] = mm
+		needWatch = true
+	}
+	t.inboundMu.Unlock()
+	if !needWatch {
+		return
+	}
+	go func() {
+		<-mm.Done()
+		t.inboundMu.Lock()
+		if t.inboundMux != nil && t.inboundMux[peer] == mm {
+			delete(t.inboundMux, peer)
+		}
+		t.inboundMu.Unlock()
+	}()
+}
+
+func (t *WSSTransport) getInboundMux(peer NodeID) *MuxManager {
+	if peer == "" {
+		return nil
+	}
+	t.inboundMu.Lock()
+	defer t.inboundMu.Unlock()
+	if t.inboundMux == nil {
+		return nil
+	}
+	return t.inboundMux[peer]
+}
+
+func (t *WSSTransport) inboundPeers() []NodeID {
+	t.inboundMu.Lock()
+	defer t.inboundMu.Unlock()
+	if len(t.inboundMux) == 0 {
+		return nil
+	}
+	out := make([]NodeID, 0, len(t.inboundMux))
+	for k := range t.inboundMux {
+		out = append(out, k)
+	}
+	return out
+}
+
 func (t *WSSTransport) getOrDialMux(ctx context.Context, next NodeID, url string) (*wscompat.Conn, *MuxManager, *pooledWS, error) {
 	// 无池模式：每次新建，流结束后关闭
 	if t.disablePool {
@@ -2184,6 +3345,7 @@ func (t *WSSTransport) getOrDialMux(ctx context.Context, next NodeID, url string
 			return nil, nil, nil, err
 		}
 		mux := NewMuxManager(NewMuxConn(conn))
+		t.startMuxServeClient(mux)
 		go func() {
 			<-mux.Done()
 			conn.Close()
@@ -2248,24 +3410,43 @@ func (t *WSSTransport) getOrDialMux(ctx context.Context, next NodeID, url string
 	} else {
 		t.pool[next] = valid
 	}
+	startServe := false
 	if chosen != nil {
 		chosen.active++
 		chosen.lastUsed = now
+		if !chosen.serveOn {
+			chosen.serveOn = true
+			startServe = true
+		}
 	}
 	t.poolMu.Unlock()
 	if chosen != nil {
+		if startServe {
+			t.startMuxServeClient(chosen.mux)
+		}
 		logDebug("[mux pool %s] reuse mux (addr=%p) active=%d/%d", next, chosen, chosen.active, maxStreams)
 		return chosen.conn, chosen.mux, chosen, nil
 	}
 
-	conn, _, err := dialWSWithFallback(ctx, url, t.TLSConfig, t.ServerName)
+	conn, resp, err := dialWSWithFallback(ctx, url, t.TLSConfig, t.ServerName)
 	if err != nil {
+		if resp != nil {
+			err = fmt.Errorf("%w (status=%s url=%s)", err, resp.Status, url)
+		}
 		// 如果新建失败，降级复用 draining 的连接，尽量保持可用
 		if fallback != nil {
+			startServe := false
 			t.poolMu.Lock()
 			fallback.active++
 			fallback.lastUsed = time.Now()
+			if !fallback.serveOn {
+				fallback.serveOn = true
+				startServe = true
+			}
 			t.poolMu.Unlock()
+			if startServe {
+				t.startMuxServeClient(fallback.mux)
+			}
 			logWarn("[mux pool %s] dial failed, fallback to draining mux (addr=%p): %v", next, fallback, err)
 			return fallback.conn, fallback.mux, fallback, nil
 		}
@@ -2280,11 +3461,12 @@ func (t *WSSTransport) getOrDialMux(ctx context.Context, next NodeID, url string
 		StreamQueue:         t.muxStreamQueue,
 		BlockOnBackpressure: t.muxBlockOnBackpressure,
 	})
-	pw := &pooledWS{conn: conn, mux: mux, createdAt: now, lastUsed: now, active: 1}
+	pw := &pooledWS{conn: conn, mux: mux, createdAt: now, lastUsed: now, active: 1, serveOn: true}
 	t.poolMu.Lock()
 	t.pool[next] = append(t.pool[next], pw)
 	t.poolMu.Unlock()
 	logDebug("[mux pool %s] new mux dialed (addr=%p) active=1/%d", next, pw, maxStreams)
+	t.startMuxServeClient(mux)
 	if t.Topology != nil {
 		t.Topology.ResetFail(t.Self, next)
 	}
@@ -2314,7 +3496,7 @@ func (t *WSSTransport) releasePooled(next NodeID, pw *pooledWS) {
 			p.active--
 		}
 		p.lastUsed = now
-		if (p.draining || t.isExpired(p, now)) && p.active == 0 {
+		if (p.draining || t.isExpired(p, now)) && p.active == 0 && !p.pinned {
 			p.conn.Close()
 			logDebug("[mux pool %s] retire mux (addr=%p)", next, p)
 			continue
@@ -2352,6 +3534,9 @@ func (t *WSSTransport) evictPooled(next NodeID, pw *pooledWS) {
 }
 
 func (t *WSSTransport) isExpired(p *pooledWS, now time.Time) bool {
+	if p != nil && p.pinned {
+		return false
+	}
 	maxAge := t.maxConnAge
 	if maxAge <= 0 {
 		maxAge = 10 * time.Minute
@@ -2607,6 +3792,58 @@ func (t *WSSTransport) muxServe(ctx context.Context, mm *MuxManager) {
 					}
 					logTest("mux stream=%d recv ctrlProbe path=%v target=%s", f.streamID, hdr.Path, hdr.RemoteAddr)
 					t.handleMuxHeader(ctx, mm, f.streamID, hdr)
+				} else if ct == ctrlReturnReady {
+					var msg returnReadyMsg
+					if err := json.Unmarshal(payload, &msg); err != nil {
+						continue
+					}
+					log.Printf("[mux stream=%d] recv return ready session=%s entry=%s exit=%s route=%s auto=%v", f.streamID, msg.Session, msg.Entry, msg.Exit, msg.Route, msg.Auto)
+					t.markReturnReady(msg)
+					t.markDiagReturnReady(msg.DiagRun)
+					if msg.DiagRun != "" && t.diagReport != nil {
+						t.diagReport(DiagEvent{
+							RunID:  msg.DiagRun,
+							Route:  msg.Route,
+							Node:   string(t.Self),
+							Stage:  "return_ready",
+							Detail: fmt.Sprintf("entry=%s exit=%s auto=%v", msg.Entry, msg.Exit, msg.Auto),
+							At:     time.Now().UnixMilli(),
+						})
+					}
+					if peer := t.relayPeer(mm, f.streamID); peer != nil {
+						_ = peer.WriteFlags(context.Background(), flagCTRL, marshalCtrl(ctrlReturnReady, payload))
+					}
+				} else if ct == ctrlReturnFail {
+					var msg returnFailMsg
+					if err := json.Unmarshal(payload, &msg); err != nil {
+						continue
+					}
+					log.Printf("[mux stream=%d] recv return fail session=%s entry=%s exit=%s route=%s auto=%v err=%s", f.streamID, msg.Session, msg.Entry, msg.Exit, msg.Route, msg.Auto, msg.Error)
+					t.markReturnFail(msg)
+					t.markDiagReturnFail(msg.DiagRun, msg.Error)
+					if msg.DiagRun != "" && t.diagReport != nil {
+						t.diagReport(DiagEvent{
+							RunID:  msg.DiagRun,
+							Route:  msg.Route,
+							Node:   string(t.Self),
+							Stage:  "return_fail",
+							Detail: fmt.Sprintf("entry=%s exit=%s auto=%v err=%s", msg.Entry, msg.Exit, msg.Auto, msg.Error),
+							At:     time.Now().UnixMilli(),
+						})
+					}
+					if peer := t.relayPeer(mm, f.streamID); peer != nil {
+						_ = peer.WriteFlags(context.Background(), flagCTRL, marshalCtrl(ctrlReturnFail, payload))
+					}
+				} else if ct == ctrlReturnAck {
+					var msg returnReadyMsg
+					if err := json.Unmarshal(payload, &msg); err != nil {
+						continue
+					}
+					log.Printf("[mux stream=%d] recv return ack session=%s entry=%s exit=%s route=%s auto=%v", f.streamID, msg.Session, msg.Entry, msg.Exit, msg.Route, msg.Auto)
+					t.markReturnAck(msg.Session)
+					if peer := t.relayPeer(mm, f.streamID); peer != nil {
+						_ = peer.WriteFlags(context.Background(), flagCTRL, marshalCtrl(ctrlReturnAck, payload))
+					}
 				} else {
 					log.Printf("[mux stream=%d] ignore ctrl type=%d", f.streamID, ct)
 				}
@@ -2639,6 +3876,18 @@ func (t *WSSTransport) handleMuxHeader(ctx context.Context, mm *MuxManager, stre
 	if len(hdr.Path) == 0 || hdr.Path[0] != t.Self {
 		log.Printf("[mux stream=%d] header path mismatch, expected start %s got %v", streamID, t.Self, hdr.Path)
 		return
+	}
+	t.reportDiag(hdr, "recv_header", fmt.Sprintf("return=%v proto=%s", hdr.Return, hdr.Proto))
+	if hdr.DiagRunID != "" {
+		t.reportDiag(hdr, "links_inbound", formatNodeList(t.inboundPeers()))
+		t.reportDiag(hdr, "links_outbound", formatOutboundStats(t.PoolSnapshot()))
+	}
+	if hdr.Return {
+		log.Printf("[mux stream=%d] recv return header session=%s path=%v", streamID, hdr.Session, hdr.Path)
+	} else {
+		if upstream := upstreamFromHeader(hdr, t.Self); upstream != "" {
+			t.registerInboundMux(upstream, mm)
+		}
 	}
 	remaining := hdr.Path[1:]
 
@@ -2974,6 +4223,85 @@ func safeAddr(c net.Conn) string {
 	}
 	if addr := c.RemoteAddr(); addr != nil {
 		return addr.String()
+	}
+	return ""
+}
+
+func (t *WSSTransport) reportDiag(hdr ControlHeader, stage string, detail string) {
+	if t == nil || t.diagReport == nil || hdr.DiagRunID == "" {
+		return
+	}
+	ev := DiagEvent{
+		RunID:   hdr.DiagRunID,
+		Route:   hdr.DiagRoute,
+		Node:    string(t.Self),
+		Stage:   stage,
+		Detail:  detail,
+		Session: hdr.Session,
+		At:      time.Now().UnixMilli(),
+	}
+	if len(hdr.FullPath) > 0 {
+		ev.Path = make([]string, 0, len(hdr.FullPath))
+		for _, p := range hdr.FullPath {
+			ev.Path = append(ev.Path, string(p))
+		}
+	} else if len(hdr.Path) > 0 {
+		ev.Path = make([]string, 0, len(hdr.Path))
+		for _, p := range hdr.Path {
+			ev.Path = append(ev.Path, string(p))
+		}
+	}
+	if len(hdr.ReturnPath) > 0 {
+		ev.ReturnPath = make([]string, 0, len(hdr.ReturnPath))
+		for _, p := range hdr.ReturnPath {
+			ev.ReturnPath = append(ev.ReturnPath, string(p))
+		}
+	}
+	t.diagReport(ev)
+}
+
+func formatNodeList(nodes []NodeID) string {
+	if len(nodes) == 0 {
+		return "-"
+	}
+	items := make([]string, 0, len(nodes))
+	for _, n := range nodes {
+		if n != "" {
+			items = append(items, string(n))
+		}
+	}
+	sort.Strings(items)
+	return strings.Join(items, ",")
+}
+
+func formatOutboundStats(stats map[NodeID]MuxPoolStats) string {
+	if len(stats) == 0 {
+		return "-"
+	}
+	parts := make([]string, 0, len(stats))
+	for node, st := range stats {
+		if node == "" {
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%s(%d/%d)", node, st.Active, st.Total))
+	}
+	sort.Strings(parts)
+	if len(parts) == 0 {
+		return "-"
+	}
+	return strings.Join(parts, ",")
+}
+
+func upstreamFromHeader(hdr ControlHeader, self NodeID) NodeID {
+	if len(hdr.FullPath) >= 2 {
+		for i := 1; i < len(hdr.FullPath); i++ {
+			if hdr.FullPath[i] == self {
+				return hdr.FullPath[i-1]
+			}
+		}
+	}
+	if hdr.EntryNode != "" && hdr.EntryNode != self {
+		return hdr.EntryNode
 	}
 	return ""
 }
@@ -3381,51 +4709,57 @@ func (w *countingWriter) Write(p []byte) (int, error) {
 }
 
 type ManualRoute struct {
-	Name     string
-	Priority int
-	Path     []NodeID
-	Remote   string
+	Name       string
+	Priority   int
+	Path       []NodeID
+	Remote     string
+	ReturnPath []NodeID
 }
 
 // Node wires entries, probing, routing, and transport.
 type Node struct {
-	ID             NodeID
-	Entries        []EntryPort
-	Router         *Router
-	Prober         Prober
-	Transport      Transport
-	Peers          []NodeID
-	PollPeriod     time.Duration
-	Metrics        *Metrics
-	MaxReroute     int
-	udpTTL         time.Duration
-	ControllerURL  string
-	TopologyPull   time.Duration
-	RoutePull      time.Duration
-	TokenPath      string
-	Compression    string
-	CompressionMin int
-	TransportMode  string
-	HTTPProbeURL   string
-	CertPath       string
-	KeyPath        string
-	AuthKey        []byte
-	DebugLog       bool
-	EncPolicies    []EncryptionPolicy
-	lastMetrics    map[NodeID]LinkMetrics
-	metricsMu      sync.Mutex
-	routePlans     map[NodeID][]ManualRoute
-	routeMu        sync.RWMutex
-	TLSConfig      *tls.Config
-	ServerName     string
-	tokenOnce      sync.Once
-	tokenValue     string
-	wsMu           sync.Mutex
-	wsConn         *wscompat.Conn
-	maxMuxStreams  int
-	muxMaxAge      time.Duration
-	muxMaxIdle     time.Duration
-	memLimit       string
+	ID                 NodeID
+	Entries            []EntryPort
+	Router             *Router
+	Prober             Prober
+	Transport          Transport
+	Peers              []NodeID
+	PollPeriod         time.Duration
+	Metrics            *Metrics
+	MaxReroute         int
+	udpTTL             time.Duration
+	ControllerURL      string
+	TopologyPull       time.Duration
+	RoutePull          time.Duration
+	TokenPath          string
+	Compression        string
+	CompressionMin     int
+	TransportMode      string
+	HTTPProbeURL       string
+	CertPath           string
+	KeyPath            string
+	AuthKey            []byte
+	DebugLog           bool
+	EncPolicies        []EncryptionPolicy
+	lastMetrics        map[NodeID]LinkMetrics
+	metricsMu          sync.Mutex
+	routePlans         map[NodeID][]ManualRoute
+	routeMu            sync.RWMutex
+	TLSConfig          *tls.Config
+	ServerName         string
+	PeerEndpoints      map[NodeID]string
+	tokenOnce          sync.Once
+	tokenValue         string
+	wsMu               sync.Mutex
+	wsConn             *wscompat.Conn
+	maxMuxStreams      int
+	muxMaxAge          time.Duration
+	muxMaxIdle         time.Duration
+	memLimit           string
+	preconnectPeers    []NodeID
+	preconnectInterval time.Duration
+	updateMu           sync.Mutex
+	updating           bool
 }
 
 func (n *Node) Start(ctx context.Context) error {
@@ -3455,6 +4789,9 @@ func (n *Node) Start(ctx context.Context) error {
 			log.Printf("transport server stopped: %v", err)
 		}
 	}()
+	if ws, ok := n.Transport.(*WSSTransport); ok && len(n.preconnectPeers) > 0 {
+		ws.StartPreconnect(ctx, n.preconnectPeers, n.preconnectInterval)
+	}
 	for _, ep := range n.Entries {
 		ep := ep
 		switch ep.Proto {
@@ -3510,23 +4847,40 @@ func (n *Node) matchingManualRoutes(exit NodeID, remote string) []ManualRoute {
 	return filtered
 }
 
-func (n *Node) pathForAttempt(exit NodeID, remote string, attempt int) ([]NodeID, error) {
+type routeSelection struct {
+	Path       []NodeID
+	ReturnPath []NodeID
+	Name       string
+}
+
+func (n *Node) routeForAttempt(exit NodeID, remote string, attempt int) (routeSelection, error) {
 	routes := n.matchingManualRoutes(exit, remote)
 	if attempt < len(routes) {
 		r := routes[attempt]
 		if len(r.Path) < 2 {
-			return nil, fmt.Errorf("manual route %q too short", r.Name)
+			return routeSelection{}, fmt.Errorf("manual route %q too short", r.Name)
 		}
 		if r.Path[0] != n.ID {
-			return nil, fmt.Errorf("manual route %q must start from %s", r.Name, n.ID)
+			return routeSelection{}, fmt.Errorf("manual route %q must start from %s", r.Name, n.ID)
 		}
 		if r.Path[len(r.Path)-1] != exit {
-			return nil, fmt.Errorf("manual route %q must end at exit %s", r.Name, exit)
+			return routeSelection{}, fmt.Errorf("manual route %q must end at exit %s", r.Name, exit)
 		}
 		log.Printf("[route] using manual route %q (priority=%d) for %s -> %s remote=%s: %v", r.Name, r.Priority, n.ID, exit, remote, r.Path)
-		return r.Path, nil
+		sel := routeSelection{Path: r.Path, ReturnPath: r.ReturnPath, Name: r.Name}
+		if len(sel.ReturnPath) > 0 {
+			if len(sel.ReturnPath) < 2 || sel.ReturnPath[0] != exit || sel.ReturnPath[len(sel.ReturnPath)-1] != n.ID {
+				log.Printf("[route] ignore return_path for %q: expect %s -> %s, got %v", r.Name, exit, n.ID, sel.ReturnPath)
+				sel.ReturnPath = nil
+			}
+		}
+		return sel, nil
 	}
-	return n.Router.BestPath(n.ID, exit)
+	path, err := n.Router.BestPath(n.ID, exit)
+	if err != nil {
+		return routeSelection{}, err
+	}
+	return routeSelection{Path: path, Name: "auto"}, nil
 }
 
 func (n *Node) routeAttempts(exit NodeID, remote string) int {
@@ -3652,12 +5006,12 @@ func (n *Node) serveTCP(ctx context.Context, ep EntryPort) {
 			if n.Metrics != nil {
 				n.Metrics.IncTCP()
 			}
-			path, err := n.pathForAttempt(ep.ExitNode, ep.RemoteAddr, 0)
+			routeSel, err := n.routeForAttempt(ep.ExitNode, ep.RemoteAddr, 0)
 			if err != nil {
 				log.Printf("tcp forwarding failed: %v", err)
 				return
 			}
-			if err := n.Transport.Forward(ctx, n.ID, path, ep.Proto, c, ep.RemoteAddr); err != nil {
+			if err := n.Transport.Forward(ctx, n.ID, routeSel.Path, routeSel.ReturnPath, ep.Proto, c, ep.RemoteAddr, routeSel.Name); err != nil {
 				log.Printf("tcp forwarding failed: %v", err)
 			}
 		}(conn)
@@ -3701,12 +5055,14 @@ func (n *Node) serveUDP(ctx context.Context, ep EntryPort) {
 				var wsConn *wscompat.Conn
 				var err error
 				for try := 0; try < attempts; try++ {
-					path, err = n.pathForAttempt(ep.ExitNode, ep.RemoteAddr, try)
+					routeSel, selErr := n.routeForAttempt(ep.ExitNode, ep.RemoteAddr, try)
+					path = routeSel.Path
+					err = selErr
 					if err != nil {
 						log.Printf("udp route selection failed (attempt %d/%d): %v", try+1, attempts, err)
 						continue
 					}
-					wsConn, sessionID, err = transport.OpenUDPSession(ctx, path, ep.RemoteAddr)
+					wsConn, sessionID, err = transport.OpenUDPSession(ctx, path, ep.RemoteAddr, clientAddr.String())
 					if err == nil {
 						break
 					}
@@ -3816,42 +5172,45 @@ type entryConfig struct {
 }
 
 type routePlanConfig struct {
-	Name     string   `json:"name"`
-	Exit     string   `json:"exit"`
-	Remote   string   `json:"remote"`
-	Priority int      `json:"priority"`
-	Path     []string `json:"path"`
+	Name       string   `json:"name"`
+	Exit       string   `json:"exit"`
+	Remote     string   `json:"remote"`
+	Priority   int      `json:"priority"`
+	Path       []string `json:"path"`
+	ReturnPath []string `json:"return_path"`
 }
 
 type nodeConfig struct {
-	ID              string             `json:"id"`
-	WSListen        string             `json:"ws_listen"`
-	QUICListen      string             `json:"quic_listen"`
-	WSSListen       string             `json:"wss_listen"`
-	Peers           map[string]string  `json:"peers"` // node -> ws(s)://host:port/mesh
-	Entries         []entryConfig      `json:"entries"`
-	Routes          []routePlanConfig  `json:"routes"`
-	PollPeriod      string             `json:"poll_period"`
-	InsecureSkipTLS bool               `json:"insecure_skip_tls"`
-	QUICServerName  string             `json:"quic_server_name"`
-	MaxIdle         string             `json:"quic_max_idle"`
-	MaxDatagramSize int                `json:"quic_max_datagram_size"`
-	AuthKey         string             `json:"auth_key"`
-	MetricsListen   string             `json:"metrics_listen"`
-	MTLSCert        string             `json:"mtls_cert"`
-	MTLSKey         string             `json:"mtls_key"`
-	MTLSCA          string             `json:"mtls_ca"`
-	ControllerURL   string             `json:"controller_url"`
-	TopologyPull    string             `json:"topology_pull"`
-	RoutePull       string             `json:"route_pull"`
-	Compression     string             `json:"compression"`
-	CompressionMin  int                `json:"compression_min_bytes"`
-	Transport       string             `json:"transport"`
-	TokenPath       string             `json:"token_path"`
-	DebugLog        bool               `json:"debug_log"`
-	HTTPProbeURL    string             `json:"http_probe_url"`
-	EncPolicies     []EncryptionPolicy `json:"encryption_policies"`
-	MemLimit        string             `json:"mem_limit"`
+	ID                 string             `json:"id"`
+	WSListen           string             `json:"ws_listen"`
+	QUICListen         string             `json:"quic_listen"`
+	WSSListen          string             `json:"wss_listen"`
+	Peers              map[string]string  `json:"peers"` // node -> ws(s)://host:port/mesh
+	Entries            []entryConfig      `json:"entries"`
+	Routes             []routePlanConfig  `json:"routes"`
+	PollPeriod         string             `json:"poll_period"`
+	InsecureSkipTLS    bool               `json:"insecure_skip_tls"`
+	QUICServerName     string             `json:"quic_server_name"`
+	MaxIdle            string             `json:"quic_max_idle"`
+	MaxDatagramSize    int                `json:"quic_max_datagram_size"`
+	AuthKey            string             `json:"auth_key"`
+	MetricsListen      string             `json:"metrics_listen"`
+	MTLSCert           string             `json:"mtls_cert"`
+	MTLSKey            string             `json:"mtls_key"`
+	MTLSCA             string             `json:"mtls_ca"`
+	ControllerURL      string             `json:"controller_url"`
+	TopologyPull       string             `json:"topology_pull"`
+	RoutePull          string             `json:"route_pull"`
+	Compression        string             `json:"compression"`
+	CompressionMin     int                `json:"compression_min_bytes"`
+	Transport          string             `json:"transport"`
+	TokenPath          string             `json:"token_path"`
+	DebugLog           bool               `json:"debug_log"`
+	HTTPProbeURL       string             `json:"http_probe_url"`
+	EncPolicies        []EncryptionPolicy `json:"encryption_policies"`
+	MemLimit           string             `json:"mem_limit"`
+	PreconnectPeers    []string           `json:"preconnect_peers"`
+	PreconnectInterval string             `json:"preconnect_interval"`
 }
 
 func loadConfig(path string) (nodeConfig, error) {
@@ -4028,15 +5387,20 @@ func buildManualRouteMap(self NodeID, routes []routePlanConfig) map[NodeID][]Man
 		for _, p := range r.Path {
 			path = append(path, NodeID(p))
 		}
+		returnPath := make([]NodeID, 0, len(r.ReturnPath))
+		for _, p := range r.ReturnPath {
+			returnPath = append(returnPath, NodeID(p))
+		}
 		if path[0] != self {
 			path = append([]NodeID{self}, path...)
 		}
 		exit := path[len(path)-1]
 		plans[exit] = append(plans[exit], ManualRoute{
-			Name:     r.Name,
-			Priority: r.Priority,
-			Path:     path,
-			Remote:   r.Remote,
+			Name:       r.Name,
+			Priority:   r.Priority,
+			Path:       path,
+			Remote:     r.Remote,
+			ReturnPath: returnPath,
 		})
 	}
 	for exit := range plans {
@@ -4175,6 +5539,7 @@ func main() {
 	tokenPath := flag.String("token", "/opt/arouter/.token", "path to node token file")
 	flag.Parse()
 
+	buildVersion = canonicalVersion(buildVersion)
 	log.Printf("arouter agent version %s", buildVersion)
 	log.SetOutput(logFilter)
 
@@ -4403,38 +5768,58 @@ func main() {
 		}
 
 		routePlans := buildManualRouteMap(NodeID(cfg.ID), cfg.Routes)
+		var preconnectPeers []NodeID
+		for _, p := range cfg.PreconnectPeers {
+			if strings.TrimSpace(p) != "" {
+				preconnectPeers = append(preconnectPeers, NodeID(p))
+			}
+		}
+		if len(preconnectPeers) == 0 {
+			for peer := range endpoints {
+				if peer != "" {
+					preconnectPeers = append(preconnectPeers, peer)
+				}
+			}
+		}
+		preconnectInterval := parseDurationOrDefault(cfg.PreconnectInterval, 30*time.Second)
 
 		node := &Node{
-			ID:             NodeID(cfg.ID),
-			Entries:        entries,
-			Router:         router,
-			Prober:         prober,
-			Transport:      transport,
-			Peers:          peerIDs,
-			PollPeriod:     parseDurationOrDefault(cfg.PollPeriod, 5*time.Second),
-			Metrics:        metrics,
-			MaxReroute:     1,
-			udpTTL:         udpTTL,
-			ControllerURL:  cfg.ControllerURL,
-			TopologyPull:   parseDurationOrDefault(cfg.TopologyPull, 5*time.Minute),
-			RoutePull:      routePull,
-			Compression:    compression,
-			CompressionMin: cfg.CompressionMin,
-			TransportMode:  mode,
-			HTTPProbeURL:   cfg.HTTPProbeURL,
-			CertPath:       platformPath(defaultIfEmpty(cfg.MTLSCert, "/opt/arouter/certs/arouter.crt")),
-			KeyPath:        platformPath(defaultIfEmpty(cfg.MTLSKey, "/opt/arouter/certs/arouter.key")),
-			AuthKey:        authKey,
-			routePlans:     routePlans,
-			TokenPath:      platformPath(defaultIfEmpty(*tokenPath, "/opt/arouter/.token")),
-			DebugLog:       cfg.DebugLog,
-			EncPolicies:    cfg.EncPolicies,
-			maxMuxStreams:  maxStreams,
-			muxMaxAge:      muxMaxAge,
-			muxMaxIdle:     muxMaxIdle,
-			memLimit:       cfg.MemLimit,
-			TLSConfig:      tlsConf,
-			ServerName:     cfg.QUICServerName,
+			ID:                 NodeID(cfg.ID),
+			Entries:            entries,
+			Router:             router,
+			Prober:             prober,
+			Transport:          transport,
+			Peers:              peerIDs,
+			PollPeriod:         parseDurationOrDefault(cfg.PollPeriod, 5*time.Second),
+			Metrics:            metrics,
+			MaxReroute:         1,
+			udpTTL:             udpTTL,
+			ControllerURL:      cfg.ControllerURL,
+			TopologyPull:       parseDurationOrDefault(cfg.TopologyPull, 5*time.Minute),
+			RoutePull:          routePull,
+			Compression:        compression,
+			CompressionMin:     cfg.CompressionMin,
+			TransportMode:      mode,
+			HTTPProbeURL:       cfg.HTTPProbeURL,
+			CertPath:           platformPath(defaultIfEmpty(cfg.MTLSCert, "/opt/arouter/certs/arouter.crt")),
+			KeyPath:            platformPath(defaultIfEmpty(cfg.MTLSKey, "/opt/arouter/certs/arouter.key")),
+			AuthKey:            authKey,
+			routePlans:         routePlans,
+			TokenPath:          platformPath(defaultIfEmpty(*tokenPath, "/opt/arouter/.token")),
+			DebugLog:           cfg.DebugLog,
+			EncPolicies:        cfg.EncPolicies,
+			maxMuxStreams:      maxStreams,
+			muxMaxAge:          muxMaxAge,
+			muxMaxIdle:         muxMaxIdle,
+			memLimit:           cfg.MemLimit,
+			preconnectPeers:    preconnectPeers,
+			preconnectInterval: preconnectInterval,
+			TLSConfig:          tlsConf,
+			ServerName:         cfg.QUICServerName,
+			PeerEndpoints:      endpoints,
+		}
+		if ws, ok := transport.(*WSSTransport); ok {
+			ws.diagReport = node.reportDiag
 		}
 
 		ctx, cancel := context.WithCancel(context.Background())
