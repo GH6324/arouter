@@ -31,6 +31,15 @@ type returnFailMsg struct {
 	DiagRun string `json:"diag_run_id,omitempty"`
 }
 
+type returnAckInfo struct {
+	start  time.Time
+	entry  string
+	exit   string
+	route  string
+	auto   bool
+	diagID string
+}
+
 func (t *WSSTransport) registerReturnSession(id string, sess *returnSession) {
 	if id == "" || sess == nil {
 		return
@@ -136,6 +145,31 @@ func (t *WSSTransport) registerReturnAckWait(id string) chan struct{} {
 	return ch
 }
 
+func (t *WSSTransport) registerReturnAckInfo(id string, info returnAckInfo) {
+	if id == "" {
+		return
+	}
+	t.returnAckMu.Lock()
+	if t.returnAckInfo == nil {
+		t.returnAckInfo = make(map[string]returnAckInfo)
+	}
+	t.returnAckInfo[id] = info
+	t.returnAckMu.Unlock()
+}
+
+func (t *WSSTransport) popReturnAckInfo(id string) (returnAckInfo, bool) {
+	t.returnAckMu.Lock()
+	defer t.returnAckMu.Unlock()
+	if t.returnAckInfo == nil {
+		return returnAckInfo{}, false
+	}
+	info, ok := t.returnAckInfo[id]
+	if ok {
+		delete(t.returnAckInfo, id)
+	}
+	return info, ok
+}
+
 func (t *WSSTransport) markReturnAck(id string) {
 	if id == "" {
 		return
@@ -150,6 +184,19 @@ func (t *WSSTransport) markReturnAck(id string) {
 		close(ch)
 	}
 	t.returnAckMu.Unlock()
+	if info, ok := t.popReturnAckInfo(id); ok {
+		rtt := time.Since(info.start)
+		if t.diagReport != nil && info.diagID != "" {
+			t.diagReport(DiagEvent{
+				RunID:  info.diagID,
+				Route:  info.route,
+				Node:   string(t.Self),
+				Stage:  "return_ack_rtt",
+				Detail: fmt.Sprintf("rtt=%s entry=%s exit=%s auto=%v", rtt, info.entry, info.exit, info.auto),
+				At:     time.Now().UnixMilli(),
+			})
+		}
+	}
 	log.Printf("[session=%s] return ack received", id)
 }
 
@@ -168,8 +215,19 @@ func (t *WSSTransport) waitReturnAck(id string, timeout time.Duration) bool {
 	case <-ch:
 		return true
 	case <-timer.C:
+		_, _ = t.popReturnAckInfo(id)
 		return false
 	}
+}
+
+func (t *WSSTransport) getReturnAckTimeout() time.Duration {
+	if t == nil {
+		return 10 * time.Second
+	}
+	if t.returnAckTimeout > 0 {
+		return t.returnAckTimeout
+	}
+	return 10 * time.Second
 }
 
 func (t *WSSTransport) markReturnReady(msg returnReadyMsg) {
@@ -360,9 +418,16 @@ func copyOneWayMaybeCompressed(session string, dst, src net.Conn, compression st
 func (t *WSSTransport) handleMuxHeaderReturnIngress(ctx context.Context, mm *MuxManager, streamID uint32, sessionID string, hdr ControlHeader, upStream *MuxStream) {
 	log.Printf("[mux stream=%d] return ingress session=%s entry=%s exit=%s", streamID, sessionID, hdr.EntryNode, t.Self)
 	t.reportDiag(hdr, "return_ingress", "recv return header")
-	ackPayload, _ := json.Marshal(returnReadyMsg{Session: sessionID, Entry: string(t.Self)})
+	ackPayload, _ := json.Marshal(returnReadyMsg{
+		Session: sessionID,
+		Entry:   string(t.Self),
+		Route:   hdr.RouteName,
+		Auto:    false,
+		DiagRun: hdr.DiagRunID,
+	})
 	_ = upStream.WriteFlags(context.Background(), flagCTRL, marshalCtrl(ctrlReturnAck, ackPayload))
 	log.Printf("[mux stream=%d] send return ack session=%s entry=%s", streamID, sessionID, t.Self)
+	t.reportDiag(hdr, "return_ack_sent", fmt.Sprintf("entry=%s exit=%s auto=%v", hdr.EntryNode, t.Self, false))
 	sess, ok := t.popReturnSession(sessionID)
 	if !ok || sess == nil || sess.downstream == nil {
 		log.Printf("[mux stream=%d] return session %s not found", streamID, sessionID)
@@ -422,10 +487,25 @@ func (t *WSSTransport) handleReturnEgress(ctx context.Context, sessionID string,
 		return err
 	}
 	log.Printf("[session=%s] return stream established via %s path=%v", sessionID, next, hdr.ReturnPath)
-	if !t.waitReturnAck(sessionID, 5*time.Second) {
-		err := fmt.Errorf("return ack timeout")
-		t.sendReturnFail(upStream, sessionID, hdr, auto, err)
-		return err
+	waitAck := hdr.DiagRunID != ""
+	if waitAck {
+		entry := ""
+		if len(hdr.ReturnPath) > 0 {
+			entry = string(hdr.ReturnPath[len(hdr.ReturnPath)-1])
+		}
+		routeName := hdr.RouteName
+		if routeName == "" {
+			routeName = "auto"
+		}
+		t.registerReturnAckInfo(sessionID, returnAckInfo{
+			start:  time.Now(),
+			entry:  entry,
+			exit:   string(t.Self),
+			route:  routeName,
+			auto:   auto,
+			diagID: hdr.DiagRunID,
+		})
+		go t.waitReturnAck(sessionID, t.getReturnAckTimeout())
 	}
 	t.sendReturnReady(upStream, sessionID, hdr, auto)
 
@@ -442,10 +522,25 @@ func (t *WSSTransport) handleReturnEgressOnMux(ctx context.Context, sessionID st
 		return err
 	}
 	log.Printf("[session=%s] return stream established via upstream mux path=%v", sessionID, hdr.ReturnPath)
-	if !t.waitReturnAck(sessionID, 5*time.Second) {
-		err := fmt.Errorf("return ack timeout")
-		t.sendReturnFail(upStream, sessionID, hdr, auto, err)
-		return err
+	waitAck := hdr.DiagRunID != ""
+	if waitAck {
+		entry := ""
+		if len(hdr.ReturnPath) > 0 {
+			entry = string(hdr.ReturnPath[len(hdr.ReturnPath)-1])
+		}
+		routeName := hdr.RouteName
+		if routeName == "" {
+			routeName = "auto"
+		}
+		t.registerReturnAckInfo(sessionID, returnAckInfo{
+			start:  time.Now(),
+			entry:  entry,
+			exit:   string(t.Self),
+			route:  routeName,
+			auto:   auto,
+			diagID: hdr.DiagRunID,
+		})
+		go t.waitReturnAck(sessionID, t.getReturnAckTimeout())
 	}
 	t.sendReturnReady(upStream, sessionID, hdr, auto)
 

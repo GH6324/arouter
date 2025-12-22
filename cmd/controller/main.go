@@ -5,13 +5,13 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
-	"errors"
 	"database/sql/driver"
 	"embed"
 	_ "embed"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -204,9 +204,34 @@ type endpointCheckRun struct {
 	Results   []EndpointCheckResult
 }
 
+type TimeSyncStep struct {
+	Command string `json:"command"`
+	OK      bool   `json:"ok"`
+	Skipped bool   `json:"skipped,omitempty"`
+	Output  string `json:"output,omitempty"`
+	Error   string `json:"error,omitempty"`
+}
+
+type TimeSyncResult struct {
+	RunID    string         `json:"run_id"`
+	Node     string         `json:"node"`
+	Timezone string         `json:"timezone"`
+	Success  bool           `json:"success"`
+	Steps    []TimeSyncStep `json:"steps"`
+}
+
+type timeSyncRun struct {
+	RunID     string
+	CreatedAt time.Time
+	Nodes     []string
+	Results   []TimeSyncResult
+}
+
 var (
 	endpointCheckMu   sync.Mutex
 	endpointCheckRuns = make(map[string]*endpointCheckRun)
+	timeSyncMu        sync.Mutex
+	timeSyncRuns      = make(map[string]*timeSyncRun)
 )
 
 type NodeUpdateStatus struct {
@@ -439,16 +464,16 @@ func (s EncPolicyList) normalize() EncPolicyList {
 }
 
 type RoutePlan struct {
-	ID        uint       `gorm:"primaryKey" json:"id"`
-	NodeID    uint       `json:"-"`
-	Name      string     `json:"name"`
-	Exit      string     `json:"exit"`
-	Remote    string     `json:"remote"`
-	Priority  int        `json:"priority"`
-	Path      StringList `json:"path"`
+	ID         uint       `gorm:"primaryKey" json:"id"`
+	NodeID     uint       `json:"-"`
+	Name       string     `json:"name"`
+	Exit       string     `json:"exit"`
+	Remote     string     `json:"remote"`
+	Priority   int        `json:"priority"`
+	Path       StringList `json:"path"`
 	ReturnPath StringList `json:"return_path"`
-	CreatedAt time.Time  `json:"created_at"`
-	UpdatedAt time.Time  `json:"updated_at"`
+	CreatedAt  time.Time  `json:"created_at"`
+	UpdatedAt  time.Time  `json:"updated_at"`
 }
 
 type Peer struct {
@@ -475,8 +500,10 @@ type Setting struct {
 	Transport          string        `json:"transport"`
 	Compression        string        `json:"compression"`
 	CompressionMin     int           `json:"compression_min_bytes"`
+	MaxMuxStreams      int           `json:"max_mux_streams"`
 	DebugLog           bool          `json:"debug_log"`
 	HTTPProbeURL       string        `json:"http_probe_url"`
+	ReturnAckTimeout   string        `json:"return_ack_timeout"`
 	EncryptionPolicies EncPolicyList `json:"encryption_policies"`
 }
 
@@ -498,37 +525,38 @@ type UserClaims struct {
 }
 
 type ConfigResponse struct {
-	ID              string            `json:"id"`
-	WSListen        string            `json:"ws_listen"`
-	QUICListen      string            `json:"quic_listen"`
-	WSSListen       string            `json:"wss_listen"`
-	QUICServerName  string            `json:"quic_server_name"`
-	Peers           map[string]string `json:"peers"`
-	Entries         []EntryConfig     `json:"entries"`
-	PollPeriod      string            `json:"poll_period"`
-	InsecureSkipTLS bool              `json:"insecure_skip_tls"`
-	AuthKey         string            `json:"auth_key"`
-	MetricsListen   string            `json:"metrics_listen"`
-	RerouteAttempts int               `json:"reroute_attempts"`
-	UDPSessionTTL   string            `json:"udp_session_ttl"`
-	MTLSCert        string            `json:"mtls_cert"`
-	MTLSKey         string            `json:"mtls_key"`
-	MTLSCA          string            `json:"mtls_ca"`
-	ControllerURL   string            `json:"controller_url"`
-	Routes          []RouteConfig     `json:"routes,omitempty"`
-	Compression     string            `json:"compression,omitempty"`
-	CompressionMin  int               `json:"compression_min_bytes,omitempty"`
-	Transport       string            `json:"transport,omitempty"`
-	DebugLog        bool              `json:"debug_log,omitempty"`
-	TokenPath       string            `json:"token_path,omitempty"`
-	OS              string            `json:"os,omitempty"`
-	Arch            string            `json:"arch,omitempty"`
-	HTTPProbeURL    string            `json:"http_probe_url,omitempty"`
-	Encryption      []EncPolicy       `json:"encryption_policies,omitempty"`
-	MaxMuxStreams   int               `json:"max_mux_streams,omitempty"`
-	MuxMaxAge       string            `json:"mux_max_age,omitempty"`
-	MuxMaxIdle      string            `json:"mux_max_idle,omitempty"`
-	MemLimit        string            `json:"mem_limit,omitempty"`
+	ID               string            `json:"id"`
+	WSListen         string            `json:"ws_listen"`
+	QUICListen       string            `json:"quic_listen"`
+	WSSListen        string            `json:"wss_listen"`
+	QUICServerName   string            `json:"quic_server_name"`
+	Peers            map[string]string `json:"peers"`
+	Entries          []EntryConfig     `json:"entries"`
+	PollPeriod       string            `json:"poll_period"`
+	InsecureSkipTLS  bool              `json:"insecure_skip_tls"`
+	AuthKey          string            `json:"auth_key"`
+	MetricsListen    string            `json:"metrics_listen"`
+	RerouteAttempts  int               `json:"reroute_attempts"`
+	UDPSessionTTL    string            `json:"udp_session_ttl"`
+	MTLSCert         string            `json:"mtls_cert"`
+	MTLSKey          string            `json:"mtls_key"`
+	MTLSCA           string            `json:"mtls_ca"`
+	ControllerURL    string            `json:"controller_url"`
+	Routes           []RouteConfig     `json:"routes,omitempty"`
+	Compression      string            `json:"compression,omitempty"`
+	CompressionMin   int               `json:"compression_min_bytes,omitempty"`
+	Transport        string            `json:"transport,omitempty"`
+	DebugLog         bool              `json:"debug_log,omitempty"`
+	TokenPath        string            `json:"token_path,omitempty"`
+	OS               string            `json:"os,omitempty"`
+	Arch             string            `json:"arch,omitempty"`
+	HTTPProbeURL     string            `json:"http_probe_url,omitempty"`
+	ReturnAckTimeout string            `json:"return_ack_timeout,omitempty"`
+	Encryption       []EncPolicy       `json:"encryption_policies,omitempty"`
+	MaxMuxStreams    int               `json:"max_mux_streams,omitempty"`
+	MuxMaxAge        string            `json:"mux_max_age,omitempty"`
+	MuxMaxIdle       string            `json:"mux_max_idle,omitempty"`
+	MemLimit         string            `json:"mem_limit,omitempty"`
 }
 
 // applyOSOverrides 根据 os hint（例如 darwin）调整默认路径，便于节点在不同平台使用合适的目录。
@@ -574,11 +602,11 @@ func applyInstallDirOverrides(cfg ConfigResponse, installDir string) ConfigRespo
 }
 
 type RouteConfig struct {
-	Name     string   `json:"name"`
-	Exit     string   `json:"exit"`
-	Remote   string   `json:"remote,omitempty"`
-	Priority int      `json:"priority"`
-	Path     []string `json:"path"`
+	Name       string   `json:"name"`
+	Exit       string   `json:"exit"`
+	Remote     string   `json:"remote,omitempty"`
+	Priority   int      `json:"priority"`
+	Path       []string `json:"path"`
 	ReturnPath []string `json:"return_path,omitempty"`
 }
 
@@ -1401,11 +1429,11 @@ func main() {
 		routes := make([]RouteConfig, 0, len(node.Routes))
 		for _, r := range node.Routes {
 			routes = append(routes, RouteConfig{
-				Name:     r.Name,
-				Exit:     r.Exit,
-				Remote:   r.Remote,
-				Priority: r.Priority,
-				Path:     []string(r.Path),
+				Name:       r.Name,
+				Exit:       r.Exit,
+				Remote:     r.Remote,
+				Priority:   r.Priority,
+				Path:       []string(r.Path),
 				ReturnPath: []string(r.ReturnPath),
 			})
 		}
@@ -1453,13 +1481,13 @@ func main() {
 			return
 		}
 		if err := db.Model(&RoutePlan{}).Where("id = ? AND node_id = ?", rid, id).Updates(map[string]any{
-			"name":       req.Name,
-			"exit":       req.Exit,
-			"remote":     req.Remote,
-			"priority":   req.Priority,
-			"path":       req.Path,
+			"name":        req.Name,
+			"exit":        req.Exit,
+			"remote":      req.Remote,
+			"priority":    req.Priority,
+			"path":        req.Path,
 			"return_path": req.ReturnPath,
-			"updated_at": time.Now(),
+			"updated_at":  time.Now(),
 		}).Error; err != nil {
 			c.String(http.StatusBadRequest, "update failed: %v", err)
 			return
@@ -1522,10 +1550,10 @@ func main() {
 			return
 		}
 		var payload struct {
-			From    string                     `json:"from"`
-			Metrics map[string]LinkMetricsJSON `json:"metrics"`
-			ReturnStats []ReturnStatJSON       `json:"return_stats"`
-			Status  struct {
+			From        string                     `json:"from"`
+			Metrics     map[string]LinkMetricsJSON `json:"metrics"`
+			ReturnStats []ReturnStatJSON           `json:"return_stats"`
+			Status      struct {
 				CPUUsage    float64  `json:"cpu_usage"`
 				MemUsed     uint64   `json:"mem_used_bytes"`
 				MemTotal    uint64   `json:"mem_total_bytes"`
@@ -1670,7 +1698,7 @@ func main() {
 			if err := hub.sendCommand(name, map[string]any{
 				"type": "diag_collect",
 				"data": map[string]any{
-					"run_id":   run.RunID,
+					"run_id":       run.RunID,
 					"limit":        400,
 					"contains":     "",
 					"clear_before": true,
@@ -1873,10 +1901,10 @@ func main() {
 			switch msg.Type {
 			case "metrics":
 				var payload struct {
-					From    string                     `json:"from"`
-					Metrics map[string]LinkMetricsJSON `json:"metrics"`
-					ReturnStats []ReturnStatJSON       `json:"return_stats"`
-					Status  struct {
+					From        string                     `json:"from"`
+					Metrics     map[string]LinkMetricsJSON `json:"metrics"`
+					ReturnStats []ReturnStatJSON           `json:"return_stats"`
+					Status      struct {
 						CPUUsage    float64  `json:"cpu_usage"`
 						MemUsed     uint64   `json:"mem_used_bytes"`
 						MemTotal    uint64   `json:"mem_total_bytes"`
@@ -1948,12 +1976,12 @@ func main() {
 				}).Create(&status)
 			case "diag_report":
 				var res struct {
-					RunID   string   `json:"run_id"`
-					Node    string   `json:"node"`
-					At      int64    `json:"at"`
-					Lines   []string `json:"lines"`
-					Limit   int      `json:"limit"`
-					Filter  string   `json:"filter"`
+					RunID  string   `json:"run_id"`
+					Node   string   `json:"node"`
+					At     int64    `json:"at"`
+					Lines  []string `json:"lines"`
+					Limit  int      `json:"limit"`
+					Filter string   `json:"filter"`
 				}
 				if err := json.Unmarshal(msg.Data, &res); err != nil {
 					continue
@@ -1987,8 +2015,8 @@ func main() {
 				storeDiagTraceEvent(res)
 			case "endpoint_check_result":
 				var res struct {
-					RunID   string               `json:"run_id"`
-					Node    string               `json:"node"`
+					RunID   string                `json:"run_id"`
+					Node    string                `json:"node"`
 					Results []EndpointCheckResult `json:"results"`
 				}
 				if err := json.Unmarshal(msg.Data, &res); err != nil {
@@ -2003,6 +2031,15 @@ func main() {
 					}
 				}
 				storeEndpointCheckResults(res.RunID, res.Results)
+			case "time_sync_result":
+				var res TimeSyncResult
+				if err := json.Unmarshal(msg.Data, &res); err != nil {
+					continue
+				}
+				if res.Node == "" {
+					res.Node = node.Name
+				}
+				storeTimeSyncResult(res.RunID, res)
 			default:
 			}
 		}
@@ -2062,6 +2099,66 @@ func main() {
 		c.JSON(http.StatusOK, gin.H{
 			"run_id":  run.RunID,
 			"offline": offline,
+		})
+	})
+
+	authGroup.POST("/time-sync/run", func(c *gin.Context) {
+		var req struct {
+			Nodes    []string `json:"nodes"`
+			Timezone string   `json:"timezone"`
+		}
+		_ = c.ShouldBindJSON(&req)
+		var nodes []Node
+		db.Find(&nodes)
+		targets := make([]string, 0)
+		if len(req.Nodes) == 0 {
+			for _, n := range nodes {
+				targets = append(targets, n.Name)
+			}
+		} else {
+			targets = append(targets, req.Nodes...)
+		}
+		run := newTimeSyncRun(targets)
+		offline := make([]string, 0)
+		for _, name := range targets {
+			if err := hub.sendCommand(name, map[string]any{
+				"type": "time_sync",
+				"data": map[string]any{
+					"run_id":   run.RunID,
+					"timezone": req.Timezone,
+				},
+			}); err != nil {
+				offline = append(offline, name)
+			}
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"run_id":  run.RunID,
+			"offline": offline,
+		})
+	})
+
+	authGroup.GET("/time-sync", func(c *gin.Context) {
+		runID := strings.TrimSpace(c.Query("run_id"))
+		run := getTimeSyncRun(runID)
+		if run == nil {
+			c.JSON(http.StatusOK, gin.H{"run_id": runID, "results": []TimeSyncResult{}})
+			return
+		}
+		missing := make([]string, 0)
+		got := make(map[string]struct{}, len(run.Results))
+		for _, r := range run.Results {
+			got[r.Node] = struct{}{}
+		}
+		for _, n := range run.Nodes {
+			if _, ok := got[n]; !ok {
+				missing = append(missing, n)
+			}
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"run_id":     run.RunID,
+			"created_at": run.CreatedAt,
+			"results":    run.Results,
+			"missing":    missing,
 		})
 	})
 	authGroup.GET("/endpoint-check", func(c *gin.Context) {
@@ -2275,12 +2372,18 @@ func main() {
 			if req.CompressionMin >= 0 {
 				s.CompressionMin = req.CompressionMin
 			}
+			if req.MaxMuxStreams > 0 {
+				s.MaxMuxStreams = req.MaxMuxStreams
+			}
 			s.DebugLog = req.DebugLog
 			if req.EncryptionPolicies != nil {
 				s.EncryptionPolicies = req.EncryptionPolicies.normalize()
 			}
 			if strings.TrimSpace(req.HTTPProbeURL) != "" {
 				s.HTTPProbeURL = strings.TrimSpace(req.HTTPProbeURL)
+			}
+			if strings.TrimSpace(req.ReturnAckTimeout) != "" {
+				s.ReturnAckTimeout = strings.TrimSpace(req.ReturnAckTimeout)
 			}
 			if err := tx.Save(&s).Error; err != nil {
 				return err
@@ -2373,11 +2476,11 @@ func buildConfig(node Node, allNodes []Node, globalKey string, controllerBase st
 	routes := make([]RouteConfig, 0, len(node.Routes))
 	for _, r := range node.Routes {
 		routes = append(routes, RouteConfig{
-			Name:     r.Name,
-			Exit:     r.Exit,
-			Remote:   r.Remote,
-			Priority: r.Priority,
-			Path:     []string(r.Path),
+			Name:       r.Name,
+			Exit:       r.Exit,
+			Remote:     r.Remote,
+			Priority:   r.Priority,
+			Path:       []string(r.Path),
 			ReturnPath: []string(r.ReturnPath),
 		})
 	}
@@ -2392,37 +2495,38 @@ func buildConfig(node Node, allNodes []Node, globalKey string, controllerBase st
 		memLimit = "256MiB"
 	}
 	return ConfigResponse{
-		ID:              node.Name,
-		WSListen:        defaultIfEmpty(stripPortPrefix(node.WSListen), "18080"),
-		WSSListen:       stripPortPrefix(node.WSSListen),
-		QUICListen:      defaultIfEmpty(stripPortPrefix(node.QUICListen), stripPortPrefix(node.WSListen)),
-		QUICServerName:  defaultIfEmpty(node.QUICServerName, "arouter.529851.xyz"),
-		Peers:           peers,
-		Entries:         entries,
-		PollPeriod:      defaultIfEmpty(node.PollPeriod, "5s"),
-		InsecureSkipTLS: true,
-		AuthKey:         firstNonEmpty(globalKey, node.AuthKey, randomKey()),
-		MetricsListen:   defaultIfEmpty(stripPortPrefix(node.MetricsListen), "19090"),
-		RerouteAttempts: defaultInt(node.RerouteAttempts, 3),
-		UDPSessionTTL:   defaultIfEmpty(node.UDPSessionTTL, "60s"),
-		MTLSCert:        defaultIfEmpty(node.MTLSCert, "/opt/arouter/certs/arouter.crt"),
-		MTLSKey:         defaultIfEmpty(node.MTLSKey, "/opt/arouter/certs/arouter.key"),
-		MTLSCA:          node.MTLSCA,
-		ControllerURL:   defaultIfEmpty(node.ControllerURL, controllerBase),
-		Routes:          routes,
-		Compression:     defaultIfEmpty(settings.Compression, "gzip"),
-		CompressionMin:  defaultInt(settings.CompressionMin, node.CompressionMin),
-		Transport:       defaultIfEmpty(settings.Transport, "quic"),
-		DebugLog:        settings.DebugLog,
-		TokenPath:       "/opt/arouter/.token",
-		OS:              node.OSName,
-		Arch:            node.Arch,
-		HTTPProbeURL:    settings.HTTPProbeURL,
-		Encryption:      settings.EncryptionPolicies,
-		MaxMuxStreams:   node.MaxMuxStreams,
-		MuxMaxAge:       node.MuxMaxAge,
-		MuxMaxIdle:      node.MuxMaxIdle,
-		MemLimit:        memLimit,
+		ID:               node.Name,
+		WSListen:         defaultIfEmpty(stripPortPrefix(node.WSListen), "18080"),
+		WSSListen:        stripPortPrefix(node.WSSListen),
+		QUICListen:       defaultIfEmpty(stripPortPrefix(node.QUICListen), stripPortPrefix(node.WSListen)),
+		QUICServerName:   defaultIfEmpty(node.QUICServerName, "arouter.529851.xyz"),
+		Peers:            peers,
+		Entries:          entries,
+		PollPeriod:       defaultIfEmpty(node.PollPeriod, "5s"),
+		InsecureSkipTLS:  true,
+		AuthKey:          firstNonEmpty(globalKey, node.AuthKey, randomKey()),
+		MetricsListen:    defaultIfEmpty(stripPortPrefix(node.MetricsListen), "19090"),
+		RerouteAttempts:  defaultInt(node.RerouteAttempts, 3),
+		UDPSessionTTL:    defaultIfEmpty(node.UDPSessionTTL, "60s"),
+		MTLSCert:         defaultIfEmpty(node.MTLSCert, "/opt/arouter/certs/arouter.crt"),
+		MTLSKey:          defaultIfEmpty(node.MTLSKey, "/opt/arouter/certs/arouter.key"),
+		MTLSCA:           node.MTLSCA,
+		ControllerURL:    defaultIfEmpty(node.ControllerURL, controllerBase),
+		Routes:           routes,
+		Compression:      defaultIfEmpty(settings.Compression, "gzip"),
+		CompressionMin:   defaultInt(settings.CompressionMin, node.CompressionMin),
+		Transport:        defaultIfEmpty(settings.Transport, "quic"),
+		DebugLog:         settings.DebugLog,
+		TokenPath:        "/opt/arouter/.token",
+		OS:               node.OSName,
+		Arch:             node.Arch,
+		HTTPProbeURL:     settings.HTTPProbeURL,
+		ReturnAckTimeout: defaultIfEmpty(settings.ReturnAckTimeout, "10s"),
+		Encryption:       settings.EncryptionPolicies,
+		MaxMuxStreams:    defaultInt(settings.MaxMuxStreams, node.MaxMuxStreams),
+		MuxMaxAge:        node.MuxMaxAge,
+		MuxMaxIdle:       node.MuxMaxIdle,
+		MemLimit:         memLimit,
 	}
 }
 
@@ -2898,11 +3002,13 @@ func ensureGlobalSettings(db *gorm.DB) {
 	}
 	if cnt == 0 {
 		def := Setting{
-			Transport:      envOrDefault("GLOBAL_TRANSPORT", "quic"),
-			Compression:    envOrDefault("GLOBAL_COMPRESSION", "none"),
-			CompressionMin: 0,
-			DebugLog:       false,
-			HTTPProbeURL:   envOrDefault("GLOBAL_HTTP_PROBE_URL", "https://www.google.com/generate_204"),
+			Transport:        envOrDefault("GLOBAL_TRANSPORT", "quic"),
+			Compression:      envOrDefault("GLOBAL_COMPRESSION", "none"),
+			CompressionMin:   0,
+			MaxMuxStreams:    defaultIntFromEnv("GLOBAL_MAX_MUX_STREAMS", 4),
+			DebugLog:         false,
+			HTTPProbeURL:     envOrDefault("GLOBAL_HTTP_PROBE_URL", "https://www.google.com/generate_204"),
+			ReturnAckTimeout: envOrDefault("GLOBAL_RETURN_ACK_TIMEOUT", "10s"),
 			EncryptionPolicies: EncPolicyList{
 				{ID: 1, Name: "aes128", Method: "aes-128-gcm", Key: "YWFhYWFhYWFhYWFhYWFhYQ=="},
 				{ID: 2, Name: "chacha", Method: "chacha20-poly1305", Key: "YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWE="},
@@ -2922,11 +3028,13 @@ func loadSettings(db *gorm.DB) Setting {
 	if err := db.First(&s).Error; err != nil {
 		log.Printf("load settings failed, using defaults: %v", err)
 		return Setting{
-			Transport:      envOrDefault("GLOBAL_TRANSPORT", "quic"),
-			Compression:    envOrDefault("GLOBAL_COMPRESSION", "none"),
-			CompressionMin: 0,
-			DebugLog:       false,
-			HTTPProbeURL:   envOrDefault("GLOBAL_HTTP_PROBE_URL", "https://www.google.com/generate_204"),
+			Transport:        envOrDefault("GLOBAL_TRANSPORT", "quic"),
+			Compression:      envOrDefault("GLOBAL_COMPRESSION", "none"),
+			CompressionMin:   0,
+			MaxMuxStreams:    defaultIntFromEnv("GLOBAL_MAX_MUX_STREAMS", 4),
+			DebugLog:         false,
+			HTTPProbeURL:     envOrDefault("GLOBAL_HTTP_PROBE_URL", "https://www.google.com/generate_204"),
+			ReturnAckTimeout: envOrDefault("GLOBAL_RETURN_ACK_TIMEOUT", "10s"),
 			EncryptionPolicies: EncPolicyList{
 				{ID: 1, Name: "aes128", Method: "aes-128-gcm", Key: "YWFhYWFhYWFhYWFhYWFhYQ=="},
 			}.normalize(),
@@ -2934,6 +3042,12 @@ func loadSettings(db *gorm.DB) Setting {
 	}
 	if strings.TrimSpace(s.HTTPProbeURL) == "" {
 		s.HTTPProbeURL = envOrDefault("GLOBAL_HTTP_PROBE_URL", "https://www.google.com/generate_204")
+	}
+	if strings.TrimSpace(s.ReturnAckTimeout) == "" {
+		s.ReturnAckTimeout = envOrDefault("GLOBAL_RETURN_ACK_TIMEOUT", "10s")
+	}
+	if s.MaxMuxStreams <= 0 {
+		s.MaxMuxStreams = defaultIntFromEnv("GLOBAL_MAX_MUX_STREAMS", 4)
 	}
 	if len(s.EncryptionPolicies) == 0 {
 		s.EncryptionPolicies = EncPolicyList{
@@ -3045,10 +3159,10 @@ func getBearerToken(c *gin.Context) string {
 }
 
 func applyMetricsPayload(db *gorm.DB, node *Node, payload struct {
-	From    string                     `json:"from"`
-	Metrics map[string]LinkMetricsJSON `json:"metrics"`
-	ReturnStats []ReturnStatJSON       `json:"return_stats"`
-	Status  struct {
+	From        string                     `json:"from"`
+	Metrics     map[string]LinkMetricsJSON `json:"metrics"`
+	ReturnStats []ReturnStatJSON           `json:"return_stats"`
+	Status      struct {
 		CPUUsage    float64  `json:"cpu_usage"`
 		MemUsed     uint64   `json:"mem_used_bytes"`
 		MemTotal    uint64   `json:"mem_total_bytes"`
@@ -3094,7 +3208,7 @@ func applyMetricsPayload(db *gorm.DB, node *Node, payload struct {
 			FailReason: rs.FailReason,
 		}
 		db.Clauses(clause.OnConflict{
-			Columns:   []clause.Column{{Name: "node"}, {Name: "route"}, {Name: "entry"}, {Name: "exit"}, {Name: "auto"}},
+			Columns: []clause.Column{{Name: "node"}, {Name: "route"}, {Name: "entry"}, {Name: "exit"}, {Name: "auto"}},
 			DoUpdates: clause.Assignments(map[string]interface{}{
 				"pending":     status.Pending,
 				"ready_total": status.ReadyTotal,
@@ -3419,6 +3533,60 @@ func getEndpointCheckRun(runID string) *endpointCheckRun {
 	return clone
 }
 
+func newTimeSyncRun(nodes []string) *timeSyncRun {
+	runID := fmt.Sprintf("timesync-%d", time.Now().UnixNano())
+	run := &timeSyncRun{
+		RunID:     runID,
+		CreatedAt: time.Now(),
+		Nodes:     append([]string(nil), nodes...),
+		Results:   make([]TimeSyncResult, 0),
+	}
+	timeSyncMu.Lock()
+	timeSyncRuns[runID] = run
+	timeSyncMu.Unlock()
+	return run
+}
+
+func storeTimeSyncResult(runID string, res TimeSyncResult) {
+	if runID == "" {
+		return
+	}
+	timeSyncMu.Lock()
+	run := timeSyncRuns[runID]
+	if run == nil {
+		run = &timeSyncRun{RunID: runID, CreatedAt: time.Now()}
+		timeSyncRuns[runID] = run
+	}
+	for i := range run.Results {
+		if run.Results[i].Node == res.Node {
+			run.Results[i] = res
+			timeSyncMu.Unlock()
+			return
+		}
+	}
+	run.Results = append(run.Results, res)
+	timeSyncMu.Unlock()
+}
+
+func getTimeSyncRun(runID string) *timeSyncRun {
+	timeSyncMu.Lock()
+	defer timeSyncMu.Unlock()
+	if runID == "" {
+		return nil
+	}
+	run := timeSyncRuns[runID]
+	if run == nil {
+		return nil
+	}
+	clone := &timeSyncRun{
+		RunID:     run.RunID,
+		CreatedAt: run.CreatedAt,
+		Nodes:     append([]string(nil), run.Nodes...),
+		Results:   append([]TimeSyncResult(nil), run.Results...),
+	}
+	return clone
+}
+
 // ensureColumns 兜底补齐旧库缺失的字段，避免“no such column”。
 func ensureColumns(db *gorm.DB) {
 	type col struct {
@@ -3459,6 +3627,8 @@ func ensureColumns(db *gorm.DB) {
 		{&User{}, "is_admin", "users", "BOOLEAN"},
 		{&Setting{}, "debug_log", "settings", "BOOLEAN"},
 		{&Setting{}, "http_probe_url", "settings", "TEXT"},
+		{&Setting{}, "max_mux_streams", "settings", "INTEGER"},
+		{&Setting{}, "return_ack_timeout", "settings", "TEXT"},
 		{&Setting{}, "encryption_policies", "settings", "TEXT"},
 		{&RoutePlan{}, "return_path", "route_plans", "TEXT"},
 		{&ReturnRouteStatus{}, "ready_at", "return_route_statuses", "BIGINT"},
@@ -3511,6 +3681,15 @@ func parseInt(s string) int {
 func envOrDefault(key, def string) string {
 	if v := os.Getenv(key); strings.TrimSpace(v) != "" {
 		return v
+	}
+	return def
+}
+
+func defaultIntFromEnv(key string, def int) int {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
 	}
 	return def
 }

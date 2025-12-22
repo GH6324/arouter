@@ -304,6 +304,15 @@ body {
   background: rgba(15, 23, 42, 0.04);
 }
 
+.diag-summary {
+  display: grid;
+  gap: 6px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  border: 1px solid rgba(15, 23, 42, 0.08);
+  background: rgba(255, 255, 255, 0.85);
+}
+
 .diag-event-fail {
   color: #dc2626;
   font-weight: 600;

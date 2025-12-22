@@ -16,6 +16,8 @@
   "transport": "quic",
   "compression": "gzip",
   "compression_min_bytes": 0,
+  "max_mux_streams": 4,
+  "return_ack_timeout": "10s",
   "debug_log": false,
   "auth_key": "changeme-shared-hmac-key",
   "metrics_listen": ":19090",

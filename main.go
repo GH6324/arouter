@@ -482,6 +482,12 @@ func (m *Metrics) MarkReturnReadyLabels(entry, exit, route string, auto bool) {
 	}
 	m.returnReadyByLabel[key]++
 	m.returnReadyAtByLabel[key] = time.Now().Unix()
+	if m.returnFailAtByLabel != nil {
+		delete(m.returnFailAtByLabel, key)
+	}
+	if m.returnFailReasonByLabel != nil {
+		delete(m.returnFailReasonByLabel, key)
+	}
 	m.returnMu.Unlock()
 }
 func (m *Metrics) MarkReturnFailLabels(entry, exit, route string, auto bool) {
@@ -1620,6 +1626,15 @@ func (n *Node) handleWSMessage(ctx context.Context, data []byte) {
 			return
 		}
 		go n.runEndpointCheck(ctx, req.RunID)
+	case "time_sync":
+		var req struct {
+			RunID    string `json:"run_id"`
+			Timezone string `json:"timezone"`
+		}
+		if err := json.Unmarshal(msg.Data, &req); err != nil {
+			return
+		}
+		go n.runTimeSync(ctx, req.RunID, req.Timezone)
 	case "force_update":
 		go n.checkAndUpdateFromController(ctx, true)
 	case "diag_collect":
@@ -2184,6 +2199,14 @@ func (n *Node) runRouteDiag(ctx context.Context, runID string, routeName string,
 		Detail: fmt.Sprintf("target=%s", target),
 		At:     time.Now().UnixMilli(),
 	})
+	n.reportDiag(DiagEvent{
+		RunID:  runID,
+		Route:  routeName,
+		Node:   string(n.ID),
+		Stage:  "return_path",
+		Detail: fmt.Sprintf("%v", returnPath),
+		At:     time.Now().UnixMilli(),
+	})
 	if ws != nil {
 		n.reportDiag(DiagEvent{
 			RunID:  runID,
@@ -2314,6 +2337,97 @@ func (n *Node) runEndpointCheck(ctx context.Context, runID string) {
 		"run_id":  runID,
 		"node":    string(n.ID),
 		"results": results,
+	})
+}
+
+func (n *Node) runTimeSync(ctx context.Context, runID string, tz string) {
+	if runID == "" {
+		return
+	}
+	if strings.TrimSpace(tz) == "" {
+		tz = "Asia/Shanghai"
+	}
+	steps := make([]TimeSyncStep, 0)
+	addStep := func(step TimeSyncStep) {
+		steps = append(steps, step)
+	}
+	if os.Geteuid() != 0 {
+		addStep(TimeSyncStep{Command: "check root", OK: false, Error: "not running as root"})
+		_ = n.pushWSMessage(ctx, "time_sync_result", TimeSyncResult{
+			RunID:    runID,
+			Node:     string(n.ID),
+			Timezone: tz,
+			Success:  false,
+			Steps:    steps,
+		})
+		return
+	}
+	runCmd := func(timeout time.Duration, name string, args ...string) TimeSyncStep {
+		step := TimeSyncStep{Command: strings.Join(append([]string{name}, args...), " ")}
+		cmdCtx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+		out, err := exec.CommandContext(cmdCtx, name, args...).CombinedOutput()
+		if len(out) > 0 {
+			step.Output = strings.TrimSpace(string(out))
+		}
+		if err != nil {
+			step.OK = false
+			if errors.Is(cmdCtx.Err(), context.DeadlineExceeded) {
+				step.Error = "timeout"
+			} else {
+				step.Error = err.Error()
+			}
+			return step
+		}
+		step.OK = true
+		return step
+	}
+	runSkip := func(cmd, reason string) {
+		addStep(TimeSyncStep{Command: cmd, OK: false, Skipped: true, Error: reason})
+	}
+
+	if _, err := exec.LookPath("timedatectl"); err == nil {
+		addStep(runCmd(10*time.Second, "timedatectl", "set-timezone", tz))
+		addStep(runCmd(10*time.Second, "timedatectl", "set-ntp", "true"))
+	} else {
+		runSkip("timedatectl", "skipped: timedatectl not found")
+	}
+
+	if _, err := exec.LookPath("chronyc"); err != nil {
+		if _, err := exec.LookPath("apt-get"); err == nil {
+			addStep(runCmd(120*time.Second, "apt-get", "update"))
+			addStep(runCmd(120*time.Second, "apt-get", "install", "-y", "chrony"))
+		} else {
+			runSkip("apt-get install chrony", "skipped: apt-get not found")
+		}
+	}
+
+	if _, err := exec.LookPath("systemctl"); err == nil {
+		addStep(runCmd(20*time.Second, "systemctl", "enable", "--now", "chrony"))
+	} else {
+		runSkip("systemctl enable --now chrony", "skipped: systemctl not found")
+	}
+
+	if _, err := exec.LookPath("chronyc"); err == nil {
+		addStep(runCmd(10*time.Second, "chronyc", "sources", "-v"))
+		addStep(runCmd(10*time.Second, "chronyc", "tracking"))
+	} else {
+		runSkip("chronyc", "skipped: chronyc not found")
+	}
+
+	success := true
+	for _, st := range steps {
+		if st.Error != "" && !st.Skipped {
+			success = false
+			break
+		}
+	}
+	_ = n.pushWSMessage(ctx, "time_sync_result", TimeSyncResult{
+		RunID:    runID,
+		Node:     string(n.ID),
+		Timezone: tz,
+		Success:  success,
+		Steps:    steps,
 	})
 }
 
@@ -2658,6 +2772,22 @@ type EndpointCheckResult struct {
 	Error    string `json:"error,omitempty"`
 }
 
+type TimeSyncStep struct {
+	Command string `json:"command"`
+	OK      bool   `json:"ok"`
+	Skipped bool   `json:"skipped,omitempty"`
+	Output  string `json:"output,omitempty"`
+	Error   string `json:"error,omitempty"`
+}
+
+type TimeSyncResult struct {
+	RunID    string         `json:"run_id"`
+	Node     string         `json:"node"`
+	Timezone string         `json:"timezone"`
+	Success  bool           `json:"success"`
+	Steps    []TimeSyncStep `json:"steps"`
+}
+
 type ctrlType uint8
 
 const (
@@ -2938,11 +3068,13 @@ type WSSTransport struct {
 	inboundMux             map[NodeID]*MuxManager
 	returnAckMu            sync.Mutex
 	returnAckWait          map[string]chan struct{}
+	returnAckInfo          map[string]returnAckInfo
 	diagReport             func(DiagEvent)
 	returnMu               sync.Mutex
 	returnSessions         map[string]*returnSession
 	returnReadyMu          sync.Mutex
 	returnReady            map[string]time.Time
+	returnAckTimeout       time.Duration
 	diagReturnMu           sync.Mutex
 	diagReturnWait         map[string]chan struct{}
 	diagReturnFailWait     map[string]chan error
@@ -3841,7 +3973,21 @@ func (t *WSSTransport) muxServe(ctx context.Context, mm *MuxManager) {
 					}
 					log.Printf("[mux stream=%d] recv return ack session=%s entry=%s exit=%s route=%s auto=%v", f.streamID, msg.Session, msg.Entry, msg.Exit, msg.Route, msg.Auto)
 					t.markReturnAck(msg.Session)
+					t.reportDiag(ControlHeader{
+						Session:   msg.Session,
+						EntryNode: NodeID(msg.Entry),
+						RouteName: msg.Route,
+						DiagRunID: msg.DiagRun,
+						DiagRoute: msg.Route,
+					}, "return_ack_recv", fmt.Sprintf("entry=%s exit=%s auto=%v", msg.Entry, msg.Exit, msg.Auto))
 					if peer := t.relayPeer(mm, f.streamID); peer != nil {
+						t.reportDiag(ControlHeader{
+							Session:   msg.Session,
+							EntryNode: NodeID(msg.Entry),
+							RouteName: msg.Route,
+							DiagRunID: msg.DiagRun,
+							DiagRoute: msg.Route,
+						}, "return_ack_relay", fmt.Sprintf("entry=%s exit=%s auto=%v", msg.Entry, msg.Exit, msg.Auto))
 						_ = peer.WriteFlags(context.Background(), flagCTRL, marshalCtrl(ctrlReturnAck, payload))
 					}
 				} else {
@@ -5211,6 +5357,8 @@ type nodeConfig struct {
 	MemLimit           string             `json:"mem_limit"`
 	PreconnectPeers    []string           `json:"preconnect_peers"`
 	PreconnectInterval string             `json:"preconnect_interval"`
+	ReturnAckTimeout   string             `json:"return_ack_timeout"`
+	MaxMuxStreams      int                `json:"max_mux_streams"`
 }
 
 func loadConfig(path string) (nodeConfig, error) {
@@ -5677,6 +5825,9 @@ func main() {
 		muxRTTAlpha := 0.2
 		linkLossAlpha := 0.2
 		maxStreams := autoMaxMuxStreams()
+		if cfg.MaxMuxStreams > 0 {
+			maxStreams = cfg.MaxMuxStreams
+		}
 		muxDefaultQueue := 256 * maxStreams
 		muxStreamQueue := 64 * maxStreams
 		muxBlockOnBackpressure := true
@@ -5717,6 +5868,7 @@ func main() {
 				disablePool:            maxStreams <= 1,
 				maxConnAge:             muxMaxAge,
 				maxIdle:                muxMaxIdle,
+				returnAckTimeout:       parseDurationOrDefault(cfg.ReturnAckTimeout, 10*time.Second),
 				muxPingInterval:        muxPingInterval,
 				muxPingTimeout:         muxPingTimeout,
 				muxCleanupInterval:     muxCleanup,
@@ -5747,6 +5899,7 @@ func main() {
 				disablePool:            maxStreams <= 1,
 				maxConnAge:             muxMaxAge,
 				maxIdle:                muxMaxIdle,
+				returnAckTimeout:       parseDurationOrDefault(cfg.ReturnAckTimeout, 10*time.Second),
 				muxPingInterval:        muxPingInterval,
 				muxPingTimeout:         muxPingTimeout,
 				muxCleanupInterval:     muxCleanup,

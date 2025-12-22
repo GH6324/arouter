@@ -188,6 +188,7 @@ func (t *WSSTransport) DiagReturnPath(ctx context.Context, path []NodeID, return
 	case <-timer.C:
 	}
 	_ = b.Close()
+	waitTimeout := t.getReturnAckTimeout() + 2*time.Second
 	select {
 	case <-readyCh:
 		return nil
@@ -198,8 +199,8 @@ func (t *WSSTransport) DiagReturnPath(ctx context.Context, path []NodeID, return
 		return err
 	case err := <-errCh:
 		return err
-	case <-time.After(3 * time.Second):
-		return fmt.Errorf("return diag timeout")
+	case <-time.After(waitTimeout):
+		return fmt.Errorf("return diag timeout after %s", waitTimeout)
 	}
 }
 

@@ -162,6 +162,11 @@ function NodeList({ onSelect, onShowInstall, refreshSignal }) {
   const [endpointLoading, setEndpointLoading] = useState(false);
   const [endpointResults, setEndpointResults] = useState([]);
   const [endpointRunId, setEndpointRunId] = useState('');
+  const [timeSyncOpen, setTimeSyncOpen] = useState(false);
+  const [timeSyncLoading, setTimeSyncLoading] = useState(false);
+  const [timeSyncResults, setTimeSyncResults] = useState([]);
+  const [timeSyncRunId, setTimeSyncRunId] = useState('');
+  const [timeSyncTZ, setTimeSyncTZ] = useState('Asia/Shanghai');
 
   const load = async () => {
     if (document.hidden || isScrolling) return;
@@ -233,6 +238,19 @@ function NodeList({ onSelect, onShowInstall, refreshSignal }) {
     }, 2000);
     return () => clearInterval(t);
   }, [endpointOpen, endpointRunId]);
+
+  useEffect(() => {
+    if (!timeSyncOpen || !timeSyncRunId) return;
+    const t = setInterval(async () => {
+      try {
+        const res = await api('GET', `/api/time-sync?run_id=${encodeURIComponent(timeSyncRunId)}`);
+        setTimeSyncResults(res.results || []);
+      } catch (e) {
+        message.error(e.message);
+      }
+    }, 2000);
+    return () => clearInterval(t);
+  }, [timeSyncOpen, timeSyncRunId]);
 
   const columns = useMemo(() => {
     if (screens.xl) return 4;
@@ -336,6 +354,22 @@ function NodeList({ onSelect, onShowInstall, refreshSignal }) {
               }}
             >
               Endpoint检测
+            </Button>
+            <Button
+              onClick={async () => {
+                setTimeSyncOpen(true);
+                setTimeSyncLoading(true);
+                try {
+                  const res = await api('POST', '/api/time-sync/run', { timezone: timeSyncTZ });
+                  setTimeSyncRunId(res.run_id || '');
+                  setTimeSyncResults([]);
+                } catch (e) {
+                  message.error(e.message);
+                }
+                setTimeSyncLoading(false);
+              }}
+            >
+              时间同步
             </Button>
           </Space>
         }
@@ -547,6 +581,101 @@ function NodeList({ onSelect, onShowInstall, refreshSignal }) {
               { title: '错误', dataIndex: 'error' },
             ]}
           />
+        </Space>
+      </Modal>
+      <Modal
+        open={timeSyncOpen}
+        onCancel={() => setTimeSyncOpen(false)}
+        onOk={() => setTimeSyncOpen(false)}
+        title="时间同步"
+        width={900}
+        okText="关闭"
+      >
+        <Space direction="vertical" size={12} style={{ width: '100%' }}>
+          <Space>
+            <Input
+              value={timeSyncTZ}
+              onChange={(e) => setTimeSyncTZ(e.target.value)}
+              style={{ width: 220 }}
+              placeholder="Asia/Shanghai"
+            />
+            <Button
+              loading={timeSyncLoading}
+              onClick={async () => {
+                setTimeSyncLoading(true);
+                try {
+                  const res = await api('POST', '/api/time-sync/run', { timezone: timeSyncTZ });
+                  setTimeSyncRunId(res.run_id || '');
+                  setTimeSyncResults([]);
+                } catch (e) {
+                  message.error(e.message);
+                }
+                setTimeSyncLoading(false);
+              }}
+            >
+              重新执行
+            </Button>
+            <Button
+              disabled={!timeSyncRunId}
+              onClick={async () => {
+                try {
+                  const res = await api('GET', `/api/time-sync?run_id=${encodeURIComponent(timeSyncRunId)}`);
+                  setTimeSyncResults(res.results || []);
+                } catch (e) {
+                  message.error(e.message);
+                }
+              }}
+            >
+              刷新
+            </Button>
+            <Button
+              disabled={!timeSyncResults.length}
+              onClick={async () => {
+                const text = timeSyncResults
+                  .map((r) => {
+                    const steps = (r.steps || [])
+                      .map((s) => {
+                        const tag = s.skipped ? 'skip' : s.ok ? 'ok' : 'fail';
+                        const msg = s.error || s.output || '';
+                        return `- [${tag}] ${s.command}${msg ? ` :: ${msg}` : ''}`;
+                      })
+                      .join('\n');
+                    return `### ${r.node} ok=${r.success} tz=${r.timezone}\n${steps}`;
+                  })
+                  .join('\n\n');
+                try {
+                  await navigator.clipboard.writeText(text);
+                  message.success('已复制结果');
+                } catch (e) {
+                  message.error('复制失败，请手动选择文本');
+                }
+              }}
+            >
+              复制结果
+            </Button>
+          </Space>
+          <div className="diag-report-list">
+            {(timeSyncResults || []).map((r) => {
+              const text = (r.steps || [])
+                .map((s) => {
+                  const tag = s.skipped ? 'skip' : s.ok ? 'ok' : 'fail';
+                  const msg = s.error || s.output || '';
+                  return `[${tag}] ${s.command}${msg ? ` :: ${msg}` : ''}`;
+                })
+                .join('\n');
+              return (
+                <Card
+                  key={r.node}
+                  size="small"
+                  className={`diag-report-card ${r.success ? '' : 'diag-node-fail'}`}
+                  title={<Space><Tag color={r.success ? 'green' : 'red'}>{r.node}</Tag></Space>}
+                  extra={<Text type="secondary">TZ: {r.timezone || '-'}</Text>}
+                >
+                  <Input.TextArea value={text} rows={6} readOnly />
+                </Card>
+              );
+            })}
+          </div>
         </Space>
       </Modal>
       <Modal
@@ -1338,6 +1467,12 @@ function RouteList({ settings }) {
   const [diagMissing, setDiagMissing] = useState([]);
   const [diagRoute, setDiagRoute] = useState(null);
   const [diagLoading, setDiagLoading] = useState(false);
+  const [logOpen, setLogOpen] = useState(false);
+  const [logRunId, setLogRunId] = useState('');
+  const [logReports, setLogReports] = useState([]);
+  const [logMissing, setLogMissing] = useState([]);
+  const [logLoading, setLogLoading] = useState(false);
+  const [logRoute, setLogRoute] = useState(null);
   const load = async () => {
     setLoading(true);
     try {
@@ -1419,6 +1554,23 @@ function RouteList({ settings }) {
     const t = setInterval(() => fetchDiag(diagRunId), 2000);
     return () => clearInterval(t);
   }, [diagOpen, diagRunId]);
+  const fetchLogs = async (runId) => {
+    if (!runId) return;
+    setLogLoading(true);
+    try {
+      const logs = await api('GET', `/api/diag?run_id=${encodeURIComponent(runId)}`);
+      setLogReports(logs.reports || []);
+      setLogMissing(logs.missing || []);
+    } catch (e) {
+      message.error(e.message);
+    }
+    setLogLoading(false);
+  };
+  useEffect(() => {
+    if (!logOpen || !logRunId) return;
+    const t = setInterval(() => fetchLogs(logRunId), 2000);
+    return () => clearInterval(t);
+  }, [logOpen, logRunId]);
   const cols = [
     { title: '节点', dataIndex: 'node' },
     { title: '线路', dataIndex: 'route' },
@@ -1491,33 +1643,59 @@ function RouteList({ settings }) {
     {
       title: '操作',
       render: (_, r) => (
-        <Button
-          size="small"
-          disabled={!onlineMap.get(r.node)}
-              onClick={async () => {
-                const target = settings?.http_probe_url || 'https://www.google.com/generate_204';
-                try {
-                  setDiagRoute(r);
-                  const res = await api('POST', '/api/route-diag/run', {
-                node: r.node,
-                route: r.route,
-                path: r.path || [],
-                return_path: r.return_path || [],
-                target,
-              });
-                  setDiagRunId(res.run_id || '');
-                  setDiagEvents([]);
-                  setDiagReports([]);
-                  setDiagMissing(res.offline || []);
-                  setDiagOpen(true);
-                  setTimeout(() => fetchDiag(res.run_id), 800);
-                } catch (e) {
-                  message.error(e.message);
-                }
-          }}
-        >
-          诊断
-        </Button>
+        <Space>
+          <Button
+            size="small"
+            disabled={!onlineMap.get(r.node)}
+            onClick={async () => {
+              const target = settings?.http_probe_url || 'https://www.google.com/generate_204';
+              try {
+                setDiagRoute(r);
+                const res = await api('POST', '/api/route-diag/run', {
+                  node: r.node,
+                  route: r.route,
+                  path: r.path || [],
+                  return_path: r.return_path || [],
+                  target,
+                });
+                setDiagRunId(res.run_id || '');
+                setDiagEvents([]);
+                setDiagReports([]);
+                setDiagMissing(res.offline || []);
+                setDiagOpen(true);
+                setTimeout(() => fetchDiag(res.run_id), 800);
+              } catch (e) {
+                message.error(e.message);
+              }
+            }}
+          >
+            诊断
+          </Button>
+          <Button
+            size="small"
+            disabled={!onlineMap.get(r.node)}
+            onClick={async () => {
+              try {
+                const nodes = Array.from(new Set([...(r.path || []), ...(r.return_path || [])].filter(Boolean)));
+                setLogRoute(r);
+                const res = await api('POST', '/api/diag/run', {
+                  nodes,
+                  limit: 400,
+                  contains: '',
+                });
+                setLogRunId(res.run_id || '');
+                setLogReports([]);
+                setLogMissing(res.offline || []);
+                setLogOpen(true);
+                setTimeout(() => fetchLogs(res.run_id), 800);
+              } catch (e) {
+                message.error(e.message);
+              }
+            }}
+          >
+            节点日志
+          </Button>
+        </Space>
       ),
     },
   ];
@@ -1643,6 +1821,17 @@ function RouteList({ settings }) {
                 const ret = items.filter((e) => isReturnStage(e.stage));
                 const inbound = [...items].reverse().find((e) => e.stage === 'links_inbound');
                 const outbound = [...items].reverse().find((e) => e.stage === 'links_outbound');
+                const summaryStages = new Set([
+                  'return_ready',
+                  'return_fail',
+                  'return_ack_sent',
+                  'return_ack_relay',
+                  'return_ack_recv',
+                  'return_ack_rtt',
+                ]);
+                const summary = [...items]
+                  .filter((e) => summaryStages.has(e.stage))
+                  .sort((a, b) => (a.at || 0) - (b.at || 0));
                 return (
                   <Card
                     key={node}
@@ -1669,6 +1858,19 @@ function RouteList({ settings }) {
                   }
                 >
                   <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                    {summary.length > 0 && (
+                      <div className="diag-summary">
+                        <Text type="secondary">诊断结论</Text>
+                        <div className="diag-event-list">
+                          {summary.map((e, idx) => (
+                            <Text key={`${node}-s-${e.at}-${idx}`} className={isFailStage(e) ? 'diag-event-fail' : ''}>
+                              {e.at ? new Date(e.at).toLocaleTimeString() : '--'} {e.stage}
+                              {e.detail ? ` - ${e.detail}` : ''}
+                            </Text>
+                          ))}
+                        </div>
+                      </div>
+                    )}
                     <div className="diag-link-summary">
                       <Text type="secondary">入站：{inbound?.detail || '-'}</Text>
                       <Text type="secondary">出站：{outbound?.detail || '-'}</Text>
@@ -1712,6 +1914,67 @@ function RouteList({ settings }) {
                   rows={8}
                   readOnly
                 />
+              </Card>
+            ))}
+          </div>
+        </Space>
+      </Modal>
+      <Modal
+        open={logOpen}
+        onCancel={() => setLogOpen(false)}
+        onOk={() => setLogOpen(false)}
+        width={900}
+        okText="关闭"
+        title={logRoute ? `线路节点日志：${logRoute.node} / ${logRoute.route}` : '线路节点日志'}
+      >
+        <Space direction="vertical" size={10} style={{ width: '100%' }}>
+          <Space>
+            <Button
+              disabled={!logRunId}
+              onClick={async () => {
+                try {
+                  await api('POST', '/api/diag/refresh', {
+                    run_id: logRunId,
+                    limit: 400,
+                    contains: '',
+                  });
+                } catch (e) {
+                  message.error(e.message);
+                }
+                fetchLogs(logRunId);
+              }}
+            >
+              刷新
+            </Button>
+            <Button
+              disabled={!logReports.length}
+              onClick={async () => {
+                const text = logReports
+                  .map((r) => `### ${r.node}\n${(r.lines || []).join('\n')}`)
+                  .join('\n\n');
+                try {
+                  await navigator.clipboard.writeText(text);
+                  message.success('已复制节点日志');
+                } catch (e) {
+                  message.error('复制失败，请手动选择文本');
+                }
+              }}
+            >
+              复制节点日志
+            </Button>
+          </Space>
+          {logMissing.length > 0 && (
+            <Text type="secondary">未返回：{logMissing.join(', ')}</Text>
+          )}
+          <div className="diag-report-list">
+            {(logReports || []).map((r) => (
+              <Card
+                key={r.node}
+                size="small"
+                className="diag-report-card"
+                title={<Space><Tag color="blue">{r.node}</Tag></Space>}
+              >
+                <Input.TextArea value={(r.lines || []).join('\n')} rows={8} readOnly />
               </Card>
             ))}
           </div>
@@ -1818,7 +2081,9 @@ export default function App() {
           transport: settings.transport || 'quic',
           compression: settings.compression || 'none',
           compression_min_bytes: settings.compression_min_bytes || 0,
+          max_mux_streams: settings.max_mux_streams || 4,
           http_probe_url: settings.http_probe_url || 'https://www.google.com/generate_204',
+          return_ack_timeout: settings.return_ack_timeout || '10s',
           debug_log: settings.debug_log || false,
           encryption_policies: settings.encryption_policies || [],
         });
@@ -1865,8 +2130,18 @@ export default function App() {
               </Form.Item>
             </Col>
             <Col xs={24} sm={12} lg={12}>
+              <Form.Item name="max_mux_streams" label="最大Mux并发" tooltip="控制单连接复用的并发流数量，建议 4-8">
+                <Input type="number" min={1} />
+              </Form.Item>
+            </Col>
+            <Col xs={24} sm={12} lg={12}>
               <Form.Item name="http_probe_url" label="HTTP探测URL">
                 <Input placeholder="https://www.google.com/generate_204" />
+              </Form.Item>
+            </Col>
+            <Col xs={24} sm={12} lg={12}>
+              <Form.Item name="return_ack_timeout" label="回程ACK超时" tooltip="建议 10s-20s，支持 Go duration 格式，如 10s">
+                <Input placeholder="10s" />
               </Form.Item>
             </Col>
             <Col xs={24} sm={12} lg={12}>
