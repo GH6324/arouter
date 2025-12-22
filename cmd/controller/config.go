@@ -142,6 +142,30 @@ func installScript(configJSON string, configURL string, configPullBase string, b
 	script := `#!/usr/bin/env bash
 set -euo pipefail
 
+ensure_jq() {
+  if command -v jq >/dev/null 2>&1; then
+    return 0
+  fi
+  SUDO=""
+  if command -v sudo >/dev/null 2>&1; then
+    SUDO="sudo"
+  fi
+  if command -v apt-get >/dev/null 2>&1; then
+    $SUDO apt-get update -y >/dev/null 2>&1 || true
+    $SUDO apt-get install -y jq >/dev/null 2>&1 || true
+  elif command -v yum >/dev/null 2>&1; then
+    $SUDO yum install -y jq >/dev/null 2>&1 || true
+  elif command -v dnf >/dev/null 2>&1; then
+    $SUDO dnf install -y jq >/dev/null 2>&1 || true
+  elif command -v apk >/dev/null 2>&1; then
+    $SUDO apk add --no-cache jq >/dev/null 2>&1 || true
+  elif command -v brew >/dev/null 2>&1; then
+    brew install jq >/dev/null 2>&1 || true
+  fi
+}
+
+ensure_jq
+
 NAME="arouter-node"
 HOME_SAFE="${HOME:-}"
 if [ -z "$HOME_SAFE" ]; then HOME_SAFE="$(eval echo ~${SUDO_USER:-$USER} 2>/dev/null || true)"; fi
@@ -208,44 +232,30 @@ cat > config.json <<'CONFIGEOF'
 __CONFIG__
 CONFIGEOF
 echo "DEBUG: config.json written, size=$(stat -c%%s config.json 2>/dev/null || stat -f%%z config.json 2>/dev/null)" >&2
-if [ "$OS" = "darwin" ]; then
-  # 将默认的 /opt/arouter 路径重写为当前安装目录，便于证书/配置落在用户目录
-  python3 - <<'PY'
-import json, os, pathlib
-cfg_path = pathlib.Path("config.json")
-cfg = json.loads(cfg_path.read_text())
-inst = os.environ.get("INSTALL_DIR", "/opt/arouter")
-def repl(v):
-    if isinstance(v, str) and v.startswith("/opt/arouter"):
-        return v.replace("/opt/arouter", inst, 1)
-    return v
-for key in ("mtls_cert","mtls_key","mtls_ca","token_path"):
-    if key in cfg:
-        cfg[key] = repl(cfg[key])
-cfg_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2))
-PY
-  echo "DEBUG: config.json rewritten for darwin install dir ${INSTALL_DIR}" >&2
-fi
 # 展开 config.json 中的路径占位符（${HOME} 或 /opt/arouter -> INSTALL_DIR）
-python3 - <<'PY'
-import json, os, pathlib
-p = pathlib.Path("config.json")
-cfg = json.loads(p.read_text())
-home = os.environ.get("HOME","")
-inst = os.environ.get("INSTALL_DIR","")
-def expand(v):
-    if not isinstance(v, str):
-        return v
-    if "${HOME}" in v and home:
-        v = v.replace("${HOME}", home)
-    if inst and v.startswith("/opt/arouter"):
-        v = v.replace("/opt/arouter", inst, 1)
-    return v
-for key in ("mtls_cert","mtls_key","mtls_ca","token_path"):
-    if key in cfg:
-        cfg[key] = expand(cfg[key])
-p.write_text(json.dumps(cfg, ensure_ascii=False, indent=2))
-PY
+if command -v jq >/dev/null 2>&1; then
+  tmp_cfg=$(mktemp)
+  jq --arg inst "$INSTALL_DIR" --arg home "$HOME" '
+    def fix($v):
+      if $v == null then $v else
+        ($v
+          | if ($home != "" and (contains("${HOME}"))) then gsub("\\$\\{HOME\\}"; $home) else . end
+          | if ($inst != "" and startswith("/opt/arouter")) then sub("^/opt/arouter"; $inst) else . end);
+    .mtls_cert = fix(.mtls_cert)
+    | .mtls_key = fix(.mtls_key)
+    | .mtls_ca = fix(.mtls_ca)
+    | .token_path = fix(.token_path)
+  ' config.json > "$tmp_cfg" && mv "$tmp_cfg" config.json
+else
+  if [ -n "$HOME" ]; then
+    sed -i.bak "s#\\${HOME}#${HOME}#g" config.json || true
+    rm -f config.json.bak 2>/dev/null || true
+  fi
+  if [ -n "$INSTALL_DIR" ]; then
+    sed -i.bak "s#\"/opt/arouter#\"${INSTALL_DIR}#g" config.json || true
+    rm -f config.json.bak 2>/dev/null || true
+  fi
+fi
 # Write token if provided
 if [ -n "$TOKEN" ]; then
   echo "$TOKEN" > .token

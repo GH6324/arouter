@@ -1,6 +1,30 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+ensure_jq() {
+  if command -v jq >/dev/null 2>&1; then
+    return 0
+  fi
+  SUDO=""
+  if command -v sudo >/dev/null 2>&1; then
+    SUDO="sudo"
+  fi
+  if command -v apt-get >/dev/null 2>&1; then
+    $SUDO apt-get update -y >/dev/null 2>&1 || true
+    $SUDO apt-get install -y jq >/dev/null 2>&1 || true
+  elif command -v yum >/dev/null 2>&1; then
+    $SUDO yum install -y jq >/dev/null 2>&1 || true
+  elif command -v dnf >/dev/null 2>&1; then
+    $SUDO dnf install -y jq >/dev/null 2>&1 || true
+  elif command -v apk >/dev/null 2>&1; then
+    $SUDO apk add --no-cache jq >/dev/null 2>&1 || true
+  elif command -v brew >/dev/null 2>&1; then
+    brew install jq >/dev/null 2>&1 || true
+  fi
+}
+
+ensure_jq
+
 OS=$(uname -s | tr '[:upper:]' '[:lower:]')
 INSTALL_DIR="__INSTALL_DIR__"
 CONFIG_URL="__CONFIG_URL__"
@@ -31,23 +55,16 @@ else
 fi
 
 if "${CURL_CMD[@]}" -o "$TMP"; then
-  python3 - <<'PY' "$TMP" "$TMP_NORM"
-import json, sys
-src, dst = sys.argv[1], sys.argv[2]
-with open(src, "r", encoding="utf-8") as f:
-    data = json.load(f)
-with open(dst, "w", encoding="utf-8") as f:
-    json.dump(data, f, sort_keys=True, separators=(",", ":"))
-PY
-  if [ -f "${INSTALL_DIR}/config.json" ]; then
-    python3 - <<'PY' "${INSTALL_DIR}/config.json" "$CUR_NORM"
-import json, sys
-src, dst = sys.argv[1], sys.argv[2]
-with open(src, "r", encoding="utf-8") as f:
-    data = json.load(f)
-with open(dst, "w", encoding="utf-8") as f:
-    json.dump(data, f, sort_keys=True, separators=(",", ":"))
-PY
+  if command -v jq >/dev/null 2>&1; then
+    jq -cS . "$TMP" > "$TMP_NORM" || cp "$TMP" "$TMP_NORM"
+    if [ -f "${INSTALL_DIR}/config.json" ]; then
+      jq -cS . "${INSTALL_DIR}/config.json" > "$CUR_NORM" || cp "${INSTALL_DIR}/config.json" "$CUR_NORM"
+    fi
+  else
+    cp "$TMP" "$TMP_NORM"
+    if [ -f "${INSTALL_DIR}/config.json" ]; then
+      cp "${INSTALL_DIR}/config.json" "$CUR_NORM"
+    fi
   fi
   if [ ! -f "$CUR_NORM" ] || ! cmp -s "$TMP_NORM" "$CUR_NORM"; then
     echo "[config-sync] config changed, updating and restarting..."
