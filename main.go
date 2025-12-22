@@ -54,6 +54,8 @@ var debugLogEnabled atomic.Bool
 var logFilter = &levelWriter{out: os.Stderr, debug: &debugLogEnabled}
 var httpTimeoutClient = &http.Client{Timeout: 10 * time.Second}
 var defaultMemLimit = "256MiB"
+var configPathValue string
+var tokenPathValue string
 
 const (
 	colorRed   = "\033[31m"
@@ -1637,6 +1639,8 @@ func (n *Node) handleWSMessage(ctx context.Context, data []byte) {
 		go n.runTimeSync(ctx, req.RunID, req.Timezone)
 	case "force_update":
 		go n.checkAndUpdateFromController(ctx, true)
+	case "uninstall":
+		go n.runUninstall(ctx)
 	case "diag_collect":
 		var req struct {
 			RunID    string `json:"run_id"`
@@ -1682,6 +1686,123 @@ func (n *Node) handleWSMessage(ctx context.Context, data []byte) {
 		go n.pushWSMessage(ctx, "diag_report", payload)
 	default:
 	}
+}
+
+func (n *Node) runUninstall(ctx context.Context) {
+	status := "success"
+	var errs []string
+	installDir := detectInstallDir(n)
+
+	errs = append(errs, uninstallServicePre()...)
+	errs = append(errs, cleanupNodeFiles(n, installDir)...)
+	if len(errs) > 0 {
+		status = "failed"
+	}
+	reason := strings.Join(errs, "; ")
+	_ = n.pushWSMessage(ctx, "uninstall_result", map[string]any{
+		"status": status,
+		"reason": reason,
+	})
+	time.Sleep(300 * time.Millisecond)
+	_ = uninstallServiceStop()
+	os.Exit(0)
+}
+
+func detectInstallDir(n *Node) string {
+	if tokenPathValue != "" {
+		if abs, err := filepath.Abs(tokenPathValue); err == nil {
+			return filepath.Dir(abs)
+		}
+	}
+	if n != nil && n.TokenPath != "" {
+		return filepath.Dir(n.TokenPath)
+	}
+	if configPathValue != "" {
+		if abs, err := filepath.Abs(configPathValue); err == nil {
+			return filepath.Dir(abs)
+		}
+	}
+	if exe, err := os.Executable(); err == nil && exe != "" {
+		return filepath.Dir(exe)
+	}
+	return ""
+}
+
+func cleanupNodeFiles(n *Node, installDir string) []string {
+	var errs []string
+	removeFile := func(p string) {
+		if p == "" {
+			return
+		}
+		if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
+			errs = append(errs, err.Error())
+		}
+	}
+	if configPathValue != "" {
+		if abs, err := filepath.Abs(configPathValue); err == nil {
+			removeFile(abs)
+		}
+	}
+	if tokenPathValue != "" {
+		if abs, err := filepath.Abs(tokenPathValue); err == nil {
+			removeFile(abs)
+		}
+	}
+	if n != nil {
+		removeFile(n.TokenPath)
+		if installDir != "" {
+			if strings.HasPrefix(n.CertPath, installDir) {
+				removeFile(n.CertPath)
+			}
+			if strings.HasPrefix(n.KeyPath, installDir) {
+				removeFile(n.KeyPath)
+			}
+		}
+	}
+	if installDir != "" && installDir != "/" && installDir != "." {
+		if err := os.RemoveAll(installDir); err != nil {
+			errs = append(errs, err.Error())
+		}
+	}
+	return errs
+}
+
+func uninstallServicePre() []string {
+	var errs []string
+	if runtime.GOOS == "darwin" {
+		if err := os.Remove("/Library/LaunchDaemons/com.arouter.node.plist"); err != nil && !errors.Is(err, os.ErrNotExist) {
+			errs = append(errs, err.Error())
+		}
+		return errs
+	}
+	if !commandExists("systemctl") {
+		return errs
+	}
+	_ = exec.Command("systemctl", "disable", "arouter").Run()
+	_ = exec.Command("systemctl", "daemon-reload").Run()
+	if err := os.Remove("/etc/systemd/system/arouter.service"); err != nil && !errors.Is(err, os.ErrNotExist) {
+		errs = append(errs, err.Error())
+	}
+	return errs
+}
+
+func uninstallServiceStop() error {
+	if runtime.GOOS == "darwin" {
+		if commandExists("launchctl") {
+			_ = exec.Command("launchctl", "remove", "com.arouter.node").Run()
+		}
+		return nil
+	}
+	if !commandExists("systemctl") {
+		return nil
+	}
+	_ = exec.Command("systemctl", "stop", "arouter").Run()
+	return nil
+}
+
+func commandExists(name string) bool {
+	_, err := exec.LookPath(name)
+	return err == nil
 }
 
 func toWSURL(raw string) string {
@@ -5686,6 +5807,8 @@ func main() {
 	configPath := flag.String("config", "config.json", "path to JSON config")
 	tokenPath := flag.String("token", "/opt/arouter/.token", "path to node token file")
 	flag.Parse()
+	configPathValue = *configPath
+	tokenPathValue = *tokenPath
 
 	buildVersion = canonicalVersion(buildVersion)
 	log.Printf("arouter agent version %s", buildVersion)

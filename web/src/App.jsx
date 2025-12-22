@@ -121,6 +121,17 @@ const loadColor = (percent = 0) => {
   if (percent >= 50) return { '0%': '#0a66ff', '100%': '#22c55e' };
   return '#0a66ff';
 };
+const uninstallStatusLabel = (status) => {
+  if (!status) return '-';
+  const map = { pending: '卸载中', success: '卸载成功', failed: '卸载失败' };
+  return map[status] || status;
+};
+const uninstallStatusColor = (status) => {
+  if (status === 'pending') return 'blue';
+  if (status === 'success') return 'green';
+  if (status === 'failed') return 'red';
+  return 'default';
+};
 const normalizeTimestamp = (ts) => {
   if (!ts) return 0;
   if (typeof ts === 'number') {
@@ -158,6 +169,12 @@ function NodeList({ onSelect, onShowInstall, refreshSignal }) {
   const [diagFilter, setDiagFilter] = useState('');
   const [diagLimit, setDiagLimit] = useState(200);
   const [diagLoading, setDiagLoading] = useState(false);
+  const [uninstallMap, setUninstallMap] = useState(new Map());
+  const [deleteOpen, setDeleteOpen] = useState(false);
+  const [deletePlan, setDeletePlan] = useState({ routes: [] });
+  const [deleteRoutes, setDeleteRoutes] = useState(false);
+  const [deleteLoading, setDeleteLoading] = useState(false);
+  const [deleteTarget, setDeleteTarget] = useState(null);
   const [endpointOpen, setEndpointOpen] = useState(false);
   const [endpointLoading, setEndpointLoading] = useState(false);
   const [endpointResults, setEndpointResults] = useState([]);
@@ -171,9 +188,30 @@ function NodeList({ onSelect, onShowInstall, refreshSignal }) {
   const load = async () => {
     if (document.hidden || isScrolling) return;
     try {
-      const list = await api('GET', '/api/nodes');
+      const [list, uninstallStatuses] = await Promise.all([
+        api('GET', '/api/nodes'),
+        api('GET', '/api/uninstall-status'),
+      ]);
       const sorted = [...(list || [])].sort((a, b) => (a.name || '').localeCompare(b.name || ''));
-      setData(sorted);
+      const existing = new Map(sorted.map((n) => [n.name, n]));
+      const nextMap = new Map();
+      (uninstallStatuses || []).forEach((s) => {
+        if (!s?.node) return;
+        if (s.status === 'success') return;
+        nextMap.set(s.node, s);
+      });
+      const merged = [...sorted];
+      nextMap.forEach((s, name) => {
+        if (!existing.has(name)) {
+          merged.push({
+            id: `ghost-${name}`,
+            name,
+            _ghost: true,
+          });
+        }
+      });
+      setData(merged.sort((a, b) => (a.name || '').localeCompare(b.name || '')));
+      setUninstallMap(nextMap);
     } catch (e) {
       message.error(e.message);
     }
@@ -205,6 +243,43 @@ function NodeList({ onSelect, onShowInstall, refreshSignal }) {
     const online = data.filter((n) => isOnline(n.last_seen_at)).map((n) => n.name);
     setDiagTargets(online);
     setDiagOpen(true);
+  };
+
+  const openDelete = async (n) => {
+    if (!n?.id || n._ghost) return;
+    setDeleteTarget(n);
+    setDeleteOpen(true);
+    setDeleteLoading(true);
+    try {
+      const plan = await api('GET', `/api/nodes/${n.id}/delete-plan`);
+      setDeletePlan(plan || { routes: [] });
+      setDeleteRoutes((plan?.routes?.length || 0) > 0);
+    } catch (e) {
+      message.error(e.message);
+      setDeleteOpen(false);
+    } finally {
+      setDeleteLoading(false);
+    }
+  };
+
+  const confirmDelete = async () => {
+    if (!deleteTarget?.id) return;
+    if ((deletePlan.routes?.length || 0) > 0 && !deleteRoutes) {
+      message.warning('请勾选同时删除这些线路');
+      return;
+    }
+    try {
+      setDeleteLoading(true);
+      await api('POST', `/api/nodes/${deleteTarget.id}/delete`, { delete_routes: deleteRoutes });
+      message.success('卸载指令已下发，等待节点上报完成');
+      setDeleteOpen(false);
+      setDeleteTarget(null);
+      load();
+    } catch (e) {
+      message.error(e.message);
+    } finally {
+      setDeleteLoading(false);
+    }
   };
 
   const fetchDiag = async (runId) => {
@@ -408,6 +483,7 @@ function NodeList({ onSelect, onShowInstall, refreshSignal }) {
                           paddingBottom: gutter,
                           boxSizing: 'border-box',
                         };
+                        const uninstall = uninstallMap.get(n.name);
                         return (
                           <div key={key} style={cellStyle}>
                             <Card
@@ -419,7 +495,18 @@ function NodeList({ onSelect, onShowInstall, refreshSignal }) {
                                 </Space>
                               }
                               size="small"
-                              extra={<Tag color="blue">{n.transport?.toUpperCase() || 'QUIC'}</Tag>}
+                              extra={(
+                                <Space size={6}>
+                                  {uninstall?.status ? (
+                                    <Tooltip title={uninstall.reason || ''}>
+                                      <Tag color={uninstallStatusColor(uninstall.status)}>
+                                        {uninstallStatusLabel(uninstall.status)}
+                                      </Tag>
+                                    </Tooltip>
+                                  ) : null}
+                                  <Tag color="blue">{n.transport?.toUpperCase() || 'QUIC'}</Tag>
+                                </Space>
+                              )}
                             >
                               <Space direction="vertical" size={8} style={{ width: '100%' }}>
                                 <Row gutter={[12, 12]}>
@@ -489,8 +576,9 @@ function NodeList({ onSelect, onShowInstall, refreshSignal }) {
                                   </Text>
                                 </Tooltip>
                                 <Space>
-                                  <Button size="small" type="primary" onClick={() => onSelect(n)}>管理</Button>
-                                  <Button size="small" onClick={() => onShowInstall(n)}>安装</Button>
+                                  <Button size="small" type="primary" disabled={n._ghost} onClick={() => onSelect(n)}>管理</Button>
+                                  <Button size="small" disabled={n._ghost} onClick={() => onShowInstall(n)}>安装</Button>
+                                  <Button size="small" danger disabled={n._ghost} onClick={() => openDelete(n)}>删除</Button>
                                 </Space>
                               </Space>
                             </Card>
@@ -505,6 +593,37 @@ function NodeList({ onSelect, onShowInstall, refreshSignal }) {
           </WindowScroller>
         </div>
       </Card>
+      <Modal
+        open={deleteOpen}
+        onCancel={() => setDeleteOpen(false)}
+        onOk={confirmDelete}
+        confirmLoading={deleteLoading}
+        okText="确认删除"
+        title={deleteTarget ? `确认删除节点：${deleteTarget.name}` : '确认删除节点'}
+      >
+        <Space direction="vertical" style={{ width: '100%' }}>
+          <Text>将先下发卸载指令，节点上报卸载成功后才会清除数据。</Text>
+          {deletePlan.routes?.length ? (
+            <>
+              <Text>以下线路使用了该节点：</Text>
+              <div style={{ border: '1px solid #f0f0f0', borderRadius: 6, padding: 8, maxHeight: 240, overflow: 'auto' }}>
+                {deletePlan.routes.map((r) => (
+                  <div key={r.id} style={{ padding: '6px 0', borderBottom: '1px dashed #f0f0f0' }}>
+                    <div><Text strong>{r.name}</Text> <Text type="secondary">优先级 {r.priority || 1}</Text></div>
+                    <div><Text type="secondary">路径：</Text>{(r.path || []).join(' -> ') || '-'}</div>
+                    <div><Text type="secondary">回程：</Text>{(r.return_path || []).join(' -> ') || '-'}</div>
+                  </div>
+                ))}
+              </div>
+              <Checkbox checked={deleteRoutes} onChange={(e) => setDeleteRoutes(e.target.checked)}>
+                同时删除这些线路
+              </Checkbox>
+            </>
+          ) : (
+            <Text type="secondary">未发现引用该节点的线路。</Text>
+          )}
+        </Space>
+      </Modal>
       <Modal
         open={endpointOpen}
         onCancel={() => setEndpointOpen(false)}
@@ -825,6 +944,7 @@ function NodeList({ onSelect, onShowInstall, refreshSignal }) {
 function NodeDetail({ node, onBack, refreshList, onShowInstall }) {
   const [detail, setDetail] = useState(node);
   const [updateStatus, setUpdateStatus] = useState(null);
+  const [uninstallStatus, setUninstallStatus] = useState(null);
   const [entryOpen, setEntryOpen] = useState(false);
   const [peerOpen, setPeerOpen] = useState(false);
   const [allNodes, setAllNodes] = useState([]);
@@ -842,11 +962,16 @@ function NodeDetail({ node, onBack, refreshList, onShowInstall }) {
   const [peerEditIPOptions, setPeerEditIPOptions] = useState([]);
   const [ipModalOpen, setIpModalOpen] = useState(false);
   const [ipForm] = Form.useForm();
+  const [deleteOpen, setDeleteOpen] = useState(false);
+  const [deletePlan, setDeletePlan] = useState({ routes: [] });
+  const [deleteRoutes, setDeleteRoutes] = useState(false);
+  const [deleteLoading, setDeleteLoading] = useState(false);
 
   const load = async () => {
     try {
       setDetail(await api('GET', `/api/nodes/${node.id}`));
       setUpdateStatus(await api('GET', `/api/nodes/${node.id}/update-status`));
+      setUninstallStatus(await api('GET', `/api/nodes/${node.id}/uninstall-status`));
       refreshList();
       setAllNodes(await api('GET', '/api/nodes'));
     } catch (e) {
@@ -906,16 +1031,38 @@ function NodeDetail({ node, onBack, refreshList, onShowInstall }) {
       message.error(e.message);
     }
   };
-  const removeNode = async () => {
-    Modal.confirm({
-      title: '确认删除节点？',
-      onOk: async () => {
-        await api('DELETE', `/api/nodes/${node.id}`);
-        message.success('已删除');
-        onBack();
-        refreshList();
-      },
-    });
+  const openDelete = async () => {
+    setDeleteOpen(true);
+    setDeleteLoading(true);
+    try {
+      const plan = await api('GET', `/api/nodes/${node.id}/delete-plan`);
+      setDeletePlan(plan || { routes: [] });
+      setDeleteRoutes((plan?.routes?.length || 0) > 0);
+    } catch (e) {
+      message.error(e.message);
+      setDeleteOpen(false);
+    } finally {
+      setDeleteLoading(false);
+    }
+  };
+  const confirmDelete = async () => {
+    try {
+      setDeleteLoading(true);
+      if ((deletePlan.routes?.length || 0) > 0 && !deleteRoutes) {
+        message.warning('请勾选同时删除这些线路');
+        setDeleteLoading(false);
+        return;
+      }
+      await api('POST', `/api/nodes/${node.id}/delete`, { delete_routes: deleteRoutes });
+      message.success('卸载指令已下发，等待节点上报完成');
+      setDeleteOpen(false);
+      onBack();
+      refreshList();
+    } catch (e) {
+      message.error(e.message);
+    } finally {
+      setDeleteLoading(false);
+    }
   };
 
   const entryCols = [
@@ -1048,7 +1195,7 @@ function NodeDetail({ node, onBack, refreshList, onShowInstall }) {
           >
             编辑监听
           </Button>
-          <Button danger onClick={removeNode}>删除</Button>
+          <Button danger onClick={openDelete}>删除</Button>
         </Space>
       )}
     >
@@ -1068,6 +1215,18 @@ function NodeDetail({ node, onBack, refreshList, onShowInstall }) {
         <Descriptions.Item label="运行时长">{formatUptime(detail.uptime_sec || 0)}</Descriptions.Item>
         <Descriptions.Item label="网络累计">{`↑${formatBytes(detail.net_out_bytes || 0)} ↓${formatBytes(detail.net_in_bytes || 0)}`}</Descriptions.Item>
         <Descriptions.Item label="版本">{detail.node_version || '-'}</Descriptions.Item>
+        <Descriptions.Item label="卸载状态">
+          {(() => {
+            if (!uninstallStatus) return '-';
+            const status = uninstallStatus.status || 'unknown';
+            const tip = uninstallStatus.reason ? <div>原因：{uninstallStatus.reason}</div> : null;
+            return (
+              <Tooltip title={tip}>
+                <Tag color={uninstallStatusColor(status)}>{uninstallStatusLabel(status)}</Tag>
+              </Tooltip>
+            );
+          })()}
+        </Descriptions.Item>
         <Descriptions.Item label="更新状态">
           {(() => {
             if (!updateStatus) return '-';
@@ -1351,6 +1510,38 @@ function NodeDetail({ node, onBack, refreshList, onShowInstall }) {
             <Input placeholder="如需校验证书请填写域名" />
           </Form.Item>
         </Form>
+      </Modal>
+
+      <Modal
+        open={deleteOpen}
+        onCancel={() => setDeleteOpen(false)}
+        onOk={confirmDelete}
+        confirmLoading={deleteLoading}
+        okText="确认删除"
+        title="确认删除节点"
+      >
+        <Space direction="vertical" style={{ width: '100%' }}>
+          <Text>将先下发卸载指令，节点上报卸载成功后才会清除数据。</Text>
+          {deletePlan.routes?.length ? (
+            <>
+              <Text>以下线路使用了该节点：</Text>
+              <div style={{ border: '1px solid #f0f0f0', borderRadius: 6, padding: 8, maxHeight: 240, overflow: 'auto' }}>
+                {deletePlan.routes.map((r) => (
+                  <div key={r.id} style={{ padding: '6px 0', borderBottom: '1px dashed #f0f0f0' }}>
+                    <div><Text strong>{r.name}</Text> <Text type="secondary">优先级 {r.priority || 1}</Text></div>
+                    <div><Text type="secondary">路径：</Text>{(r.path || []).join(' -> ') || '-'}</div>
+                    <div><Text type="secondary">回程：</Text>{(r.return_path || []).join(' -> ') || '-'}</div>
+                  </div>
+                ))}
+              </div>
+              <Checkbox checked={deleteRoutes} onChange={(e) => setDeleteRoutes(e.target.checked)}>
+                同时删除这些线路
+              </Checkbox>
+            </>
+          ) : (
+            <Text type="secondary">未发现引用该节点的线路。</Text>
+          )}
+        </Space>
       </Modal>
 
       <Modal open={routeOpen} onCancel={() => setRouteOpen(false)} onOk={addRoute} title="添加线路" width={600}>

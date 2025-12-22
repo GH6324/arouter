@@ -11,4 +11,5 @@ func registerNodeRoutes(api *gin.RouterGroup, authGroup *gin.RouterGroup, db *go
 	registerNodePeerRoutes(authGroup, db)
 	registerNodeRouteRoutes(api, authGroup, db)
 	registerNodeMiscRoutes(authGroup, db)
+	registerNodeDeleteRoutes(authGroup, db, hub)
 }

@@ -17,7 +17,7 @@ func main() {
 	auth := NewGlobalAuth(envOrDefault("AUTH_KEY_FILE", "/app/data/auth.key"))
 	globalKey = auth.LoadOrCreate()
 	buildVersion = canonicalVersion(buildVersion)
-	if err := db.AutoMigrate(&Node{}, &Entry{}, &Peer{}, &LinkMetric{}, &RoutePlan{}, &Setting{}, &User{}, &RouteProbe{}, &ReturnRouteStatus{}, &NodeUpdateStatus{}); err != nil {
+	if err := db.AutoMigrate(&Node{}, &Entry{}, &Peer{}, &LinkMetric{}, &RoutePlan{}, &Setting{}, &User{}, &RouteProbe{}, &ReturnRouteStatus{}, &NodeUpdateStatus{}, &NodeUninstallStatus{}); err != nil {
 		log.Fatalf("migrate failed: %v", err)
 	}
 	ensureColumns(db)

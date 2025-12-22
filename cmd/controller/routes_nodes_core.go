@@ -165,14 +165,6 @@ func registerNodeCoreRoutes(authGroup *gin.RouterGroup, db *gorm.DB, hub *wsHub)
 		db.Preload("Entries").Preload("Peers").Preload("Routes").First(&node, id)
 		c.JSON(http.StatusOK, node)
 	})
-	authGroup.DELETE("/nodes/:id", func(c *gin.Context) {
-		id := c.Param("id")
-		db.Delete(&Peer{}, "node_id = ?", id)
-		db.Delete(&Entry{}, "node_id = ?", id)
-		db.Delete(&RoutePlan{}, "node_id = ?", id)
-		db.Delete(&Node{}, "id = ?", id)
-		c.Status(http.StatusNoContent)
-	})
 	authGroup.POST("/nodes/:id/force-update", func(c *gin.Context) {
 		id := c.Param("id")
 		var node Node

@@ -202,6 +202,35 @@ func registerWSRoutes(api *gin.RouterGroup, db *gorm.DB, hub *wsHub) {
 					res.Node = node.Name
 				}
 				storeTimeSyncResult(res.RunID, res)
+			case "uninstall_result":
+				var res struct {
+					Status string `json:"status"`
+					Reason string `json:"reason"`
+				}
+				if err := json.Unmarshal(msg.Data, &res); err != nil {
+					continue
+				}
+				status := NodeUninstallStatus{
+					Node:   node.Name,
+					Status: res.Status,
+					Reason: res.Reason,
+				}
+				db.Clauses(clause.OnConflict{
+					Columns:   []clause.Column{{Name: "node"}},
+					DoUpdates: clause.Assignments(map[string]interface{}{"status": status.Status, "reason": status.Reason, "updated_at": time.Now()}),
+				}).Create(&status)
+				if strings.EqualFold(res.Status, "success") {
+					if req := getDeleteRequest(node.Name); req != nil {
+						if req.DeleteRoutes && len(req.RouteIDs) > 0 {
+							db.Delete(&RoutePlan{}, req.RouteIDs)
+						}
+						deleteNodeData(db, node.ID, node.Name)
+						clearDeleteRequest(node.Name)
+					}
+					db.Delete(&NodeUninstallStatus{}, "node = ?", node.Name)
+				} else if res.Status != "" {
+					clearDeleteRequest(node.Name)
+				}
 			default:
 			}
 		}

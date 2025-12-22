@@ -214,6 +214,15 @@ type UpdateStatusJSON struct {
 	Forced  bool   `json:"forced"`
 }
 
+type NodeUninstallStatus struct {
+	ID        uint      `gorm:"primaryKey" json:"id"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Node      string    `gorm:"uniqueIndex" json:"node"`
+	Status    string    `json:"status"`
+	Reason    string    `json:"reason"`
+}
+
 type Entry struct {
 	ID     uint   `gorm:"primaryKey" json:"id"`
 	NodeID uint   `json:"-"`
