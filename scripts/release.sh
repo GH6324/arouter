@@ -14,9 +14,6 @@ OUT_DIR="dist"
 rm -rf "$OUT_DIR"
 mkdir -p "$OUT_DIR"
 
-# Persist VERSION so docker/binary builds share the same tag.
-echo "$VERSION" > VERSION
-
 # Build embedded node binaries for controller downloads.
 echo "Building embedded node binaries..."
 VERSION="${VERSION}" ./scripts/build_nodes.sh

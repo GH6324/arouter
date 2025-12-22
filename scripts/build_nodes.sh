@@ -6,9 +6,6 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT_DIR="${ROOT_DIR}/cmd/controller/dist"
 PKG="${ROOT_DIR}"
-if [ -z "${VERSION:-}" ] && [ -f "${ROOT_DIR}/VERSION" ]; then
-  VERSION="$(cat "${ROOT_DIR}/VERSION" | tr -d ' \t\r\n')"
-fi
 VERSION="${VERSION:-$(TZ=Asia/Shanghai date +v%Y%m%d%H%M)}"
 LD_FLAGS="-s -w -X main.buildVersion=${VERSION}"
 
