@@ -1,0 +1,5 @@
+{
+  "appId": "xyz.arouter.app",
+  "appName": "arouter",
+  "webDir": "../cmd/controller/web/dist"
+}

@@ -1,0 +1,41 @@
+diff --git a/node_modules/@capacitor/ios/Capacitor/Capacitor/Codable/JSValueDecoder.swift b/node_modules/@capacitor/ios/Capacitor/Capacitor/Codable/JSValueDecoder.swift
+index b1f7081..5fea878 100644
+--- a/node_modules/@capacitor/ios/Capacitor/Capacitor/Codable/JSValueDecoder.swift
++++ b/node_modules/@capacitor/ios/Capacitor/Capacitor/Codable/JSValueDecoder.swift
+@@ -138,7 +138,7 @@ extension _JSValueDecoder: Decoder {
+                 return Date(timeIntervalSince1970: value.doubleValue) as! T
+             case .millisecondsSince1970:
+                 guard let value = data as? NSNumber else { throw DecodingError.dataCorrupted(data, target: Double.self, codingPath: codingPath) }
+-                return Date(timeIntervalSince1970: value.doubleValue / Double(MSEC_PER_SEC)) as! T
++                return Date(timeIntervalSince1970: value.doubleValue / 1000.0) as! T
+             case .iso8601:
+                 guard let value = data as? String else { throw DecodingError.dataCorrupted(data, target: String.self, codingPath: codingPath) }
+                 let formatter = ISO8601DateFormatter()
+diff --git a/node_modules/@capacitor/ios/Capacitor/Capacitor/Codable/JSValueEncoder.swift b/node_modules/@capacitor/ios/Capacitor/Capacitor/Codable/JSValueEncoder.swift
+index ce017fc..e7b5af7 100644
+--- a/node_modules/@capacitor/ios/Capacitor/Capacitor/Codable/JSValueEncoder.swift
++++ b/node_modules/@capacitor/ios/Capacitor/Capacitor/Codable/JSValueEncoder.swift
+@@ -149,11 +149,11 @@ private enum EncodingContainer: JSValueEncodingContainer {
+     var type: String {
+         switch self {
+         case .singleValue:
+-            "SingleValueContainer"
++            return "SingleValueContainer"
+         case .unkeyed:
+-            "UnkeyedContainer"
++            return "UnkeyedContainer"
+         case .keyed:
+-            "KeyedContainer"
++            return "KeyedContainer"
+         }
+     }
+ }
+@@ -264,7 +264,7 @@ extension _JSValueEncoder: Encoder {
+             case .deferredToDate:
+                 try value.encode(to: self)
+             case .millisecondsSince1970:
+-                try (value.timeIntervalSince1970 * Double(MSEC_PER_SEC)).encode(to: self)
++                try (value.timeIntervalSince1970 * 1000.0).encode(to: self)
+             case .secondsSince1970:
+                 try value.timeIntervalSince1970.encode(to: self)
+             case .iso8601:

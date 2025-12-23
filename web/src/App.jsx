@@ -1,4 +1,6 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import L from 'leaflet';
+import 'leaflet/dist/leaflet.css';
 import { AutoSizer, Grid as VirtualGrid, WindowScroller } from 'react-virtualized';
 import {
   Layout,
@@ -7,6 +9,7 @@ import {
   Modal,
   Form,
   Input,
+  InputNumber,
   Space,
   message,
   Tabs,
@@ -28,7 +31,8 @@ import {
   Badge,
   Checkbox,
 } from 'antd';
-import { api, API_BASE, joinUrl } from './api';
+import { ApiOutlined, ClockCircleOutlined, CopyOutlined, RadarChartOutlined, ShareAltOutlined } from '@ant-design/icons';
+import { api, DEFAULT_API_BASE, getApiBase, joinUrl, setApiBase } from './api';
 import './App.css';
 
 const { Header, Content, Sider } = Layout;
@@ -155,8 +159,421 @@ const formatRelativeTime = (ts) => {
   return `${day}天前`;
 };
 
+const PathOrderEditor = ({ value = [], onChange, options = [], placeholder, extra }) => {
+  const dragRef = useRef(null);
+  const pointerIdRef = useRef(null);
+  const didTouchMoveRef = useRef(false);
+  const trackRef = useRef(null);
+  const lastPointRef = useRef(null);
+  const scrollLockRef = useRef(0);
+  const dropIndexRef = useRef(null);
+  const lastValidDropIndexRef = useRef(null);
+  const enteredTrackRef = useRef(false);
+  const [ghost, setGhost] = useState(null);
+  const [dropIndex, setDropIndex] = useState(null);
+  const [collapsedGroups, setCollapsedGroups] = useState(() => new Set());
+  const didInitGroups = useRef(false);
+  const prevGroupNames = useRef(new Set());
+  const [touchDragging, setTouchDragging] = useState(false);
+  const isTouch = useMemo(() => {
+    if (typeof window === 'undefined') return false;
+    return 'ontouchstart' in window || navigator.maxTouchPoints > 0;
+  }, []);
+  const safeValue = Array.isArray(value) ? value : [];
+  const selectedSet = useMemo(() => new Set(safeValue), [safeValue]);
+  const filtered = useMemo(() => {
+    return options.filter((opt) => {
+      if (selectedSet.has(opt.value)) return false;
+      return true;
+    });
+  }, [options, selectedSet]);
+  const grouped = useMemo(() => {
+    const map = new Map();
+    filtered.forEach((opt) => {
+      const region = opt.region || opt.country || '未知地区';
+      if (!map.has(region)) map.set(region, []);
+      map.get(region).push(opt);
+    });
+    return Array.from(map.entries()).sort(([a], [b]) => a.localeCompare(b, 'zh'));
+  }, [filtered]);
+
+  useEffect(() => {
+    if (!grouped.length) return;
+    const names = new Set(grouped.map(([name]) => name));
+    if (!didInitGroups.current) {
+      setCollapsedGroups(new Set(names));
+      prevGroupNames.current = names;
+      didInitGroups.current = true;
+      return;
+    }
+    const prevNames = prevGroupNames.current;
+    const added = [];
+    names.forEach((name) => {
+      if (!prevNames.has(name)) added.push(name);
+    });
+    if (added.length) {
+      setCollapsedGroups((prev) => {
+        const next = new Set(prev);
+        added.forEach((name) => next.add(name));
+        return next;
+      });
+    }
+    prevGroupNames.current = names;
+  }, [grouped]);
+
+  const addItem = (item, index = null) => {
+    if (!item || selectedSet.has(item)) return;
+    const next = [...safeValue];
+    if (index == null || index >= next.length) {
+      next.push(item);
+    } else {
+      next.splice(index, 0, item);
+    }
+    onChange?.(next);
+  };
+
+  const removeItem = (item) => {
+    onChange?.(safeValue.filter((v) => v !== item));
+  };
+
+  const moveItem = (from, to) => {
+    if (from === to || from == null || to == null) return;
+    const next = [...safeValue];
+    const [item] = next.splice(from, 1);
+    next.splice(to, 0, item);
+    onChange?.(next);
+  };
+
+  const setDropIndexSafe = (val) => {
+    dropIndexRef.current = val;
+    setDropIndex(val);
+  };
+
+  const onDropTrack = (index = null) => {
+    const payload = dragRef.current;
+    if (!payload) return;
+    if (payload.source === 'pool') {
+      addItem(payload.value, index);
+    } else if (payload.source === 'track') {
+      moveItem(payload.index, index == null ? safeValue.length - 1 : index);
+    }
+    dragRef.current = null;
+    setDropIndexSafe(null);
+  };
+
+  const getDropIndexFromPoint = useCallback((x, y) => {
+    const track = trackRef.current;
+    if (!track) return null;
+    const rect = track.getBoundingClientRect();
+    if (y < rect.top - 8 || y > rect.bottom + 8) return null;
+    const chips = Array.from(track.querySelectorAll('.path-order-chip'));
+    if (!chips.length) return 0;
+    for (let i = 0; i < chips.length; i += 1) {
+      const c = chips[i].getBoundingClientRect();
+      const mid = c.left + c.width / 2;
+      if (x < mid) return i;
+    }
+    return chips.length;
+  }, []);
+
+  const getClosestDropIndex = useCallback((x) => {
+    const track = trackRef.current;
+    if (!track) return null;
+    const rect = track.getBoundingClientRect();
+    const clampedX = Math.min(Math.max(x, rect.left + 1), rect.right - 1);
+    const midY = rect.top + rect.height / 2;
+    return getDropIndexFromPoint(clampedX, midY);
+  }, [getDropIndexFromPoint]);
+
+  const isOverTrack = useCallback((x, y) => {
+    const track = trackRef.current;
+    if (!track) return false;
+    const el = document.elementFromPoint(x, y);
+    return !!(el && track.contains(el));
+  }, []);
+
+  const startTouchDrag = (payload, e) => {
+    if (!isTouch || e.pointerType !== 'touch') return;
+    e.preventDefault();
+    dragRef.current = payload;
+    pointerIdRef.current = e.pointerId;
+    lastPointRef.current = { x: e.clientX, y: e.clientY };
+    didTouchMoveRef.current = false;
+    setTouchDragging(true);
+    const text = payload?.value || '';
+    setGhost({ x: e.clientX, y: e.clientY, text });
+    scrollLockRef.current = window.scrollY || window.pageYOffset || 0;
+    document.body.style.position = 'fixed';
+    document.body.style.top = `-${scrollLockRef.current}px`;
+    document.body.style.left = '0';
+    document.body.style.right = '0';
+    document.body.style.width = '100%';
+    document.body.classList.add('touch-dragging');
+    if (e.currentTarget?.setPointerCapture) {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    }
+  };
+
+  useEffect(() => {
+    if (!touchDragging) return;
+    const updateFromPoint = (x, y, source = '') => {
+      const last = lastPointRef.current;
+      if (last) {
+        if (Math.abs(x - last.x) > 2 || Math.abs(y - last.y) > 2) {
+          didTouchMoveRef.current = true;
+        }
+      }
+      lastPointRef.current = { x, y };
+      setGhost((prev) => (prev ? { ...prev, x, y } : null));
+      const idx = getDropIndexFromPoint(x, y);
+      setDropIndexSafe(idx);
+      if (idx != null) {
+        lastValidDropIndexRef.current = idx;
+        enteredTrackRef.current = true;
+      } else if (isOverTrack(x, y)) {
+        enteredTrackRef.current = true;
+      }
+    };
+    const onMove = (e) => {
+      if (!dragRef.current) return;
+      if (pointerIdRef.current != null && e.pointerId !== pointerIdRef.current) return;
+      updateFromPoint(e.clientX, e.clientY, 'pointermove');
+      e.preventDefault();
+    };
+    const onTouchMove = (e) => {
+      if (!dragRef.current) return;
+      const touch = e.touches && e.touches[0];
+      if (!touch) return;
+      updateFromPoint(touch.clientX, touch.clientY, 'touchmove');
+      e.preventDefault();
+    };
+    const finishDrag = (x, y, source = '') => {
+      if (enteredTrackRef.current) {
+        const lastX = lastPointRef.current?.x ?? x ?? 0;
+        const fallbackIdx = getClosestDropIndex(lastX);
+        const dropIdx = lastValidDropIndexRef.current ?? fallbackIdx ?? safeValue.length;
+        onDropTrack(dropIdx);
+      }
+      dragRef.current = null;
+      setDropIndexSafe(null);
+      setTouchDragging(false);
+      setGhost(null);
+      pointerIdRef.current = null;
+      document.body.classList.remove('touch-dragging');
+      lastValidDropIndexRef.current = null;
+      enteredTrackRef.current = false;
+      document.body.style.position = '';
+      document.body.style.top = '';
+      document.body.style.left = '';
+      document.body.style.right = '';
+      document.body.style.width = '';
+      window.scrollTo(0, scrollLockRef.current);
+    };
+    const onEnd = (e) => {
+      if (!dragRef.current) return;
+      if (pointerIdRef.current != null && e.pointerId !== pointerIdRef.current) return;
+      finishDrag(e.clientX, e.clientY, 'pointerup');
+    };
+    const onTouchEnd = (e) => {
+      if (!dragRef.current) return;
+      const touch = e.changedTouches && e.changedTouches[0];
+      finishDrag(touch ? touch.clientX : null, touch ? touch.clientY : null, 'touchend');
+    };
+    window.addEventListener('pointermove', onMove, { passive: false });
+    window.addEventListener('touchmove', onTouchMove, { passive: false });
+    window.addEventListener('pointerup', onEnd);
+    window.addEventListener('pointercancel', onEnd);
+    window.addEventListener('touchend', onTouchEnd, { passive: false });
+    window.addEventListener('touchcancel', onTouchEnd, { passive: false });
+    return () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('touchmove', onTouchMove);
+      window.removeEventListener('pointerup', onEnd);
+      window.removeEventListener('pointercancel', onEnd);
+      window.removeEventListener('touchend', onTouchEnd);
+      window.removeEventListener('touchcancel', onTouchEnd);
+    };
+  }, [touchDragging, getDropIndexFromPoint, getClosestDropIndex]);
+
+  return (
+    <Space direction="vertical" size={8} style={{ width: '100%' }}>
+      <div className="path-order-pool">
+        {filtered.length === 0 ? (
+          <div className="path-order-empty">暂无可用节点</div>
+        ) : grouped.map(([group, items]) => (
+          <div key={group} className="path-order-group">
+            <button
+              type="button"
+              className="path-order-group-title"
+              onClick={() => {
+                setCollapsedGroups((prev) => {
+                  const next = new Set(prev);
+                  if (next.has(group)) next.delete(group);
+                  else next.add(group);
+                  return next;
+                });
+              }}
+            >
+              <span className={`path-order-group-caret${collapsedGroups.has(group) ? ' is-collapsed' : ''}`}>▾</span>
+              <span>{group}</span>
+              <span className="path-order-group-count">{items.length}</span>
+            </button>
+            {!collapsedGroups.has(group) && (
+              <div className="path-order-group-items">
+                {items.map((opt) => (
+                  <div
+                    key={opt.value}
+                    className={`path-order-pool-chip${isTouch ? ' is-touch' : ''}`}
+                    draggable={!isTouch}
+                    onDragStart={() => {
+                      if (isTouch) return;
+                      dragRef.current = { source: 'pool', value: opt.value };
+                    }}
+                    onPointerDown={(e) => startTouchDrag({ source: 'pool', value: opt.value }, e)}
+                    onClick={isTouch ? () => {
+                      if (didTouchMoveRef.current) return;
+                      addItem(opt.value);
+                    } : undefined}
+                  >
+                    <span className="path-order-handle">＋</span>
+                    <span>{opt.label}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+      {extra ? <Text type="secondary" style={{ fontSize: 12 }}>{extra}</Text> : null}
+      <div
+        className="path-order-track"
+        ref={trackRef}
+        onDragOver={(e) => e.preventDefault()}
+        onDrop={() => onDropTrack()}
+        onDragLeave={() => setDropIndex(null)}
+      >
+        {dropIndex === 0 ? <div className="path-drop-indicator" /> : null}
+        {safeValue.length === 0 ? (
+          <div className="path-order-empty">拖拽节点到这里形成路径</div>
+        ) : safeValue.map((item, idx) => (
+          <React.Fragment key={`${item}-${idx}`}>
+            {dropIndex === idx ? <div className="path-drop-indicator" /> : null}
+            <div
+              className={`path-order-chip${isTouch ? ' is-touch' : ''}${dropIndex === idx ? ' path-order-chip-shift' : ''}`}
+              draggable={!isTouch}
+              onDragStart={() => {
+                if (isTouch) return;
+                dragRef.current = { source: 'track', value: item, index: idx };
+              }}
+              onPointerDown={(e) => startTouchDrag({ source: 'track', value: item, index: idx }, e)}
+              onDragOver={(e) => {
+                e.preventDefault();
+                setDropIndex(idx + 1);
+              }}
+              onDrop={() => onDropTrack(idx)}
+            >
+              <span className="path-order-handle">≡</span>
+              <span>{item}</span>
+              {isTouch ? (
+                <span className="path-order-actions">
+                  <button
+                    type="button"
+                    className="path-order-action"
+                    disabled={idx === 0}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      moveItem(idx, idx - 1);
+                    }}
+                  >
+                    ↑
+                  </button>
+                  <button
+                    type="button"
+                    className="path-order-action"
+                    disabled={idx === safeValue.length - 1}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      moveItem(idx, idx + 1);
+                    }}
+                  >
+                    ↓
+                  </button>
+                </span>
+              ) : null}
+              <button
+                type="button"
+                className="path-order-remove"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  removeItem(item);
+                }}
+              >
+                ×
+              </button>
+            </div>
+          </React.Fragment>
+        ))}
+        {dropIndex === safeValue.length ? <div className="path-drop-indicator" /> : null}
+      </div>
+      {ghost && (
+        <div
+          className="path-order-ghost"
+          style={{ transform: `translate(${ghost.x}px, ${ghost.y}px)` }}
+        >
+          <span className="path-order-handle">≡</span>
+          <span>{ghost.text}</span>
+        </div>
+      )}
+    </Space>
+  );
+};
+
+const PathActionBar = ({ form, field, sourceField }) => {
+  const reverseField = () => {
+    const cur = form.getFieldValue(field);
+    const next = Array.isArray(cur) ? [...cur].reverse() : [];
+    form.setFieldsValue({ [field]: next });
+  };
+  const clearField = () => {
+    form.setFieldsValue({ [field]: [] });
+  };
+  const fillFromSource = () => {
+    if (!sourceField) return;
+    const src = form.getFieldValue(sourceField);
+    const next = Array.isArray(src) ? [...src].reverse() : [];
+    form.setFieldsValue({ [field]: next });
+  };
+  return (
+    <Space size={8} wrap>
+      <Button size="small" onClick={reverseField}>反转顺序</Button>
+      <Button size="small" onClick={clearField}>清空</Button>
+      {sourceField ? <Button size="small" onClick={fillFromSource}>回程=正向反转</Button> : null}
+    </Space>
+  );
+};
+
+const escapeHtml = (input = '') => (
+  input.replace(/[&<>"']/g, (ch) => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch] || ch
+  ))
+);
+
 function NodeList({ onSelect, onShowInstall, refreshSignal }) {
   const [data, setData] = useState([]);
+  const [searchText, setSearchText] = useState('');
+  const [filterStatus, setFilterStatus] = useState('all');
+  const [filterRegion, setFilterRegion] = useState('all');
+  const [filterTransport, setFilterTransport] = useState('all');
+  const [cpuMin, setCpuMin] = useState(null);
+  const [memMin, setMemMin] = useState(null);
+  const [viewName, setViewName] = useState('');
+  const [views, setViews] = useState(() => {
+    try {
+      return JSON.parse(localStorage.getItem('node_filter_views') || '[]');
+    } catch (_) {
+      return [];
+    }
+  });
   const [modalOpen, setModalOpen] = useState(false);
   const [form] = Form.useForm();
   const screens = useBreakpoint();
@@ -192,7 +609,12 @@ function NodeList({ onSelect, onShowInstall, refreshSignal }) {
         api('GET', '/api/nodes'),
         api('GET', '/api/uninstall-status'),
       ]);
-      const sorted = [...(list || [])].sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+      const sorted = [...(list || [])].sort((a, b) => {
+        const at = normalizeTimestamp(a.created_at);
+        const bt = normalizeTimestamp(b.created_at);
+        if (at !== bt) return bt - at;
+        return (a.name || '').localeCompare(b.name || '');
+      });
       const existing = new Map(sorted.map((n) => [n.name, n]));
       const nextMap = new Map();
       (uninstallStatuses || []).forEach((s) => {
@@ -210,7 +632,12 @@ function NodeList({ onSelect, onShowInstall, refreshSignal }) {
           });
         }
       });
-      setData(merged.sort((a, b) => (a.name || '').localeCompare(b.name || '')));
+      setData(merged.sort((a, b) => {
+        const at = normalizeTimestamp(a.created_at);
+        const bt = normalizeTimestamp(b.created_at);
+        if (at !== bt) return bt - at;
+        return (a.name || '').localeCompare(b.name || '');
+      }));
       setUninstallMap(nextMap);
     } catch (e) {
       message.error(e.message);
@@ -335,7 +762,7 @@ function NodeList({ onSelect, onShowInstall, refreshSignal }) {
     return 1;
   }, [screens]);
 
-  const rowHeight = 340;
+  const rowHeight = 360;
   const gutter = 16;
 
   const summary = useMemo(() => {
@@ -350,6 +777,107 @@ function NodeList({ onSelect, onShowInstall, refreshSignal }) {
       : 0;
     return { total, online, totalIn, totalOut, totalMem, usedMem, avgCpu };
   }, [data]);
+
+  const regionOptions = useMemo(() => {
+    const set = new Set();
+    data.forEach((n) => {
+      const region = n.geo_region || n.geo_country || '未知地区';
+      set.add(region);
+    });
+    return Array.from(set).sort((a, b) => a.localeCompare(b, 'zh'));
+  }, [data]);
+
+  const transportOptions = useMemo(() => {
+    const set = new Set();
+    data.forEach((n) => {
+      const v = (n.transport || 'quic').toUpperCase();
+      set.add(v);
+    });
+    return Array.from(set).sort();
+  }, [data]);
+
+  const displayData = useMemo(() => {
+    const keyword = searchText.trim().toLowerCase();
+    return data.filter((n) => {
+      if (keyword) {
+        const name = String(n.name || '').toLowerCase();
+        if (!name.includes(keyword)) return false;
+      }
+      if (filterStatus !== 'all') {
+        const online = isOnline(n.last_seen_at);
+        if (filterStatus === 'online' && !online) return false;
+        if (filterStatus === 'offline' && online) return false;
+      }
+      if (filterRegion !== 'all') {
+        const region = n.geo_region || n.geo_country || '未知地区';
+        if (region !== filterRegion) return false;
+      }
+      if (filterTransport !== 'all') {
+        const v = (n.transport || 'quic').toUpperCase();
+        if (v !== filterTransport) return false;
+      }
+      if (cpuMin != null && cpuMin !== '') {
+        const cpu = n.cpu_usage || 0;
+        if (cpu < cpuMin) return false;
+      }
+      if (memMin != null && memMin !== '') {
+        const memPct = n.mem_total_bytes
+          ? Math.round((n.mem_used_bytes || 0) / n.mem_total_bytes * 100)
+          : 0;
+        if (memPct < memMin) return false;
+      }
+      return true;
+    });
+  }, [data, searchText, filterStatus, filterRegion, filterTransport, cpuMin, memMin]);
+
+  const resetFilters = () => {
+    setSearchText('');
+    setFilterStatus('all');
+    setFilterRegion('all');
+    setFilterTransport('all');
+    setCpuMin(null);
+    setMemMin(null);
+  };
+
+  const saveView = () => {
+    const name = viewName.trim();
+    if (!name) {
+      message.warning('请输入视图名称');
+      return;
+    }
+    const next = [...views.filter((v) => v.name !== name), {
+      name,
+      filters: {
+        searchText,
+        filterStatus,
+        filterRegion,
+        filterTransport,
+        cpuMin,
+        memMin,
+      },
+    }];
+    setViews(next);
+    localStorage.setItem('node_filter_views', JSON.stringify(next));
+    message.success('视图已保存');
+  };
+
+  const applyView = (name) => {
+    const v = views.find((x) => x.name === name);
+    if (!v) return;
+    const f = v.filters || {};
+    setSearchText(f.searchText || '');
+    setFilterStatus(f.filterStatus || 'all');
+    setFilterRegion(f.filterRegion || 'all');
+    setFilterTransport(f.filterTransport || 'all');
+    setCpuMin(f.cpuMin ?? null);
+    setMemMin(f.memMin ?? null);
+  };
+
+  const removeView = (name) => {
+    const next = views.filter((v) => v.name !== name);
+    setViews(next);
+    localStorage.setItem('node_filter_views', JSON.stringify(next));
+  };
 
   const onCreate = async () => {
     try {
@@ -400,62 +928,148 @@ function NodeList({ onSelect, onShowInstall, refreshSignal }) {
         title="节点列表"
         extra={
           <Space>
-            <Button onClick={openDiag}>诊断采集</Button>
-            <Button
-              onClick={async () => {
-                try {
-                  const res = await api('POST', '/api/peers/auto', {});
-                  message.success(`已批量配置对端：新增${res.created || 0}，补全${res.updated || 0}`);
-                  load();
-                } catch (e) {
-                  message.error(e.message);
-                }
-              }}
-            >
-              一键配置对端
-            </Button>
-            <Button
-              onClick={async () => {
-                setEndpointOpen(true);
-                setEndpointLoading(true);
-                try {
-                  const res = await api('POST', '/api/endpoint-check/run', {});
-                  setEndpointRunId(res.run_id || '');
-                  setEndpointResults([]);
-                } catch (e) {
-                  message.error(e.message);
-                }
-                setEndpointLoading(false);
-              }}
-            >
-              Endpoint检测
-            </Button>
-            <Button
-              onClick={async () => {
-                setTimeSyncOpen(true);
-                setTimeSyncLoading(true);
-                try {
-                  const res = await api('POST', '/api/time-sync/run', { timezone: timeSyncTZ });
-                  setTimeSyncRunId(res.run_id || '');
-                  setTimeSyncResults([]);
-                } catch (e) {
-                  message.error(e.message);
-                }
-                setTimeSyncLoading(false);
-              }}
-            >
-              时间同步
-            </Button>
+            <Tooltip title="诊断采集">
+              <Button className="icon-btn" type="text" size="small" icon={<RadarChartOutlined />} onClick={openDiag} aria-label="诊断采集" />
+            </Tooltip>
+            <Tooltip title="一键配置对端">
+              <Button
+                className="icon-btn"
+                type="text"
+                size="small"
+                icon={<ShareAltOutlined />}
+                onClick={async () => {
+                  try {
+                    const res = await api('POST', '/api/peers/auto', {});
+                    message.success(`已批量配置对端：新增${res.created || 0}，补全${res.updated || 0}`);
+                    load();
+                  } catch (e) {
+                    message.error(e.message);
+                  }
+                }}
+                aria-label="一键配置对端"
+              />
+            </Tooltip>
+            <Tooltip title="对端检测">
+              <Button
+                className="icon-btn"
+                type="text"
+                size="small"
+                icon={<ApiOutlined />}
+                onClick={async () => {
+                  setEndpointOpen(true);
+                  setEndpointLoading(true);
+                  try {
+                    const res = await api('POST', '/api/endpoint-check/run', {});
+                    setEndpointRunId(res.run_id || '');
+                    setEndpointResults([]);
+                  } catch (e) {
+                    message.error(e.message);
+                  }
+                  setEndpointLoading(false);
+                }}
+                aria-label="对端检测"
+              />
+            </Tooltip>
+            <Tooltip title="时间同步">
+              <Button
+                className="icon-btn"
+                type="text"
+                size="small"
+                icon={<ClockCircleOutlined />}
+                onClick={async () => {
+                  setTimeSyncOpen(true);
+                  setTimeSyncLoading(true);
+                  try {
+                    const res = await api('POST', '/api/time-sync/run', { timezone: timeSyncTZ });
+                    setTimeSyncRunId(res.run_id || '');
+                    setTimeSyncResults([]);
+                  } catch (e) {
+                    message.error(e.message);
+                  }
+                  setTimeSyncLoading(false);
+                }}
+                aria-label="时间同步"
+              />
+            </Tooltip>
           </Space>
         }
       >
+        <div className="node-filter-bar">
+          <Space wrap>
+            <Input
+              placeholder="搜索节点名称"
+              value={searchText}
+              onChange={(e) => setSearchText(e.target.value)}
+              allowClear
+            />
+            <Select
+              placeholder="视图"
+              options={views.map((v) => ({ label: v.name, value: v.name }))}
+              onChange={applyView}
+              allowClear
+              style={{ minWidth: 140 }}
+            />
+            <Input
+              placeholder="视图名称"
+              value={viewName}
+              onChange={(e) => setViewName(e.target.value)}
+              style={{ minWidth: 140 }}
+            />
+            <Button onClick={saveView}>保存视图</Button>
+            {views.length ? (
+              <Select
+                placeholder="删除视图"
+                options={views.map((v) => ({ label: v.name, value: v.name }))}
+                onChange={removeView}
+                style={{ minWidth: 140 }}
+              />
+            ) : null}
+            <Select
+              value={filterStatus}
+              onChange={setFilterStatus}
+              options={[
+                { label: '全部状态', value: 'all' },
+                { label: '在线', value: 'online' },
+                { label: '离线', value: 'offline' },
+              ]}
+              style={{ minWidth: 120 }}
+            />
+            <Select
+              value={filterRegion}
+              onChange={setFilterRegion}
+              options={[{ label: '全部地区', value: 'all' }, ...regionOptions.map((r) => ({ label: r, value: r }))]}
+              style={{ minWidth: 140 }}
+            />
+            <Select
+              value={filterTransport}
+              onChange={setFilterTransport}
+              options={[{ label: '全部传输', value: 'all' }, ...transportOptions.map((v) => ({ label: v, value: v }))]}
+              style={{ minWidth: 120 }}
+            />
+            <InputNumber
+              min={0}
+              max={100}
+              value={cpuMin}
+              onChange={setCpuMin}
+              placeholder="CPU≥%"
+            />
+            <InputNumber
+              min={0}
+              max={100}
+              value={memMin}
+              onChange={setMemMin}
+              placeholder="内存≥%"
+            />
+            <Button onClick={resetFilters}>清空筛选</Button>
+          </Space>
+        </div>
         <div className="node-list-viewport">
           <WindowScroller scrollElement={window}>
             {({ height, isScrolling, onChildScroll, scrollTop }) => (
               <AutoSizer disableHeight>
                 {({ width }) => {
                   const columnWidth = Math.max(260, Math.floor((width - gutter * (columns - 1)) / columns));
-                  const rowCount = Math.ceil(data.length / columns) || 1;
+                  const rowCount = Math.ceil(displayData.length / columns) || 1;
                   return (
                     <VirtualGrid
                       autoHeight
@@ -472,8 +1086,8 @@ function NodeList({ onSelect, onShowInstall, refreshSignal }) {
                       scrollTop={scrollTop}
                       cellRenderer={({ columnIndex, rowIndex, key, style }) => {
                         const index = rowIndex * columns + columnIndex;
-                        if (index >= data.length) return null;
-                        const n = data[index];
+                        if (index >= displayData.length) return null;
+                        const n = displayData[index];
                         const online = isOnline(n.last_seen_at);
                         const cellStyle = {
                           ...style,
@@ -578,6 +1192,19 @@ function NodeList({ onSelect, onShowInstall, refreshSignal }) {
                                 <Space>
                                   <Button size="small" type="primary" disabled={n._ghost} onClick={() => onSelect(n)}>管理</Button>
                                   <Button size="small" disabled={n._ghost} onClick={() => onShowInstall(n)}>安装</Button>
+                                  <Button
+                                    size="small"
+                                    onClick={async () => {
+                                      try {
+                                        await navigator.clipboard.writeText(n.name || '');
+                                        message.success('已复制节点名称');
+                                      } catch (e) {
+                                        message.error('复制失败');
+                                      }
+                                    }}
+                                  >
+                                    复制名称
+                                  </Button>
                                   <Button size="small" danger disabled={n._ghost} onClick={() => openDelete(n)}>删除</Button>
                                 </Space>
                               </Space>
@@ -941,6 +1568,368 @@ function NodeList({ onSelect, onShowInstall, refreshSignal }) {
   );
 }
 
+function NodeMap({ refreshSignal, onSelect, onOpenNode }) {
+  const [nodes, setNodes] = useState([]);
+  const [mapReady, setMapReady] = useState(false);
+  const [mapError, setMapError] = useState('');
+  const [autoFit, setAutoFit] = useState(true);
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const [drawerNode, setDrawerNode] = useState(null);
+  const mapRef = useRef(null);
+  const mapInstance = useRef(null);
+  const markersRef = useRef(new Map());
+  const hoverTimer = useRef(null);
+
+  const loadNodes = async () => {
+    try {
+      const list = await api('GET', '/api/nodes');
+      setNodes(list || []);
+    } catch (e) {
+      message.error(e.message);
+    }
+  };
+
+  useEffect(() => {
+    loadNodes();
+    const timer = setInterval(loadNodes, 6000);
+    return () => clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    if (refreshSignal > 0) loadNodes();
+  }, [refreshSignal]);
+
+  useEffect(() => {
+    if (!mapRef.current) return;
+    if (mapInstance.current) return;
+    try {
+      const map = L.map(mapRef.current, {
+        zoomControl: true,
+        attributionControl: true,
+      }).setView([20, 0], 2);
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        maxZoom: 19,
+        attribution: '&copy; OpenStreetMap contributors',
+      }).addTo(map);
+      map.on('zoomstart', () => setAutoFit(false));
+      map.on('dragstart', () => setAutoFit(false));
+      mapInstance.current = map;
+      setMapReady(true);
+      setTimeout(() => map.invalidateSize(), 0);
+    } catch (e) {
+      setMapError(e.message || '地图加载失败');
+    }
+  }, []);
+
+  const nodeLocations = useMemo(() => (
+    nodes.map((node) => {
+      const ip = String(node.geo_ip || (node.public_ips || [])[0] || '').trim();
+      const geo = {
+        lat: Number(node.geo_lat),
+        lng: Number(node.geo_lng),
+        city: node.geo_city,
+        region: node.geo_region,
+        country: node.geo_country,
+      };
+      return { node, ip, geo };
+    })
+  ), [nodes]);
+
+  useEffect(() => {
+    const map = mapInstance.current;
+    if (!map) return;
+    const active = nodeLocations.filter(
+      (n) => n.geo && Number.isFinite(n.geo.lat) && Number.isFinite(n.geo.lng),
+    );
+    if (active.length === 0) return;
+    const bounds = L.latLngBounds();
+
+    const nextKeys = new Set();
+    active.forEach(({ node, ip, geo }) => {
+      const key = node.id || node.name;
+      if (!key) return;
+      nextKeys.add(key);
+      const position = [geo.lat, geo.lng];
+      const locationText = [geo.city, geo.region, geo.country].filter(Boolean).join(' / ');
+      const statusText = isOnline(node.last_seen_at) ? '在线' : '离线';
+      const statusColor = isOnline(node.last_seen_at) ? '#16a34a' : '#64748b';
+      const cpu = node.cpu_usage?.toFixed ? Number(node.cpu_usage.toFixed(1)) : 0;
+      const cpuColor = cpu >= 85 ? '#ef4444' : cpu >= 70 ? '#f59e0b' : cpu >= 50 ? 'linear-gradient(90deg,#0a66ff,#22c55e)' : '#0a66ff';
+      const memPct = node.mem_total_bytes
+        ? Math.min(100, Math.round((node.mem_used_bytes || 0) / node.mem_total_bytes * 100))
+        : 0;
+      const memColor = memPct >= 85 ? '#ef4444' : memPct >= 70 ? '#f59e0b' : memPct >= 50 ? 'linear-gradient(90deg,#0a66ff,#22c55e)' : '#0a66ff';
+      const memText = node.mem_total_bytes
+        ? `${formatBytes(node.mem_used_bytes)} / ${formatBytes(node.mem_total_bytes)}`
+        : '-';
+      const uptimeText = node.uptime_sec ? formatUptime(node.uptime_sec) : '-';
+      const lastSeenText = node.last_seen_at ? formatRelativeTime(node.last_seen_at) : '-';
+      const html = `
+        <div class="node-map-card">
+          <div class="node-map-title">
+            <span class="node-map-dot" style="background:${statusColor};"></span>
+            <span>${escapeHtml(node.name || '-')}</span>
+          </div>
+          <div class="node-map-meta">IP：${escapeHtml(ip || '-')}</div>
+          <div class="node-map-meta">${escapeHtml(locationText || '未知位置')}</div>
+          <div class="node-map-status">${escapeHtml(statusText)}</div>
+        </div>
+      `;
+      const detailHtml = `
+        <div class="node-map-detail">
+          <div class="node-map-detail-head">
+            <span class="node-map-dot" style="background:${statusColor};"></span>
+            <span class="node-map-detail-name">${escapeHtml(node.name || '-')}</span>
+            <span class="node-map-tag node-map-tag-status ${isOnline(node.last_seen_at) ? 'node-map-tag-status-on' : 'node-map-tag-status-off'}">${escapeHtml(statusText)}</span>
+            <span class="node-map-tag node-map-tag-transport">${escapeHtml((node.transport || 'quic').toUpperCase())}</span>
+          </div>
+          <div class="node-map-detail-grid">
+            <div class="node-map-metric">
+              <div class="node-map-metric-label">CPU</div>
+              <div class="node-map-metric-sub">占用：${escapeHtml(String(cpu))}%</div>
+              <div class="node-map-progress">
+                <span style="width:${cpu}%;background:${cpuColor};"></span>
+              </div>
+            </div>
+            <div class="node-map-metric">
+              <div class="node-map-metric-label">内存</div>
+              <div class="node-map-metric-sub">占用：${escapeHtml(String(memPct))}%</div>
+              <div class="node-map-metric-sub">已用：${escapeHtml(memText)}</div>
+              <div class="node-map-progress">
+                <span style="width:${memPct}%;background:${memColor};"></span>
+              </div>
+            </div>
+          </div>
+          <div class="node-map-detail-meta">
+            <div>IP：${escapeHtml(ip || '-')}</div>
+            <div>位置：${escapeHtml(locationText || '未知位置')}</div>
+            <div>上行：${escapeHtml(formatBytes(node.net_out_bytes))}</div>
+            <div>下行：${escapeHtml(formatBytes(node.net_in_bytes))}</div>
+            <div>运行：${escapeHtml(uptimeText)}</div>
+            <div>上报：${escapeHtml(lastSeenText)}</div>
+          </div>
+        </div>
+      `;
+      const existing = markersRef.current.get(key);
+      if (existing) {
+        const last = existing._nodeMapState || {};
+        const posChanged = last.lat !== geo.lat || last.lng !== geo.lng;
+        if (posChanged) {
+          existing.setLatLng(position);
+        }
+        if (last.html !== html) {
+          existing.setIcon(L.divIcon({
+            className: 'node-map-marker',
+            html,
+            iconSize: [220, 78],
+            iconAnchor: [110, 78],
+          }));
+        }
+        if (last.detailHtml !== detailHtml) {
+          existing.setTooltipContent(detailHtml);
+        }
+        existing._nodeMapState = { lat: geo.lat, lng: geo.lng, html, detailHtml };
+      } else {
+        const marker = L.marker(position, {
+          title: node.name || ip,
+          icon: L.divIcon({
+            className: 'node-map-marker',
+            html,
+            iconSize: [220, 78],
+            iconAnchor: [110, 78],
+          }),
+        });
+        const tooltip = L.tooltip({
+          direction: 'top',
+          offset: [0, -10],
+          opacity: 1,
+          className: 'node-map-tooltip',
+          interactive: true,
+        }).setContent(detailHtml);
+        marker.bindTooltip(tooltip);
+        marker.on('mouseover', () => {
+          if (hoverTimer.current) window.clearTimeout(hoverTimer.current);
+          marker.openTooltip();
+        });
+        marker.on('mouseout', () => {
+          if (hoverTimer.current) window.clearTimeout(hoverTimer.current);
+          hoverTimer.current = window.setTimeout(() => marker.closeTooltip(), 160);
+        });
+        marker.on('tooltipopen', (e) => {
+          const el = e.tooltip.getElement?.();
+          if (!el) return;
+          const onEnter = () => {
+            if (hoverTimer.current) window.clearTimeout(hoverTimer.current);
+          };
+          const onLeave = () => {
+            if (hoverTimer.current) window.clearTimeout(hoverTimer.current);
+            hoverTimer.current = window.setTimeout(() => marker.closeTooltip(), 160);
+          };
+          el.addEventListener('mouseenter', onEnter);
+          el.addEventListener('mouseleave', onLeave);
+          e.tooltip._nodeMapHandlers = { onEnter, onLeave };
+        });
+        marker.on('tooltipclose', (e) => {
+          const el = e.tooltip.getElement?.();
+          const handlers = e.tooltip._nodeMapHandlers;
+          if (!el || !handlers) return;
+          el.removeEventListener('mouseenter', handlers.onEnter);
+          el.removeEventListener('mouseleave', handlers.onLeave);
+          e.tooltip._nodeMapHandlers = null;
+        });
+      marker.on('click', () => {
+        setDrawerNode(node);
+        setDrawerOpen(true);
+      });
+        marker.addTo(map);
+        marker._nodeMapState = { lat: geo.lat, lng: geo.lng, html, detailHtml };
+        markersRef.current.set(key, marker);
+      }
+      bounds.extend(position);
+    });
+
+    markersRef.current.forEach((marker, key) => {
+      if (!nextKeys.has(key)) {
+        marker.remove();
+        markersRef.current.delete(key);
+      }
+    });
+
+    if (autoFit) {
+      map.fitBounds(bounds, { padding: [80, 80] });
+      if (map.getZoom() > 5) map.setZoom(5);
+    }
+  }, [nodeLocations, autoFit]);
+
+  const missing = nodeLocations.filter(
+    (n) => !n.geo || !Number.isFinite(n.geo.lat) || !Number.isFinite(n.geo.lng),
+  );
+
+  return (
+    <Space direction="vertical" size={16} style={{ width: '100%' }}>
+      <Card className="page-card" title="节点地图">
+        <div className="map-shell">
+          <div ref={mapRef} className="map-canvas" />
+          <Button
+            className="map-fit-btn"
+            size="small"
+            disabled={!mapReady}
+            onClick={() => setAutoFit(true)}
+          >
+            重新适配
+          </Button>
+          {mapError ? (
+            <div className="map-overlay">
+              <Text type="danger">{mapError}</Text>
+            </div>
+          ) : !mapReady ? (
+            <div className="map-overlay">
+              <Text type="secondary">地图加载中...</Text>
+            </div>
+          ) : null}
+        </div>
+      </Card>
+      <Card className="page-card" title="未定位节点">
+        {missing.length === 0 ? (
+          <Text type="secondary">全部节点已定位。</Text>
+        ) : (
+          <Space wrap>
+            {missing.map((n) => (
+              <Tag key={n.node.id || n.node.name} color="default">
+                {n.node.name || '未命名'}
+              </Tag>
+            ))}
+          </Space>
+        )}
+      </Card>
+      <Drawer
+        placement="right"
+        open={drawerOpen}
+        onClose={() => setDrawerOpen(false)}
+        width={420}
+        title={drawerNode ? `节点详情：${drawerNode.name}` : '节点详情'}
+      >
+        {drawerNode ? (
+          <Space direction="vertical" size={12} style={{ width: '100%' }}>
+            <Space>
+              <Tooltip title="进入管理">
+                <Button
+                  type="text"
+                  className="icon-btn icon-btn-primary"
+                  icon={<GearIcon />}
+                  onClick={() => {
+                    if (onSelect) onSelect(drawerNode);
+                    if (onOpenNode) onOpenNode();
+                    setDrawerOpen(false);
+                  }}
+                />
+              </Tooltip>
+              <Tooltip title="复制节点名称">
+                <Button
+                  type="text"
+                  className="icon-btn icon-btn-neutral"
+                  icon={<CopyOutlined />}
+                  onClick={async () => {
+                    try {
+                      await navigator.clipboard.writeText(drawerNode.name || '');
+                      message.success('已复制节点名称');
+                    } catch (e) {
+                      message.error('复制失败');
+                    }
+                  }}
+                />
+              </Tooltip>
+              <Tooltip title="Endpoint 检测">
+                <Button
+                  type="text"
+                  className="icon-btn icon-btn-success"
+                  icon={<ApiOutlined />}
+                  onClick={async () => {
+                    try {
+                      await api('POST', '/api/endpoint-check/run', { nodes: [drawerNode.name] });
+                      message.success('已触发 Endpoint 检测');
+                    } catch (e) {
+                      message.error(e.message);
+                    }
+                  }}
+                />
+              </Tooltip>
+              <Tooltip title="时间同步">
+                <Button
+                  type="text"
+                  className="icon-btn icon-btn-warn"
+                  icon={<ClockCircleOutlined />}
+                  onClick={async () => {
+                    try {
+                      await api('POST', '/api/time-sync/run', { nodes: [drawerNode.name], timezone: 'Asia/Shanghai' });
+                      message.success('已触发时间同步');
+                    } catch (e) {
+                      message.error(e.message);
+                    }
+                  }}
+                />
+              </Tooltip>
+            </Space>
+            <Descriptions size="small" column={1}>
+              <Descriptions.Item label="状态">{isOnline(drawerNode.last_seen_at) ? '在线' : '离线'}</Descriptions.Item>
+              <Descriptions.Item label="IP">{drawerNode.geo_ip || (drawerNode.public_ips || []).join(', ') || '-'}</Descriptions.Item>
+              <Descriptions.Item label="位置">
+                {[drawerNode.geo_city, drawerNode.geo_region, drawerNode.geo_country].filter(Boolean).join(' / ') || '-'}
+              </Descriptions.Item>
+              <Descriptions.Item label="CPU">{drawerNode.cpu_usage?.toFixed ? `${drawerNode.cpu_usage.toFixed(1)}%` : '-'}</Descriptions.Item>
+              <Descriptions.Item label="内存">
+                {drawerNode.mem_total_bytes
+                  ? `${formatBytes(drawerNode.mem_used_bytes)} / ${formatBytes(drawerNode.mem_total_bytes)}`
+                  : '-'}
+              </Descriptions.Item>
+            </Descriptions>
+          </Space>
+        ) : null}
+      </Drawer>
+    </Space>
+  );
+}
+
 function NodeDetail({ node, onBack, refreshList, onShowInstall }) {
   const [detail, setDetail] = useState(node);
   const [updateStatus, setUpdateStatus] = useState(null);
@@ -969,7 +1958,16 @@ function NodeDetail({ node, onBack, refreshList, onShowInstall }) {
 
   const load = async () => {
     try {
-      setDetail(await api('GET', `/api/nodes/${node.id}`));
+      const detailRes = await api('GET', `/api/nodes/${node.id}`);
+      if (detailRes?.routes) {
+        detailRes.routes = [...detailRes.routes].sort((a, b) => {
+          const at = normalizeTimestamp(a.created_at);
+          const bt = normalizeTimestamp(b.created_at);
+          if (at !== bt) return bt - at;
+          return (a.name || '').localeCompare(b.name || '');
+        });
+      }
+      setDetail(detailRes);
       setUpdateStatus(await api('GET', `/api/nodes/${node.id}/update-status`));
       setUninstallStatus(await api('GET', `/api/nodes/${node.id}/uninstall-status`));
       refreshList();
@@ -1022,8 +2020,18 @@ function NodeDetail({ node, onBack, refreshList, onShowInstall }) {
   const addRoute = async () => {
     try {
       const v = await routeForm.validateFields();
-      await api('POST', `/api/nodes/${node.id}/routes`, v);
-      message.success('线路已添加');
+      const path = (v.path || []).filter(Boolean);
+      if (path.length < 2) {
+        message.warning('路径至少包含入口和出口节点');
+        return;
+      }
+      if (path[0] !== detail.name) {
+        message.warning('路径第一个必须是入口节点');
+        return;
+      }
+      const exit = path[path.length - 1];
+      await api('POST', `/api/nodes/${node.id}/routes`, { ...v, path, exit });
+      message.success(`线路已创建并分配到入口节点 ${detail.name}`);
       setRouteOpen(false);
       routeForm.resetFields();
       load();
@@ -1159,7 +2167,7 @@ function NodeDetail({ node, onBack, refreshList, onShowInstall }) {
       extra={(
         <Space>
           <Button onClick={onBack}>返回</Button>
-          <Button href={joinUrl(API_BASE, `/nodes/${detail.id}/config`)} target="_blank">下载配置</Button>
+          <Button href={joinUrl(getApiBase(), `/nodes/${detail.id}/config`)} target="_blank">下载配置</Button>
           <Button onClick={() => onShowInstall(detail)}>安装脚本</Button>
           <Button
             onClick={() => {
@@ -1547,36 +2555,41 @@ function NodeDetail({ node, onBack, refreshList, onShowInstall }) {
       <Modal open={routeOpen} onCancel={() => setRouteOpen(false)} onOk={addRoute} title="添加线路" width={600}>
         <Form layout="vertical" form={routeForm} initialValues={{ priority: 1 }}>
           <Form.Item name="name" label="线路名称" rules={[{ required: true }]}><Input placeholder="如: 成都->新加坡-1" /></Form.Item>
-          <Form.Item name="exit" label="出口节点" rules={[{ required: true }]}>
-            <Select
-              placeholder="选择出口节点"
-              options={(allNodes || []).filter((n) => n.id !== detail.id).map((n) => ({ label: n.name, value: n.name }))}
-              showSearch
-              optionFilterProp="label"
-            />
+          <Form.Item name="priority" label="优先级" rules={[{ required: true }]}>
+            <InputNumber min={1} style={{ width: '100%' }} />
           </Form.Item>
-          <Form.Item name="priority" label="优先级" rules={[{ required: true }]}><Input type="number" min={1} /></Form.Item>
-          <Form.Item name="path" label="路径节点顺序" rules={[{ required: true, message: '请选择路径' }]}>
-            <Select
-              mode="multiple"
-              placeholder="从起点到出口的节点顺序"
-              options={(allNodes || []).map((n) => ({ label: n.name, value: n.name }))}
-              showSearch
-              optionFilterProp="label"
-            />
+          <Form.Item label="路径节点顺序">
+            <div className="path-action-bar">
+              <PathActionBar form={routeForm} field="path" />
+            </div>
+            <Form.Item name="path" rules={[{ required: true, message: '请选择路径' }]} noStyle>
+              <PathOrderEditor
+                options={(allNodes || []).map((n) => ({
+                  label: n.name,
+                  value: n.name,
+                  region: n.geo_region,
+                  country: n.geo_country,
+                }))}
+                placeholder="从起点到出口的节点顺序"
+                extra="首节点必须是入口，末节点为出口"
+              />
+            </Form.Item>
           </Form.Item>
-          <Form.Item
-            name="return_path"
-            label="回程路径节点顺序 (可选)"
-            tooltip="从出口回到入口的节点顺序，需以出口开头、入口结尾"
-          >
-            <Select
-              mode="multiple"
-              placeholder="从出口回到入口的节点顺序"
-              options={(allNodes || []).map((n) => ({ label: n.name, value: n.name }))}
-              showSearch
-              optionFilterProp="label"
-            />
+          <Form.Item label="回程路径节点顺序 (可选)" tooltip="从出口回到入口的节点顺序，需以出口开头、入口结尾">
+            <div className="path-action-bar">
+              <PathActionBar form={routeForm} field="return_path" sourceField="path" />
+            </div>
+            <Form.Item name="return_path" noStyle>
+              <PathOrderEditor
+                options={(allNodes || []).map((n) => ({
+                  label: n.name,
+                  value: n.name,
+                  region: n.geo_region,
+                  country: n.geo_country,
+                }))}
+                placeholder="从出口回到入口的节点顺序"
+              />
+            </Form.Item>
           </Form.Item>
           <Divider>可选：入口/出口 IP 参考</Divider>
           <Space direction="vertical" style={{ width: '100%' }}>
@@ -1596,7 +2609,17 @@ function NodeDetail({ node, onBack, refreshList, onShowInstall }) {
         onOk={async () => {
           try {
             const v = await routeEditForm.validateFields();
-            await api('PUT', `/api/nodes/${node.id}/routes/${v.id}`, v);
+            const path = (v.path || []).filter(Boolean);
+            if (path.length < 2) {
+              message.warning('路径至少包含入口和出口节点');
+              return;
+            }
+            if (path[0] !== detail.name) {
+              message.warning('路径第一个必须是入口节点');
+              return;
+            }
+            const exit = path[path.length - 1];
+            await api('PUT', `/api/nodes/${node.id}/routes/${v.id}`, { ...v, path, exit });
             message.success('已更新');
             setRouteEditOpen(false);
             load();
@@ -1610,22 +2633,26 @@ function NodeDetail({ node, onBack, refreshList, onShowInstall }) {
         <Form layout="vertical" form={routeEditForm}>
           <Form.Item name="id" hidden><Input /></Form.Item>
           <Form.Item name="name" label="线路名称" rules={[{ required: true }]}><Input /></Form.Item>
-          <Form.Item name="exit" label="出口节点" rules={[{ required: true }]}>
-            <Select
-              placeholder="选择出口节点"
-              options={(allNodes || []).filter((n) => n.id !== detail.id).map((n) => ({ label: n.name, value: n.name }))}
-              showSearch
-              optionFilterProp="label"
-            />
+          <Form.Item name="priority" label="优先级" rules={[{ required: true }]}>
+            <InputNumber min={1} style={{ width: '100%' }} />
           </Form.Item>
-          <Form.Item name="priority" label="优先级" rules={[{ required: true }]}><Input type="number" min={1} /></Form.Item>
-          <Form.Item name="path" label="路径节点顺序" rules={[{ required: true }]}>
-            <Select
-              mode="multiple"
+          <Form.Item
+            name="path"
+            label="路径节点顺序"
+            rules={[{ required: true }]}
+          >
+            <div className="path-action-bar">
+              <PathActionBar form={routeEditForm} field="path" />
+            </div>
+            <PathOrderEditor
+              options={(allNodes || []).map((n) => ({
+                label: n.name,
+                value: n.name,
+                region: n.geo_region,
+                country: n.geo_country,
+              }))}
               placeholder="从起点到出口的节点顺序"
-              options={(allNodes || []).map((n) => ({ label: n.name, value: n.name }))}
-              showSearch
-              optionFilterProp="label"
+              extra="首节点必须是入口，末节点为出口"
             />
           </Form.Item>
           <Form.Item
@@ -1633,12 +2660,17 @@ function NodeDetail({ node, onBack, refreshList, onShowInstall }) {
             label="回程路径节点顺序 (可选)"
             tooltip="从出口回到入口的节点顺序，需以出口开头、入口结尾"
           >
-            <Select
-              mode="multiple"
+            <div className="path-action-bar">
+              <PathActionBar form={routeEditForm} field="return_path" sourceField="path" />
+            </div>
+            <PathOrderEditor
+              options={(allNodes || []).map((n) => ({
+                label: n.name,
+                value: n.name,
+                region: n.geo_region,
+                country: n.geo_country,
+              }))}
               placeholder="从出口回到入口的节点顺序"
-              options={(allNodes || []).map((n) => ({ label: n.name, value: n.name }))}
-              showSearch
-              optionFilterProp="label"
             />
           </Form.Item>
         </Form>
@@ -1651,17 +2683,34 @@ function RouteList({ settings }) {
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(false);
   const [onlineMap, setOnlineMap] = useState(new Map());
+  const [allNodes, setAllNodes] = useState([]);
+  const [routeOpen, setRouteOpen] = useState(false);
+  const [routeForm] = Form.useForm();
+  const [routeSearch, setRouteSearch] = useState('');
+  const [filterEntry, setFilterEntry] = useState('all');
+  const [filterExit, setFilterExit] = useState('all');
+  const [filterStatus, setFilterStatus] = useState('all');
+  const [templates, setTemplates] = useState(() => {
+    try {
+      return JSON.parse(localStorage.getItem('route_templates') || '[]');
+    } catch (_) {
+      return [];
+    }
+  });
+  const [templateName, setTemplateName] = useState('');
   const [diagOpen, setDiagOpen] = useState(false);
   const [diagRunId, setDiagRunId] = useState('');
   const [diagEvents, setDiagEvents] = useState([]);
   const [diagReports, setDiagReports] = useState([]);
   const [diagMissing, setDiagMissing] = useState([]);
+  const [diagCachedAt, setDiagCachedAt] = useState(null);
   const [diagRoute, setDiagRoute] = useState(null);
   const [diagLoading, setDiagLoading] = useState(false);
   const [logOpen, setLogOpen] = useState(false);
   const [logRunId, setLogRunId] = useState('');
   const [logReports, setLogReports] = useState([]);
   const [logMissing, setLogMissing] = useState([]);
+  const [logCachedAt, setLogCachedAt] = useState(null);
   const [logLoading, setLogLoading] = useState(false);
   const [logRoute, setLogRoute] = useState(null);
   const load = async () => {
@@ -1677,6 +2726,7 @@ function RouteList({ settings }) {
         online.set(n.name, isOnline(n.last_seen_at));
       });
       setOnlineMap(online);
+      setAllNodes(nodes || []);
       const probeMap = new Map();
       (probes || []).forEach((p) => {
         probeMap.set(`${p.node}::${p.route}`, p);
@@ -1708,10 +2758,17 @@ function RouteList({ settings }) {
             return_path: rt.return_path || [],
             return_status: st,
             probe: pb || null,
+            created_at: rt.created_at,
           });
         });
       });
-      setRows(r);
+      setRows(r.sort((a, b) => {
+        const at = normalizeTimestamp(a.created_at);
+        const bt = normalizeTimestamp(b.created_at);
+        if (at !== bt) return bt - at;
+        if (a.node !== b.node) return (a.node || '').localeCompare(b.node || '');
+        return (a.route || '').localeCompare(b.route || '');
+      }));
     } catch (e) {
       message.error(e.message);
     }
@@ -1723,7 +2780,86 @@ function RouteList({ settings }) {
     return () => clearInterval(t);
   }, []);
 
-  const fetchDiag = async (runId) => {
+  const entryOptions = useMemo(() => {
+    const set = new Set(rows.map((r) => r.node));
+    return Array.from(set).sort((a, b) => (a || '').localeCompare(b || ''));
+  }, [rows]);
+
+  const exitOptions = useMemo(() => {
+    const set = new Set(rows.map((r) => r.exit));
+    return Array.from(set).sort((a, b) => (a || '').localeCompare(b || ''));
+  }, [rows]);
+
+  const filteredRows = useMemo(() => {
+    const keyword = routeSearch.trim().toLowerCase();
+    return rows.filter((r) => {
+      if (keyword) {
+        const name = `${r.route || ''} ${r.node || ''} ${r.exit || ''}`.toLowerCase();
+        if (!name.includes(keyword)) return false;
+      }
+      if (filterEntry !== 'all' && r.node !== filterEntry) return false;
+      if (filterExit !== 'all' && r.exit !== filterExit) return false;
+      if (filterStatus !== 'all') {
+        const online = onlineMap.get(r.node);
+        if (filterStatus === 'online' && !online) return false;
+        if (filterStatus === 'offline' && online) return false;
+      }
+      return true;
+    });
+  }, [rows, routeSearch, filterEntry, filterExit, filterStatus, onlineMap]);
+
+  const resetFilters = () => {
+    setRouteSearch('');
+    setFilterEntry('all');
+    setFilterExit('all');
+    setFilterStatus('all');
+  };
+
+  const saveTemplate = () => {
+    const values = routeForm.getFieldsValue();
+    const path = Array.isArray(values.path) ? values.path : [];
+    if (!path.length) {
+      message.warning('请先配置路径');
+      return;
+    }
+    const name = templateName.trim();
+    if (!name) {
+      message.warning('请输入模板名称');
+      return;
+    }
+    const next = [...templates.filter((t) => t.name !== name), {
+      name,
+      path,
+      return_path: Array.isArray(values.return_path) ? values.return_path : [],
+      route_name: values.name || '',
+      priority: values.priority || 1,
+    }];
+    setTemplates(next);
+    localStorage.setItem('route_templates', JSON.stringify(next));
+    message.success('模板已保存');
+  };
+
+  const applyTemplate = (name) => {
+    const tpl = templates.find((t) => t.name === name);
+    if (!tpl) return;
+    routeForm.setFieldsValue({
+      path: tpl.path || [],
+      return_path: tpl.return_path || [],
+      name: tpl.route_name || routeForm.getFieldValue('name'),
+      priority: tpl.priority || routeForm.getFieldValue('priority'),
+    });
+  };
+
+  const removeTemplate = (name) => {
+    const next = templates.filter((t) => t.name !== name);
+    setTemplates(next);
+    localStorage.setItem('route_templates', JSON.stringify(next));
+  };
+
+  const diagLastKey = (routeKey) => `route_diag_last:${routeKey}`;
+  const logLastKey = (routeKey) => `node_log_last:${routeKey}`;
+
+  const fetchDiag = async (runId, cache = false) => {
     if (!runId) return;
     setDiagLoading(true);
     try {
@@ -1731,9 +2867,28 @@ function RouteList({ settings }) {
         api('GET', `/api/route-diag?run_id=${encodeURIComponent(runId)}`),
         api('GET', `/api/diag?run_id=${encodeURIComponent(runId)}`),
       ]);
-      setDiagEvents(trace.events || []);
-      setDiagReports(logs.reports || []);
-      setDiagMissing(logs.missing || []);
+      if (!cache) {
+        setDiagEvents(trace.events || []);
+        setDiagReports(logs.reports || []);
+        setDiagMissing(logs.missing || []);
+      }
+      try {
+        localStorage.setItem(`route_diag_cache:${runId}`, JSON.stringify({
+          events: trace.events || [],
+          reports: logs.reports || [],
+          missing: logs.missing || [],
+          cached_at: Date.now(),
+        }));
+        if (diagRoute?.key) {
+          localStorage.setItem(diagLastKey(diagRoute.key), JSON.stringify({
+            run_id: runId,
+            events: trace.events || [],
+            reports: logs.reports || [],
+            missing: logs.missing || [],
+            cached_at: Date.now(),
+          }));
+        }
+      } catch (_) {}
     } catch (e) {
       message.error(e.message);
     }
@@ -1745,17 +2900,75 @@ function RouteList({ settings }) {
     const t = setInterval(() => fetchDiag(diagRunId), 2000);
     return () => clearInterval(t);
   }, [diagOpen, diagRunId]);
-  const fetchLogs = async (runId) => {
+  const fetchLogs = async (runId, cache = false) => {
     if (!runId) return;
     setLogLoading(true);
     try {
       const logs = await api('GET', `/api/diag?run_id=${encodeURIComponent(runId)}`);
-      setLogReports(logs.reports || []);
-      setLogMissing(logs.missing || []);
+      if (!cache) {
+        setLogReports(logs.reports || []);
+        setLogMissing(logs.missing || []);
+      }
+      try {
+        localStorage.setItem(`node_log_cache:${runId}`, JSON.stringify({
+          reports: logs.reports || [],
+          missing: logs.missing || [],
+          cached_at: Date.now(),
+        }));
+        if (logRoute?.key) {
+          localStorage.setItem(logLastKey(logRoute.key), JSON.stringify({
+            run_id: runId,
+            reports: logs.reports || [],
+            missing: logs.missing || [],
+            cached_at: Date.now(),
+          }));
+        }
+      } catch (_) {}
     } catch (e) {
       message.error(e.message);
     }
     setLogLoading(false);
+  };
+
+  const openDiagFromCache = (route) => {
+    if (!route?.key) return;
+    const cached = localStorage.getItem(diagLastKey(route.key));
+    if (!cached) {
+      message.info('暂无上次诊断结果');
+      return;
+    }
+    try {
+      const payload = JSON.parse(cached);
+      setDiagRoute(route);
+      setDiagRunId(payload.run_id || '');
+      setDiagEvents(payload.events || []);
+      setDiagReports(payload.reports || []);
+      setDiagMissing(payload.missing || []);
+      setDiagCachedAt(payload.cached_at || null);
+      setDiagOpen(true);
+    } catch (_) {
+      message.error('读取上次诊断失败');
+    }
+  };
+
+  const openLogFromCache = (route) => {
+    if (!route?.key) return;
+    const cached = localStorage.getItem(logLastKey(route.key));
+    if (!cached) {
+      message.info('暂无上次日志结果');
+      return;
+    }
+    try {
+      const payload = JSON.parse(cached);
+      setLogRoute(route);
+      setLogRunId(payload.run_id || '');
+      setLogReports(payload.reports || []);
+      setLogMissing(payload.missing || []);
+      setLogCachedAt(payload.cached_at || null);
+      setLogOpen(true);
+    } catch (_) {
+      message.error('读取上次日志失败');
+    }
   };
   useEffect(() => {
     if (!logOpen || !logRunId) return;
@@ -1853,7 +3066,19 @@ function RouteList({ settings }) {
                 setDiagEvents([]);
                 setDiagReports([]);
                 setDiagMissing(res.offline || []);
+                setDiagCachedAt(null);
                 setDiagOpen(true);
+                const cacheKey = `route_diag_cache:${res.run_id}`;
+                const cached = localStorage.getItem(cacheKey);
+                if (cached) {
+                  try {
+                    const payload = JSON.parse(cached);
+                    setDiagEvents(payload.events || []);
+                    setDiagReports(payload.reports || []);
+                    setDiagMissing(payload.missing || []);
+                    setDiagCachedAt(payload.cached_at || null);
+                  } catch (_) {}
+                }
                 setTimeout(() => fetchDiag(res.run_id), 800);
               } catch (e) {
                 message.error(e.message);
@@ -1862,6 +3087,7 @@ function RouteList({ settings }) {
           >
             诊断
           </Button>
+          <Button size="small" onClick={() => openDiagFromCache(r)}>上次诊断</Button>
           <Button
             size="small"
             disabled={!onlineMap.get(r.node)}
@@ -1877,7 +3103,18 @@ function RouteList({ settings }) {
                 setLogRunId(res.run_id || '');
                 setLogReports([]);
                 setLogMissing(res.offline || []);
+                setLogCachedAt(null);
                 setLogOpen(true);
+                const cacheKey = `node_log_cache:${res.run_id}`;
+                const cached = localStorage.getItem(cacheKey);
+                if (cached) {
+                  try {
+                    const payload = JSON.parse(cached);
+                    setLogReports(payload.reports || []);
+                    setLogMissing(payload.missing || []);
+                    setLogCachedAt(payload.cached_at || null);
+                  } catch (_) {}
+                }
                 setTimeout(() => fetchLogs(res.run_id), 800);
               } catch (e) {
                 message.error(e.message);
@@ -1886,6 +3123,7 @@ function RouteList({ settings }) {
           >
             节点日志
           </Button>
+          <Button size="small" onClick={() => openLogFromCache(r)}>上次日志</Button>
         </Space>
       ),
     },
@@ -1924,11 +3162,150 @@ function RouteList({ settings }) {
       message.error(e.message);
     }
   };
+  const addRoute = async () => {
+    try {
+      const v = await routeForm.validateFields();
+      const path = (v.path || []).filter(Boolean);
+      if (path.length < 2) {
+        message.warning('路径至少包含入口和出口节点');
+        return;
+      }
+      const entryName = path[0];
+      const entry = allNodes.find((n) => n.name === entryName);
+      if (!entry) {
+        message.error('入口节点不存在');
+        return;
+      }
+      const exit = path[path.length - 1];
+      await api('POST', `/api/nodes/${entry.id}/routes`, {
+        name: v.name,
+        priority: v.priority,
+        path,
+        return_path: v.return_path || [],
+        exit,
+      });
+      message.success(`线路已创建并分配到入口节点 ${entry.name}`);
+      setRouteOpen(false);
+      routeForm.resetFields();
+      load();
+    } catch (e) {
+      message.error(e.message);
+    }
+  };
   return (
     <>
-      <Card className="page-card" title="线路列表（含端到端延迟）" extra={<Button onClick={triggerAllTests}>测试全部</Button>}>
-        <Table rowKey="key" dataSource={rows} columns={cols} loading={loading} pagination={false} />
+      <Card
+        className="page-card"
+        title="线路列表（含端到端延迟）"
+        extra={
+          <Space>
+            <Button type="primary" onClick={() => setRouteOpen(true)}>新建线路</Button>
+            <Button onClick={triggerAllTests}>测试全部</Button>
+          </Space>
+        }
+      >
+        <div className="route-filter-bar">
+          <Space wrap>
+            <Input
+              placeholder="搜索线路/入口/出口"
+              value={routeSearch}
+              onChange={(e) => setRouteSearch(e.target.value)}
+              allowClear
+            />
+            <Select
+              value={filterEntry}
+              onChange={setFilterEntry}
+              options={[{ label: '全部入口', value: 'all' }, ...entryOptions.map((v) => ({ label: v, value: v }))]}
+              style={{ minWidth: 140 }}
+            />
+            <Select
+              value={filterExit}
+              onChange={setFilterExit}
+              options={[{ label: '全部出口', value: 'all' }, ...exitOptions.map((v) => ({ label: v, value: v }))]}
+              style={{ minWidth: 140 }}
+            />
+            <Select
+              value={filterStatus}
+              onChange={setFilterStatus}
+              options={[
+                { label: '全部状态', value: 'all' },
+                { label: '在线入口', value: 'online' },
+                { label: '离线入口', value: 'offline' },
+              ]}
+              style={{ minWidth: 120 }}
+            />
+            <Button onClick={resetFilters}>清空筛选</Button>
+          </Space>
+        </div>
+        <Table rowKey="key" dataSource={filteredRows} columns={cols} loading={loading} pagination={false} />
       </Card>
+      <Modal open={routeOpen} onCancel={() => setRouteOpen(false)} onOk={addRoute} title="新建线路" width={620}>
+        <Form layout="vertical" form={routeForm} initialValues={{ priority: 1 }}>
+          <div className="route-template-bar">
+            <Space wrap>
+              <Select
+                placeholder="选择模板"
+                options={templates.map((t) => ({ label: t.name, value: t.name }))}
+                onChange={applyTemplate}
+                allowClear
+                style={{ minWidth: 180 }}
+              />
+              <Input
+                placeholder="模板名称"
+                value={templateName}
+                onChange={(e) => setTemplateName(e.target.value)}
+                style={{ minWidth: 160 }}
+              />
+              <Button onClick={saveTemplate}>保存为模板</Button>
+              {templates.length ? (
+                <Select
+                  placeholder="删除模板"
+                  options={templates.map((t) => ({ label: t.name, value: t.name }))}
+                  onChange={removeTemplate}
+                  style={{ minWidth: 160 }}
+                />
+              ) : null}
+            </Space>
+          </div>
+          <Form.Item name="name" label="线路名称" rules={[{ required: true }]}><Input placeholder="如: 成都->新加坡-1" /></Form.Item>
+          <Form.Item name="priority" label="优先级" rules={[{ required: true }]}>
+            <InputNumber min={1} style={{ width: '100%' }} />
+          </Form.Item>
+          <Form.Item label="路径节点顺序">
+            <div className="path-action-bar">
+              <PathActionBar form={routeForm} field="path" />
+            </div>
+            <Form.Item name="path" rules={[{ required: true, message: '请选择路径' }]} noStyle>
+              <PathOrderEditor
+                options={(allNodes || []).map((n) => ({
+                  label: n.name,
+                  value: n.name,
+                  region: n.geo_region,
+                  country: n.geo_country,
+                }))}
+                placeholder="从节点池拖拽到轨道形成路径"
+                extra="首节点必须是入口，末节点为出口"
+              />
+            </Form.Item>
+          </Form.Item>
+          <Form.Item label="回程路径节点顺序 (可选)" tooltip="从出口回到入口的节点顺序，需以出口开头、入口结尾">
+            <div className="path-action-bar">
+              <PathActionBar form={routeForm} field="return_path" sourceField="path" />
+            </div>
+            <Form.Item name="return_path" noStyle>
+              <PathOrderEditor
+                options={(allNodes || []).map((n) => ({
+                  label: n.name,
+                  value: n.name,
+                  region: n.geo_region,
+                  country: n.geo_country,
+                }))}
+                placeholder="从节点池拖拽到轨道形成回程路径"
+              />
+            </Form.Item>
+          </Form.Item>
+        </Form>
+      </Modal>
       <Modal
         open={diagOpen}
         onCancel={() => setDiagOpen(false)}
@@ -1956,6 +3333,9 @@ function RouteList({ settings }) {
             >
               刷新
             </Button>
+            {diagCachedAt ? (
+              <Text type="secondary">最近缓存：{new Date(diagCachedAt).toLocaleString()}</Text>
+            ) : null}
             <Button
               disabled={!diagEvents.length}
               onClick={async () => {
@@ -2137,6 +3517,9 @@ function RouteList({ settings }) {
             >
               刷新
             </Button>
+            {logCachedAt ? (
+              <Text type="secondary">最近缓存：{new Date(logCachedAt).toLocaleString()}</Text>
+            ) : null}
             <Button
               disabled={!logReports.length}
               onClick={async () => {
@@ -2186,20 +3569,35 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [controllerVersion, setControllerVersion] = useState('');
   const [token, setToken] = useState(localStorage.getItem('jwt') || '');
+  const [apiBase, setApiBaseState] = useState(getApiBase());
   const [userList, setUserList] = useState([]);
   const [userModal, setUserModal] = useState(false);
-  const [userForm] = Form.useForm();
-  const [editUser, setEditUser] = useState(null);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [view, setView] = useState('dashboard');
   const refreshList = () => setRefreshSignal((t) => t + 1);
+
+  const applyApiBase = () => {
+    const next = apiBase.trim();
+    setApiBase(next);
+    localStorage.removeItem('jwt');
+    setToken('');
+    message.success(next ? '已切换控制器地址' : '已恢复默认控制器地址');
+  };
+
+  const resetApiBase = () => {
+    setApiBaseState('');
+    setApiBase('');
+    localStorage.removeItem('jwt');
+    setToken('');
+    message.success('已恢复默认控制器地址');
+  };
 
   const showInstall = (node) => {
     if (!node) {
       message.info('请先选择一个节点');
       return;
     }
-    const origin = API_BASE || window.location.origin;
+    const origin = getApiBase() || window.location.origin;
     const tok = node.token || '';
     const tokenArg = tok ? `?token=${encodeURIComponent(tok)}` : '';
     const extra = tok ? ` -k ${tok}` : '';
@@ -2262,6 +3660,90 @@ export default function App() {
   useEffect(() => {
     if (token) loadSettings();
   }, [token]);
+
+  const UserModal = () => {
+    const [form] = Form.useForm();
+    const [editUser, setEditUser] = useState(null);
+    useEffect(() => {
+      if (!userModal) return;
+      if (editUser) {
+        form.setFieldsValue({ username: editUser.username, is_admin: editUser.is_admin, password: '' });
+      } else {
+        form.resetFields();
+      }
+    }, [editUser, userModal]);
+    return (
+      <Modal
+        open={userModal}
+        onCancel={() => { setUserModal(false); setEditUser(null); form.resetFields(); }}
+        onOk={async () => {
+          try {
+            const v = await form.validateFields();
+            if (editUser) {
+              const body = {};
+              if (v.password) body.password = v.password;
+              if (v.is_admin !== undefined) body.is_admin = v.is_admin;
+              await api('PUT', `/api/users/${editUser.id}`, body);
+              message.success('用户已更新');
+            } else {
+              await api('POST', '/api/users', v);
+              message.success('用户已创建');
+            }
+            setUserModal(false);
+            setEditUser(null);
+            form.resetFields();
+            loadUsers();
+          } catch (e) {
+            message.error(e.message);
+          }
+        }}
+        title="用户管理"
+        okText={editUser ? '保存' : '添加用户'}
+        width={760}
+      >
+        <Table
+          rowKey="id"
+          dataSource={userList}
+          pagination={false}
+          columns={[
+            { title: '用户名', dataIndex: 'username' },
+            { title: '管理员', dataIndex: 'is_admin', render: (v) => (v ? '是' : '否') },
+            {
+              title: '操作',
+              render: (_, r) => (
+                <Space>
+                  <Button size="small" onClick={() => { setEditUser(r); setUserModal(true); }}>修改</Button>
+                  <Button
+                    size="small"
+                    danger
+                    onClick={async () => {
+                      try {
+                        await api('DELETE', `/api/users/${r.id}`);
+                        message.success('已删除');
+                        loadUsers();
+                      } catch (e) {
+                        message.error(e.message);
+                      }
+                    }}
+                  >
+                    删除
+                  </Button>
+                </Space>
+              ),
+            },
+          ]}
+        />
+        <Divider />
+        <Form layout="vertical" form={form}>
+          <Form.Item name="username" label="用户名" rules={[{ required: true }]}><Input /></Form.Item>
+          <Form.Item name="password" label="密码" rules={[{ required: !editUser }]}><Input.Password /></Form.Item>
+          <Form.Item name="is_admin" label="管理员" initialValue={false}>
+            <Select options={[{ value: true, label: '是' }, { value: false, label: '否' }]} />
+          </Form.Item>
+        </Form>
+      </Modal>
+    );
+  };
 
   const SettingsModal = () => {
     const [form] = Form.useForm();
@@ -2430,6 +3912,18 @@ export default function App() {
         </Header>
         <Content className="login-content">
           <Card className="login-card" title="登录">
+            <Space direction="vertical" size={8} style={{ width: '100%', marginBottom: 16 }}>
+              <div style={{ fontSize: 13, color: '#64748b' }}>控制器地址</div>
+              <Space.Compact style={{ width: '100%' }}>
+                <Input
+                  value={apiBase}
+                  onChange={(e) => setApiBaseState(e.target.value)}
+                  placeholder={`默认：${DEFAULT_API_BASE}`}
+                />
+                <Button type="primary" onClick={applyApiBase}>应用</Button>
+              </Space.Compact>
+              <Button size="small" type="link" onClick={resetApiBase}>恢复默认</Button>
+            </Space>
             <Form layout="vertical" onFinish={login}>
               <Form.Item name="username" label="用户名" rules={[{ required: true }]}><Input /></Form.Item>
               <Form.Item name="password" label="密码" rules={[{ required: true }]}><Input.Password /></Form.Item>
@@ -2443,6 +3937,7 @@ export default function App() {
 
   const menuItems = [
     { key: 'dashboard', label: '节点概览' },
+    { key: 'map', label: '节点地图' },
     { key: 'routes', label: '线路列表' },
     { key: 'encryption', label: '加密策略' },
   ];
@@ -2496,7 +3991,7 @@ export default function App() {
               size="small"
               type="text"
               icon={<UserIcon />}
-              onClick={() => { setEditUser(null); userForm.resetFields(); setUserModal(true); }}
+              onClick={() => { setUserModal(true); }}
               aria-label="用户管理"
             />
             <Button size="small" type="text" icon={<GearIcon />} onClick={() => setSettingsOpen(true)} aria-label="全局设置" />
@@ -2504,10 +3999,11 @@ export default function App() {
         </Header>
         <Content className="app-content">
           <Space direction="vertical" size={16} style={{ width: '100%' }}>
-            <Card className="page-card" bodyStyle={{ padding: 16 }}>
+            <Card className="page-card" styles={{ body: { padding: 16 } }}>
               <Space wrap>
                 <Button type="primary" onClick={() => refreshList()}>刷新</Button>
                 <Button onClick={() => { setSelected(null); setView('dashboard'); }}>节点概览</Button>
+                <Button onClick={() => { setSelected(null); setView('map'); }}>节点地图</Button>
                 <Button onClick={() => setView('routes')}>线路列表</Button>
                 <Button onClick={() => setView('encryption')}>加密策略</Button>
                 <Tooltip title={selected ? '' : '请先选择一个节点'}>
@@ -2520,84 +4016,18 @@ export default function App() {
               ? <RouteList settings={settings} />
               : view === 'encryption'
                 ? <EncryptionCard />
-                : (selected
-                  ? <NodeDetail key={selected.id} node={selected} onBack={() => setSelected(null)} refreshList={refreshList} onShowInstall={showInstall} />
-                  : <NodeList onSelect={setSelected} onShowInstall={showInstall} refreshSignal={refreshSignal} />
-                )
+                : view === 'map'
+                  ? <NodeMap refreshSignal={refreshSignal} onSelect={setSelected} onOpenNode={() => setView('dashboard')} />
+                  : (selected
+                    ? <NodeDetail key={selected.id} node={selected} onBack={() => setSelected(null)} refreshList={refreshList} onShowInstall={showInstall} />
+                    : <NodeList onSelect={setSelected} onShowInstall={showInstall} refreshSignal={refreshSignal} />
+                  )
             }
             <Modal open={installOpen} onCancel={() => setInstallOpen(false)} onOk={copyCmd} okText="复制命令">
               <p>在目标节点执行以下命令以安装并自启动：</p>
               <Input.TextArea value={installCmd} rows={3} readOnly />
             </Modal>
-            <Modal
-              open={userModal}
-              onCancel={() => { setUserModal(false); setEditUser(null); userForm.resetFields(); }}
-              onOk={async () => {
-                try {
-                  const v = await userForm.validateFields();
-                  if (editUser) {
-                    const body = {};
-                    if (v.password) body.password = v.password;
-                    if (v.is_admin !== undefined) body.is_admin = v.is_admin;
-                    await api('PUT', `/api/users/${editUser.id}`, body);
-                    message.success('用户已更新');
-                  } else {
-                    await api('POST', '/api/users', v);
-                    message.success('用户已创建');
-                  }
-                  setUserModal(false);
-                  setEditUser(null);
-                  userForm.resetFields();
-                  loadUsers();
-                } catch (e) {
-                  message.error(e.message);
-                }
-              }}
-              title="用户管理"
-              okText={editUser ? '保存' : '添加用户'}
-              width={760}
-            >
-              <Table
-                rowKey="id"
-                dataSource={userList}
-                pagination={false}
-                columns={[
-                  { title: '用户名', dataIndex: 'username' },
-                  { title: '管理员', dataIndex: 'is_admin', render: (v) => (v ? '是' : '否') },
-                  {
-                    title: '操作',
-                    render: (_, r) => (
-                      <Space>
-                        <Button size="small" onClick={() => { setEditUser(r); userForm.setFieldsValue({ username: r.username, is_admin: r.is_admin, password: '' }); setUserModal(true); }}>修改</Button>
-                        <Button
-                          size="small"
-                          danger
-                          onClick={async () => {
-                            try {
-                              await api('DELETE', `/api/users/${r.id}`);
-                              message.success('已删除');
-                              loadUsers();
-                            } catch (e) {
-                              message.error(e.message);
-                            }
-                          }}
-                        >
-                          删除
-                        </Button>
-                      </Space>
-                    ),
-                  },
-                ]}
-              />
-              <Divider />
-              <Form layout="vertical" form={userForm}>
-                <Form.Item name="username" label="用户名" rules={[{ required: true }]}><Input /></Form.Item>
-                <Form.Item name="password" label="密码" rules={[{ required: true }]}><Input.Password /></Form.Item>
-                <Form.Item name="is_admin" label="管理员" initialValue={false}>
-                  <Select options={[{ value: true, label: '是' }, { value: false, label: '否' }]} />
-                </Form.Item>
-              </Form>
-            </Modal>
+            <UserModal />
           </Space>
         </Content>
         <Drawer

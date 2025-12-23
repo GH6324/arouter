@@ -544,6 +544,17 @@ type MuxPoolStats struct {
 	TotalFails int
 }
 
+type GeoInfo struct {
+	IP        string  `json:"ip"`
+	Lat       float64 `json:"lat"`
+	Lng       float64 `json:"lng"`
+	City      string  `json:"city"`
+	Region    string  `json:"region"`
+	Country   string  `json:"country"`
+	Org       string  `json:"org"`
+	UpdatedAt int64   `json:"updated_at"`
+}
+
 // NodeStatus 描述节点自身运行状态，用于上报给控制器。
 type NodeStatus struct {
 	CPUUsage    float64  `json:"cpu_usage"`       // 0-100
@@ -558,6 +569,7 @@ type NodeStatus struct {
 	OS          string   `json:"os"`
 	Arch        string   `json:"arch"`
 	PublicIPs   []string `json:"public_ips"`
+	Geo         GeoInfo  `json:"geo"`
 }
 
 func (m *Metrics) Serve(addr string) *http.Server {
@@ -1123,6 +1135,85 @@ func gatherPublicIPs() []string {
 	return out
 }
 
+var (
+	geoMu        sync.Mutex
+	geoInfoCache GeoInfo
+	geoLastFetch time.Time
+	geoFetching  bool
+)
+
+func gatherGeoInfo(publicIPs []string) GeoInfo {
+	geoMu.Lock()
+	info := geoInfoCache
+	lastFetch := geoLastFetch
+	fetching := geoFetching
+	stale := lastFetch.IsZero() || time.Since(lastFetch) >= geoRefreshInterval()
+	if !stale && info.IP != "" && len(publicIPs) > 0 && !containsString(publicIPs, info.IP) {
+		stale = true
+	}
+	if !stale || fetching {
+		geoMu.Unlock()
+		return info
+	}
+	geoFetching = true
+	geoMu.Unlock()
+
+	if info.Lat == 0 && info.Lng == 0 {
+		updated := fetchGeoForIPs(publicIPs)
+		geoMu.Lock()
+		if updated.Lat != 0 || updated.Lng != 0 {
+			updated.UpdatedAt = time.Now().Unix()
+			geoInfoCache = updated
+			info = updated
+		}
+		geoLastFetch = time.Now()
+		geoFetching = false
+		geoMu.Unlock()
+		return info
+	}
+
+	go refreshGeoAsync(publicIPs)
+	return info
+}
+
+func refreshGeoAsync(publicIPs []string) {
+	updated := fetchGeoForIPs(publicIPs)
+	geoMu.Lock()
+	if updated.Lat != 0 || updated.Lng != 0 {
+		updated.UpdatedAt = time.Now().Unix()
+		geoInfoCache = updated
+	}
+	geoLastFetch = time.Now()
+	geoFetching = false
+	geoMu.Unlock()
+}
+
+func fetchGeoForIPs(publicIPs []string) GeoInfo {
+	client := &http.Client{Timeout: 4 * time.Second}
+	endpoint := envOrDefault("GEOIP_ENDPOINT", "https://ipinfo.io/%s/json")
+	for _, ip := range publicIPs {
+		ip = strings.TrimSpace(ip)
+		if ip == "" {
+			continue
+		}
+		info, err := fetchGeoIP(client, endpoint, ip)
+		if err == nil && (info.Lat != 0 || info.Lng != 0) {
+			return info
+		}
+	}
+	return GeoInfo{}
+}
+
+func geoRefreshInterval() time.Duration {
+	val := strings.TrimSpace(os.Getenv("GEOIP_CACHE_TTL"))
+	if val != "" {
+		if d, err := time.ParseDuration(val); err == nil && d > 0 {
+			return d
+		}
+	}
+	return 24 * time.Hour
+}
+
 func publicIPsFromInterfaces() []string {
 	ifaces, _ := net.Interfaces()
 	var res []string
@@ -1173,6 +1264,137 @@ func fetchPublicIPFromIPSB(network string) string {
 	return ip.String()
 }
 
+func fetchGeoIP(client *http.Client, endpoint, ip string) (GeoInfo, error) {
+	url := buildGeoIPURL(endpoint, ip)
+	req, _ := http.NewRequest(http.MethodGet, url, nil)
+	req.Header.Set("Accept", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return GeoInfo{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return GeoInfo{}, fmt.Errorf("geoip status %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if err != nil {
+		return GeoInfo{}, err
+	}
+	return parseGeoIPResponse(body, ip)
+}
+
+func buildGeoIPURL(endpoint, ip string) string {
+	if strings.Contains(endpoint, "%s") {
+		return fmt.Sprintf(endpoint, ip)
+	}
+	if strings.Contains(endpoint, "{ip}") {
+		return strings.ReplaceAll(endpoint, "{ip}", ip)
+	}
+	if strings.HasSuffix(endpoint, "/") {
+		return endpoint + ip
+	}
+	return endpoint + "/" + ip
+}
+
+func parseGeoIPResponse(body []byte, ip string) (GeoInfo, error) {
+	var raw map[string]any
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return GeoInfo{}, err
+	}
+	if v, ok := raw["error"].(bool); ok && v {
+		if reason, ok := raw["reason"].(string); ok && reason != "" {
+			return GeoInfo{}, fmt.Errorf("geoip error: %s", reason)
+		}
+		if msg, ok := raw["message"].(string); ok && msg != "" {
+			return GeoInfo{}, fmt.Errorf("geoip error: %s", msg)
+		}
+		return GeoInfo{}, fmt.Errorf("geoip error")
+	}
+	lat, lng := readGeoLatLng(raw)
+	if lat == 0 && lng == 0 {
+		if loc, ok := raw["loc"].(string); ok && loc != "" {
+			parts := strings.Split(loc, ",")
+			if len(parts) == 2 {
+				if v, err := parseGeoFloat(parts[0]); err == nil {
+					lat = v
+				}
+				if v, err := parseGeoFloat(parts[1]); err == nil {
+					lng = v
+				}
+			}
+		}
+	}
+	return GeoInfo{
+		IP:      firstNonEmpty(readGeoString(raw, "ip"), ip),
+		Lat:     lat,
+		Lng:     lng,
+		City:    readGeoString(raw, "city"),
+		Region:  firstNonEmpty(readGeoString(raw, "region"), readGeoString(raw, "region_name")),
+		Country: firstNonEmpty(readGeoString(raw, "country_name"), readGeoString(raw, "country")),
+		Org:     firstNonEmpty(readGeoString(raw, "org"), readGeoString(raw, "org_name"), readGeoString(raw, "isp")),
+	}, nil
+}
+
+func readGeoLatLng(raw map[string]any) (float64, float64) {
+	lat := readGeoFloat(raw, "latitude")
+	lng := readGeoFloat(raw, "longitude")
+	if lat == 0 && lng == 0 {
+		lat = readGeoFloat(raw, "lat")
+		lng = readGeoFloat(raw, "lng")
+	}
+	if lat == 0 && lng == 0 {
+		lat = readGeoFloat(raw, "lat")
+		lng = readGeoFloat(raw, "lon")
+	}
+	return lat, lng
+}
+
+func readGeoString(raw map[string]any, key string) string {
+	if v, ok := raw[key]; ok {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return ""
+}
+
+func readGeoFloat(raw map[string]any, key string) float64 {
+	if v, ok := raw[key]; ok {
+		switch t := v.(type) {
+		case float64:
+			return t
+		case float32:
+			return float64(t)
+		case int:
+			return float64(t)
+		case int64:
+			return float64(t)
+		case json.Number:
+			if f, err := t.Float64(); err == nil {
+				return f
+			}
+		case string:
+			if f, err := parseGeoFloat(t); err == nil {
+				return f
+			}
+		}
+	}
+	return 0
+}
+
+func parseGeoFloat(s string) (float64, error) {
+	return strconv.ParseFloat(strings.TrimSpace(s), 64)
+}
+
+func containsString(list []string, target string) bool {
+	for _, item := range list {
+		if item == target {
+			return true
+		}
+	}
+	return false
+}
+
 func isPrivateOrLinkLocal(ip net.IP) bool {
 	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
 		return true
@@ -1199,6 +1421,7 @@ func gatherNodeStatus() NodeStatus {
 	status := NodeStatus{Version: buildVersion}
 	status.OS, status.Arch = detectOSInfo()
 	status.PublicIPs = gatherPublicIPs()
+	status.Geo = gatherGeoInfo(status.PublicIPs)
 
 	if snap, err := readCPUSnapshot(); err == nil {
 		if hasCPUSnap {
@@ -1235,6 +1458,22 @@ func defaultIfEmpty(val, def string) string {
 		return def
 	}
 	return val
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func envOrDefault(key, def string) string {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		return v
+	}
+	return def
 }
 
 // ensureListenAddr ensures port-only values are prefixed with ":" for net.Listen.

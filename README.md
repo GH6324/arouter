@@ -29,6 +29,7 @@ services:
       - CONTROLLER_ADDR=:8080
       - DB_PATH=/data/arouter.db
       - ENABLE_CORS=true   # 允许任意域名跨域访问（默认 true）
+      - GEOIP_ENDPOINT=https://ipinfo.io/%s/json
     volumes:
       - ./data:/data
       - ./certs:/app/certs   # 如需自定义证书
@@ -64,6 +65,7 @@ services:
       - CONTROLLER_ADDR=:8080
       - DB_DSN=arouter:arouter123@tcp(mysql:3306)/arouter?parseTime=true&charset=utf8mb4&loc=Local
       - ENABLE_CORS=true   # 允许任意域名跨域访问（默认 true）
+      - GEOIP_ENDPOINT=https://ipinfo.io/%s/json
     depends_on:
       - mysql
     volumes:
@@ -78,6 +80,10 @@ services:
 
 ### 控制器环境变量补充
 - `ENABLE_CORS`：是否开启 CORS（跨域）。`true/1/yes` 开启，`false/0/no` 关闭。默认开启。
+
+### 节点环境变量补充
+- `GEOIP_ENDPOINT`：节点侧 IP 定位接口，默认 `https://ipinfo.io/%s/json`（无 token 返回城市/经纬度等基础信息）。
+- `GEOIP_CACHE_TTL`：定位缓存时间，默认 `24h`（节点每天更新一次）。
 
 ## 节点部署
 1. 在控制台创建节点（“节点列表”→“新建节点”），记录节点 Token。

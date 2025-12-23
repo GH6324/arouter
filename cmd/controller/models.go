@@ -50,6 +50,14 @@ type Node struct {
 	OSName          string      `json:"os_name"`
 	Arch            string      `json:"arch"`
 	PublicIPs       StringList  `json:"public_ips"`
+	GeoIP           string      `json:"geo_ip"`
+	GeoLat          float64     `json:"geo_lat"`
+	GeoLng          float64     `json:"geo_lng"`
+	GeoCity         string      `json:"geo_city"`
+	GeoRegion       string      `json:"geo_region"`
+	GeoCountry      string      `json:"geo_country"`
+	GeoOrg          string      `json:"geo_org"`
+	GeoUpdatedAt    int64       `json:"geo_updated_at"`
 	MaxMuxStreams   int         `json:"max_mux_streams"`
 	MuxMaxAge       string      `json:"mux_max_age"`
 	MuxMaxIdle      string      `json:"mux_max_idle"`

@@ -26,6 +26,16 @@ func applyMetricsPayload(db *gorm.DB, node *Node, payload struct {
 		OS          string   `json:"os"`
 		Arch        string   `json:"arch"`
 		PublicIPs   []string `json:"public_ips"`
+		Geo         struct {
+			IP        string  `json:"ip"`
+			Lat       float64 `json:"lat"`
+			Lng       float64 `json:"lng"`
+			City      string  `json:"city"`
+			Region    string  `json:"region"`
+			Country   string  `json:"country"`
+			Org       string  `json:"org"`
+			UpdatedAt int64   `json:"updated_at"`
+		} `json:"geo"`
 	} `json:"status"`
 }) {
 	for to, m := range payload.Metrics {
@@ -114,6 +124,20 @@ func applyMetricsPayload(db *gorm.DB, node *Node, payload struct {
 	}
 	if len(merged) > 0 {
 		updates["public_ips"] = StringList(merged)
+	}
+	if payload.Status.Geo.Lat != 0 || payload.Status.Geo.Lng != 0 || payload.Status.Geo.City != "" {
+		updatedAt := payload.Status.Geo.UpdatedAt
+		if updatedAt <= 0 {
+			updatedAt = time.Now().Unix()
+		}
+		updates["geo_ip"] = payload.Status.Geo.IP
+		updates["geo_lat"] = payload.Status.Geo.Lat
+		updates["geo_lng"] = payload.Status.Geo.Lng
+		updates["geo_city"] = payload.Status.Geo.City
+		updates["geo_region"] = payload.Status.Geo.Region
+		updates["geo_country"] = payload.Status.Geo.Country
+		updates["geo_org"] = payload.Status.Geo.Org
+		updates["geo_updated_at"] = updatedAt
 	}
 	db.Model(&Node{}).Where("id = ?", node.ID).Updates(updates)
 }

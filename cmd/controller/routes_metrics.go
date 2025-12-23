@@ -36,6 +36,16 @@ func registerMetricsRoutes(api *gin.RouterGroup, authGroup *gin.RouterGroup, db 
 				OS          string   `json:"os"`
 				Arch        string   `json:"arch"`
 				PublicIPs   []string `json:"public_ips"`
+				Geo         struct {
+					IP        string  `json:"ip"`
+					Lat       float64 `json:"lat"`
+					Lng       float64 `json:"lng"`
+					City      string  `json:"city"`
+					Region    string  `json:"region"`
+					Country   string  `json:"country"`
+					Org       string  `json:"org"`
+					UpdatedAt int64   `json:"updated_at"`
+				} `json:"geo"`
 			} `json:"status"`
 		}
 		if err := c.ShouldBindJSON(&payload); err != nil {
